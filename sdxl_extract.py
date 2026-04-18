@@ -12,10 +12,11 @@ from PIL import Image
 import numpy as np
 
 import time
+from tqdm import tqdm
 
 from experiment_helpers.init_helpers import default_parser,repo_api_init
 
-parser=default_parser()
+parser=default_parser({"save_dir":"embeddings"})
 parser.add_argument("--src_dir",type=str,default="laion")
 parser.add_argument("--size",type=int,default=256)
             
@@ -64,8 +65,10 @@ def main(args):
     path_to_checkpoints = './sdxl_unbox/checkpoints/'
 
     block_list=[
-       # "down_blocks.2.attentions.1",
-        "mid_block.attentions.0"
+        "down_blocks.2.attentions.1",
+        "mid_block.attentions.0",
+        "up_blocks.0.attentions.0",
+         "up_blocks.0.attentions.1"
     ]
     
     model = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32")
@@ -98,7 +101,13 @@ def main(args):
     path_list=[f for f in os.listdir(src_dir) if f.endswith(".jpg")]
     count=len([p for p in os.listdir(save_dir) if p.endswith(".npz")])
     
-    for r,jpg_path in enumerate(path_list):
+    print(f"processed {count}/{len(path_list)} images")
+    
+    session_count=0
+    
+    for r,jpg_path in enumerate(tqdm(path_list)):
+        if r<count:
+            continue
         
         if r==limit:
             break
@@ -107,7 +116,11 @@ def main(args):
         if os.path.exists(npz_path):
             continue
         
-        image=Image.open(os.path.join(src_dir,jpg_path))
+        image=Image.open(os.path.join(src_dir,jpg_path)).convert("RGB")
+        (h,w)=image.size
+        if h<4 or w<4:
+            print("hella small ",jpg_path)
+            continue
         with torch.no_grad():
             clip_inputs = processor(images=image, return_tensors="pt")
             clip_outputs=model(**clip_inputs,return_dict=False)
@@ -173,6 +186,9 @@ def main(args):
                 output_dict[name]=output.cpu().detach().numpy()
             
             np.savez(npz_path,**output_dict)
+            session_count+=1
+            if session_count%250==0:
+                print(f"processed {session_count}+{count}={session_count+count} / {len(path_list)}")
                 
 
 
