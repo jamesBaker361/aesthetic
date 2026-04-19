@@ -44,10 +44,6 @@ for file in os.listdir(src_dir):
             x=torch.tensor(data[block])[0].permute(1,2,0).flatten(0,1)
             
             features=sae.encode(x)
-            features=features-means_dict[block]
+            features=features.cpu()-means_dict[block].cpu()
             result[block]=features.cpu().detach().numpy()
     np.savez(new_path,**result)
-            
-            
-            
-            
