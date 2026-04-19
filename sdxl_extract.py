@@ -5,7 +5,7 @@ from experiment_helpers.argprint import print_args
 from sdxl_unbox.SAE import SparseAutoencoder
 from sdxl_pipe import HookedStableDiffusionXLWithUNetPipeline
 from diffusers import UNet2DConditionModel
-from transformers import AutoProcessor, CLIPVisionModel
+from transformers import AutoProcessor, CLIPVisionModel,CLIPVisionModelWithProjection
 from diffusers.image_processor import VaeImageProcessor
 import torch
 from PIL import Image
@@ -71,7 +71,7 @@ def main(args):
          "up_blocks.0.attentions.1"
     ]
     
-    model = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32")
+    model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
     processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32")
     image_processor=VaeImageProcessor()
     
@@ -123,8 +123,11 @@ def main(args):
             continue
         with torch.no_grad():
             clip_inputs = processor(images=image, return_tensors="pt")
-            clip_outputs=model(**clip_inputs,return_dict=False)
-            last_hidden_state = clip_outputs[0].cpu().detach().numpy()
+            clip_outputs=model(**clip_inputs,return_dict=True,output_attentions=True,output_hidden_states=True)
+            
+            output_dict={}
+            for attr in ["image_embeds", "last_hidden_state","hidden_states"]:
+                output_dict[attr]=getattr(clip_outputs,attr).cpu().detach().numpy()
             
             image_pt=image_processor.preprocess(image,size,size).to(device=device,dtype=dtype)
 
@@ -144,8 +147,7 @@ def main(args):
             negative_prompt_embeds,
             pooled_prompt_embeds,
             negative_pooled_prompt_embeds,
-            )=pipe.encode_prompt(
-            "image","image",device,1,False," "," ")
+            )=pipe.encode_prompt("image","image",device,1,False," "," ")
             timestep_cond=None
             add_text_embeds = pooled_prompt_embeds
 
@@ -177,7 +179,7 @@ def main(args):
                                             added_cond_kwargs=added_cond_kwargs,
                                             return_dict=False,)[0]
             
-            output_dict={"clip":last_hidden_state}
+            
             
             for name,block in block_dict.items():
                 output=getattr(block,"saved_output")
