@@ -76,6 +76,7 @@ def main(args):
     image_processor=VaeImageProcessor()
     
     def hook(module, input, output):
+        setattr(module,"saved_input",input)
         setattr(module,"saved_output",output)
         if output is None:
             return input
@@ -125,14 +126,14 @@ def main(args):
             clip_inputs = processor(images=image, return_tensors="pt")
             clip_outputs=model(**clip_inputs,return_dict=True,output_attentions=True,output_hidden_states=True)
             
-            output_dict={}
+            result_dict={}
             for attr in ["image_embeds", "last_hidden_state","hidden_states"]:
                 try:
-                    output_dict[attr]=getattr(clip_outputs,attr).cpu().detach().numpy()
+                    result_dict[attr]=getattr(clip_outputs,attr).cpu().detach().numpy()
                 except AttributeError:
                     hidden_states=getattr(clip_outputs,attr)
                     hidden_states=np.stack([h.cpu().detach().numpy() for h in hidden_states])
-                    output_dict[attr]=hidden_states
+                    result_dict[attr]=hidden_states
                     
             
             image_pt=image_processor.preprocess(image,size,size).to(device=device,dtype=dtype)
@@ -188,12 +189,13 @@ def main(args):
             
             
             for name,block in block_dict.items():
-                output=getattr(block,"saved_output")
-                if type(output)==tuple:
-                    output=output[0]
-                output_dict[name]=output.cpu().detach().numpy()
+                for key in ["saved_output","saved_input"]:
+                    value=getattr(block,key)
+                    if type(value)==tuple:
+                        value=value[0]
+                    result_dict[f"{key}.{name}"]=value.cpu().detach().numpy()
             
-            np.savez(npz_path,**output_dict)
+            np.savez(npz_path,**result_dict)
             session_count+=1
             if session_count%250==0:
                 print(f"processed {session_count}+{count}={session_count+count} / {len(path_list)}")
