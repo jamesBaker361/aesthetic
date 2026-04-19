@@ -13,6 +13,7 @@ processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
 def hook(module, input, output):
     setattr(module,"saved_output",output)
+    setattr(module,"saved_input",input)
     if output is None:
         return input
     return output
@@ -26,15 +27,23 @@ with httpx.stream("GET", url) as response:
 
 inputs = processor(images=image, return_tensors="pt")
 
+print(inputs["pixel_values"].size())
+
 model(**inputs,return_dict=False)
 
 for name, module in model.named_modules():
-    print(name,type(module),end="")
-    out=getattr(module,"saved_output",None)
-    if out !=None:
-        if type(out)==tuple:
-            print(out[0].size())
-        elif type(out)==torch.Tensor:
-            print(out.size())
-        else:
-            print(type(out))
+    print(name,type(module),)
+    for key in ["saved_output","saved_input"]:
+        print(f"\t{key}",end=" ")
+        out=getattr(module,key,None)
+        if out !=None:
+            if type(out)==tuple:
+                for n in range(len(out)):
+                    print(type(out[n]),end=" ")
+                    if type(out[n])==torch.Tensor:
+                        print((out[n].size()),end=" ")
+            elif type(out)==torch.Tensor:
+                print(out.size(),end=" ")
+            else:
+                print(type(out),end=" ")
+        print(" ")
