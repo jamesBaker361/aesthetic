@@ -2,6 +2,7 @@ import torch
 from sdxl_unbox.SAE import SparseAutoencoder
 import os
 import numpy as np
+from tqdm import tqdm
 
 
 block_list=[
@@ -15,7 +16,7 @@ saes_dict:dict[str,SparseAutoencoder] = {}
 means_dict = {}
 path_to_checkpoints = './sdxl_unbox/checkpoints/'
 
-for block in block_list:
+for block in tqdm(block_list, desc="Loading SAEs"):
     sae = SparseAutoencoder.load_from_disk(
         os.path.join(path_to_checkpoints, f"unet.{block}_k10_hidden5120_auxk256_bs4096_lr0.0001", "final"),
     )
@@ -31,7 +32,7 @@ dest_dir="sparse_embeddings"
 os.makedirs(dest_dir,exist_ok=True)
 src_dir="embeddings"
 
-for file in os.listdir(src_dir):
+for file in tqdm(os.listdir(src_dir), desc="Sparsifying"):
     if not file.endswith(".npz"):
         continue
     new_path=os.path.join(dest_dir,file)
