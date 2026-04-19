@@ -127,7 +127,13 @@ def main(args):
             
             output_dict={}
             for attr in ["image_embeds", "last_hidden_state","hidden_states"]:
-                output_dict[attr]=getattr(clip_outputs,attr).cpu().detach().numpy()
+                try:
+                    output_dict[attr]=getattr(clip_outputs,attr).cpu().detach().numpy()
+                except AttributeError:
+                    hidden_states=getattr(clip_outputs,attr)
+                    hidden_states=np.stack([h.cpu().detach().numpy() for h in hidden_states])
+                    output_dict[attr]=hidden_states
+                    
             
             image_pt=image_processor.preprocess(image,size,size).to(device=device,dtype=dtype)
 
