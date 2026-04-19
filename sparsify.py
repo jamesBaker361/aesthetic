@@ -31,7 +31,7 @@ dest_dir="sparse_embeddings"
 os.makedirs(dest_dir,exist_ok=True)
 src_dir="embeddings"
 
-for f,file in enumerate( os.listdir(src_dir)):
+for file in os.listdir(src_dir):
     if not file.endswith(".npz"):
         continue
     new_path=os.path.join(dest_dir,file)
@@ -41,7 +41,8 @@ for f,file in enumerate( os.listdir(src_dir)):
         result={}
         for block in block_list:
             sae=saes_dict[block]
-            x=torch.tensor(data[block])[0].transpose(1,2,0).flatten(0,1)
+            x=torch.tensor(data[block])[0].permute(1,2,0).flatten(0,1)
+            x=x - means_dict[block]
             features=sae.encode(x)
             result[block]=features.cpu().detach().numpy()
     np.savez(new_path,**result)
