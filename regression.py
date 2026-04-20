@@ -41,6 +41,8 @@ if __name__=="__main__":
     
     independent=np.array(independent)
     dependent=np.array(dependent)
+    print("dependnent",dependent.shape)
+    print("indpednent ",independent.shape)
     t0=time.time()
     x,residuals,rank,s=np.linalg.lstsq(independent,dependent,rcond=None)
     print(f"lstsq: {time.time()-t0:.2f}s")
