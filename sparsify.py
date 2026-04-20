@@ -42,7 +42,9 @@ for file in tqdm(os.listdir(src_dir), desc="Sparsifying"):
         result={}
         for block in block_list:
             sae=saes_dict[block]
-            x=torch.tensor(data[block])[0].permute(1,2,0).flatten(0,1)
+            input_data=data["saved_input."+block]
+            output_data=data["saved_output."+block]
+            x=torch.tensor(output_data-input_data).squeeze(0).permute(1,2,0).flatten(0,1)
             
             features=sae.encode(x)
             features=features.cpu()-means_dict[block].cpu()
