@@ -28,7 +28,7 @@ if __name__=="__main__":
                 "aesthetic":aesthetic,
                 "punsafe":punsafe
             }[args.y_column]
-            npz_file=os.path.join(sparse_dir,imgpath)
+            npz_file=os.path.join(sparse_dir,imgpath+".npz")
             if os.path.exists(npz_file):
                 features=np.load(npz_file)[args.block]
                 n=features.shape[0]
