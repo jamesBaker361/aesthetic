@@ -134,7 +134,12 @@ def main(args):
             
             image_pt=image_processor.preprocess(image,size,size).to(device=device,dtype=dtype) #all images have to be the same size so we can do batching
 
+            if torch.isnan(image_pt).any():
+                print("nann image")
+
             latents=vae.encode(image_pt).latent_dist.sample()
+            if torch.isnan(latents).any():
+                print("nan latents")
             noise = torch.randn_like(latents)
             
             timesteps = torch.randint(
@@ -147,9 +152,9 @@ def main(args):
             noisy_model_input = scheduler.add_noise(latents, noise, timesteps)
             
             (prompt_embeds,
-            negative_prompt_embeds,
-            pooled_prompt_embeds,
-            negative_pooled_prompt_embeds,
+                negative_prompt_embeds,
+                pooled_prompt_embeds,
+                negative_pooled_prompt_embeds,
             )=pipe.encode_prompt("image","image",device,1,False," "," ")
             timestep_cond=None
             add_text_embeds = pooled_prompt_embeds
@@ -174,6 +179,10 @@ def main(args):
             add_text_embeds = add_text_embeds.expand(actual_batch_size, -1).contiguous()
             add_time_ids = add_time_ids.expand(actual_batch_size, -1).contiguous()
             added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+            
+            for tensor,var_name in zip([prompt_embeds,add_text_embeds,add_time_ids],['prompt_embeds','add_text_embeds','add_time_ids']):
+                if torch.isnan(tensor).any():
+                    print("nan ",var_name)
             
             model_pred = unet.forward(
                         noisy_model_input,timesteps,
