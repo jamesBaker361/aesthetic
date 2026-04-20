@@ -42,7 +42,7 @@ def main(args):
 
 
 
-    dtype=torch.float16
+    dtype=torch.float32
 
     if torch.cuda.is_available():
 
