@@ -39,9 +39,10 @@ if __name__=="__main__":
                 n=features.shape[0]
                 if l<10:
                     print(features.shape)
-                dependent.extend([target for _ in range(n)])
+                
                 features=[f for f in features if np.isfinite(f).all()]
                 independent.extend([f for f in features])
+                dependent.extend([target for _ in range(len(features))])
             elif l<10:
                 print(npz_file,"doesnt exists")
             
