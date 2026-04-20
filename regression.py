@@ -9,6 +9,7 @@ from tqdm import tqdm
 parser=argparse.ArgumentParser()
 parser.add_argument("--y_column",type=str,default="aesthetic") #column 0 = aesthetic column = 1 = p(unsafe)
 parser.add_argument("--block",type=str,default="down_blocks.2.attentions.1")
+parser.add_argument("--limit",type=int,default=-1)
 
 info_path="laion/info.csv"
 sparse_dir="sparse_embeddings"
@@ -20,6 +21,8 @@ if __name__=="__main__":
     independent=[]
     with open(info_path,"r") as file:
         for l,line in enumerate(tqdm(file.readlines())):
+            if l==args.limit:
+                break
             [imgpath,aesthetic,punsafe]=line.strip().split(",")
             imgpath=imgpath.split("/")[1]
             aesthetic=float(aesthetic)
