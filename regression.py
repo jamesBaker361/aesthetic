@@ -29,12 +29,13 @@ if __name__=="__main__":
                 "punsafe":punsafe
             }[args.y_column]
             npz_file=os.path.join(sparse_dir,imgpath)
-            features=np.load(npz_file)[args.block]
-            n=features.shape[0]
-            if l<10:
-                print(features.shape)
-            dependent.extend([target for _ in range(n)])
-            independent.extend([f for f in features])
+            if os.path.exists(npz_file):
+                features=np.load(npz_file)[args.block]
+                n=features.shape[0]
+                if l<10:
+                    print(features.shape)
+                dependent.extend([target for _ in range(n)])
+                independent.extend([f for f in features])
             
     print(" len samples",len(dependent))
     
