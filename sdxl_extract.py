@@ -79,6 +79,13 @@ def main(args):
         return output
     unet: UNet2DConditionModel =pipe.unet
     vae=pipe.vae
+    def assert_no_nan(model):
+        for name, p in model.named_parameters():
+            if not torch.isfinite(p).all():
+                raise ValueError(f"Invalid values in {name}")
+    print("vae type ",type(vae))
+    assert_no_nan(vae)
+    
     scheduler=pipe.scheduler
     tokenizer=pipe.tokenizer
     
