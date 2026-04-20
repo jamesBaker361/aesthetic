@@ -36,6 +36,8 @@ if __name__=="__main__":
                     print(features.shape)
                 dependent.extend([target for _ in range(n)])
                 independent.extend([f for f in features])
+            elif l<10:
+                print(npz_file,"doesnt exists")
             
     print(" len samples",len(dependent))
     
