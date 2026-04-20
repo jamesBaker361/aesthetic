@@ -143,6 +143,8 @@ def main(args):
 
             if torch.isnan(image_pt).any():
                 print("nann image")
+                
+            print("max min ",image_pt.max(),image_pt.min())
 
             latents=vae.encode(image_pt).latent_dist.sample()
             if torch.isnan(latents).any():
