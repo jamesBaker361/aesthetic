@@ -78,8 +78,6 @@ def main(args):
     def hook(module, input, output):
         setattr(module,"saved_input",input)
         setattr(module,"saved_output",output)
-        if output is None:
-            return input
         return output
     unet: UNet2DConditionModel =pipe.unet
     vae=pipe.vae
@@ -136,7 +134,7 @@ def main(args):
                     result_dict[attr]=hidden_states
                     
             
-            image_pt=image_processor.preprocess(image,size,size).to(device=device,dtype=dtype)
+            image_pt=image_processor.preprocess(image,size,size).to(device=device,dtype=dtype) #all images have to be the same size so we can do batching
 
             latents=vae.encode(image_pt).latent_dist.sample()
             noise = torch.randn_like(latents)
@@ -193,6 +191,8 @@ def main(args):
                     value=getattr(block,key)
                     if type(value)==tuple:
                         value=value[0]
+                    if torch.isnan(value).any():
+                        print(npz_path,"nan value ",key)
                     result_dict[f"{key}.{name}"]=value.cpu().detach().numpy()
             
             np.savez(npz_path,**result_dict)
