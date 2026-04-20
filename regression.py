@@ -31,6 +31,8 @@ if __name__=="__main__":
                 "aesthetic":aesthetic,
                 "punsafe":punsafe
             }[args.y_column]
+            if l<10:
+                print(target)
             npz_file=os.path.join(sparse_dir,imgpath+".npz")
             if os.path.exists(npz_file):
                 features=np.load(npz_file)[args.block]
@@ -38,6 +40,7 @@ if __name__=="__main__":
                 if l<10:
                     print(features.shape)
                 dependent.extend([target for _ in range(n)])
+                features=[f for f in features if np.isfinite(f).all()]
                 independent.extend([f for f in features])
             elif l<10:
                 print(npz_file,"doesnt exists")
