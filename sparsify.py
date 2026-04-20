@@ -21,6 +21,8 @@ for block in tqdm(block_list, desc="Loading SAEs"):
     sae = SparseAutoencoder.load_from_disk(
         os.path.join(path_to_checkpoints, f"unet.{block}_k10_hidden5120_auxk256_bs4096_lr0.0001", "final"),
     )
+    if torch.isnan(sae.decoder.weight).any():
+        print("nan decoder weight ",block)
     means = torch.load(
         os.path.join(path_to_checkpoints, f"unet.{block}_k10_hidden5120_auxk256_bs4096_lr0.0001", "final", "mean.pt"),
         weights_only=True
