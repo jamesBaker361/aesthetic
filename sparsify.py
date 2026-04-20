@@ -26,6 +26,9 @@ for block in tqdm(block_list, desc="Loading SAEs"):
         weights_only=True
     )
     
+    if torch.isnan(means).any():
+        print(" nan mean for ",block)
+    
     saes_dict[block]=sae
     means_dict[block]=means
     
@@ -46,8 +49,11 @@ for file in tqdm(os.listdir(src_dir), desc="Sparsifying"):
             input_data=data["saved_input."+block]
             output_data=data["saved_output."+block]
             x=torch.tensor(output_data-input_data).squeeze(0).permute(1,2,0).flatten(0,1)
-            
+            if torch.isnan(x).any():
+                print("nan x ",new_path)
             features=sae.encode(x)
+            if torch.isnan(features).any():
+                print("nan features ",new_path)
             features=features.cpu()-means_dict[block].cpu()
             result[block]=features.cpu().detach().numpy()
     np.savez(new_path,**result)
