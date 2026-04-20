@@ -37,9 +37,7 @@ def main(args):
     size: int = args.size
     
 
-    clip_dir=os.path.join(save_dir,"clip")
-    sdxl_dir=os.path.join(save_dir, "sdxl")
-    for d in [save_dir,clip_dir,sdxl_dir]:
+    for d in [save_dir]:
         os.makedirs(d,exist_ok=True)
 
 
@@ -195,7 +193,7 @@ def main(args):
                         print(npz_path,"nan value ",key)
                     result_dict[f"{key}.{name}"]=value.cpu().detach().numpy()
             
-            np.savez(npz_path,**result_dict)
+            #np.savez(npz_path,**result_dict) no saving while debugging
             session_count+=1
             if session_count%250==0:
                 print(f"processed {session_count}+{count}={session_count+count} / {len(path_list)}")
