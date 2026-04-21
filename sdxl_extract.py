@@ -61,7 +61,7 @@ def main(args):
             variant=("fp16" if dtype==torch.float16 else None)
         )
 
-    pipe.vae=AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
+    
     path_to_checkpoints = './sdxl_unbox/checkpoints/'
 
     block_list=[
@@ -80,13 +80,7 @@ def main(args):
         setattr(module,"saved_output",output)
         return output
     unet: UNet2DConditionModel =pipe.unet
-    vae=pipe.vae
-    def assert_no_nan(model):
-        for name, p in model.named_parameters():
-            if not torch.isfinite(p).all():
-                raise ValueError(f"Invalid values in {name}")
-    print("vae type ",type(vae))
-    assert_no_nan(vae)
+    
     
     scheduler=pipe.scheduler
     tokenizer=pipe.tokenizer
@@ -103,6 +97,14 @@ def main(args):
         return param.device, param.dtype
             
     device, dtype = get_unet_device_dtype(pipe.unet)
+    pipe.vae=AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16).to(device)
+    vae=pipe.vae
+    def assert_no_nan(model):
+        for name, p in model.named_parameters():
+            if not torch.isfinite(p).all():
+                raise ValueError(f"Invalid values in {name}")
+    print("vae type ",type(vae))
+    assert_no_nan(vae)
             
     path_list=[f for f in os.listdir(src_dir) if f.endswith(".jpg")]
     count=len([p for p in os.listdir(save_dir) if p.endswith(".npz")])
@@ -148,7 +150,7 @@ def main(args):
                 
             print("max min ",image_pt.max(),image_pt.min())
 
-            latents=vae.encode(image_pt).latent_dist.sample()
+            latents=vae.config.scaling_factor* vae.encode(image_pt).latent_dist.sample()
             if torch.isnan(latents).any():
                 print("nan latents")
             noise = torch.randn_like(latents)
