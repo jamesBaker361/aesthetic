@@ -15,6 +15,8 @@ info_path="laion/info.csv"
 sparse_dir="sparse_embeddings"
 dest_dir="statistics"
 
+os.makedirs(dest_dir,exist_ok=True)
+
 if __name__=="__main__":
     args=parser.parse_args()
     dependent=[]
