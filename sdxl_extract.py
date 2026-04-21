@@ -7,6 +7,7 @@ from sdxl_pipe import HookedStableDiffusionXLWithUNetPipeline
 from diffusers import UNet2DConditionModel
 from transformers import AutoProcessor, CLIPVisionModel,CLIPVisionModelWithProjection
 from diffusers.image_processor import VaeImageProcessor
+from diffusers import DiffusionPipeline, AutoencoderKL
 import torch
 from PIL import Image
 import numpy as np
@@ -42,7 +43,7 @@ def main(args):
 
 
 
-    dtype=torch.float32
+    dtype=torch.float16
 
     if torch.cuda.is_available():
 
@@ -60,6 +61,7 @@ def main(args):
             variant=("fp16" if dtype==torch.float16 else None)
         )
 
+    pipe.vae=AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
     path_to_checkpoints = './sdxl_unbox/checkpoints/'
 
     block_list=[
