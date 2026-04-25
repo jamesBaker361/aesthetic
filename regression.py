@@ -7,6 +7,7 @@ from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 from sklearn.metrics import r2_score
+from experiment_helpers.argprint import print_args
 
 class ElasticRegression:
     def __init__(self, learning_rate, iterations, l1_penalty, l2_penalty):
@@ -54,6 +55,7 @@ dest_dir="statistics"
 os.makedirs(dest_dir,exist_ok=True)
 
 if __name__=="__main__":
+    print_args(parser)
     args=parser.parse_args()
     dependent=[]
     independent=[]
@@ -86,8 +88,8 @@ if __name__=="__main__":
             
     print(" len samples",len(dependent))
     
-    independent=np.array(independent)
-    dependent=np.array(dependent)
+    independent=np.array(independent).astype(np.float16)
+    dependent=np.array(dependent).astype(np.float16)
 
     indep_mean = independent.mean(axis=0)
     indep_std = independent.std(axis=0)
@@ -143,5 +145,12 @@ if __name__=="__main__":
     r2 = r2_score(dep_test, pred)
     print("\tR2 Score:", r2)
     
-    np.savez(os.path.join(dest_dir,args.block),weights_linear=x,covar=covariance)
+    np.savez(os.path.join(dest_dir,args.block,args.y_column),
+             weights_linear=x,
+             weights_elastic=model.W,
+             covar=covariance,
+             indep_mean=indep_mean,
+             dep_mean=dep_mean,
+             indep_std=indep_std,
+             dep_std=dep_std)
     
