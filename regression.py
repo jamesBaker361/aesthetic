@@ -109,7 +109,7 @@ if __name__=="__main__":
         print(name,var.shape)
     print("indep test")
     t0=time.time()
-    x,residuals,rank,s=np.linalg.lstsq(indep_train,dep_train,rcond=None)
+    x,residuals,rank,s=np.linalg.lstsq(indep_train,np.expand_dims(dep_train,axis=0),rcond=None)
     print(f"lstsq: {time.time()-t0:.2f}s")
     t0=time.time()
     covariance=np.corrcoef(independent)
