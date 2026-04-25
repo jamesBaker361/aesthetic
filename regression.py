@@ -103,8 +103,11 @@ if __name__=="__main__":
         dependent, independent, test_size=0.05, random_state=42
     )
     
-    print("dependnent",dependent.shape)
-    print("indpednent ",independent.shape)
+    
+    for var,name in zip([indep_train, indep_test, dep_train, dep_test,independent,dependent],
+                        ["indep_train", "indep_test", "dep_train", "dep_test","independent","dependent"]):
+        print(name,var.shape)
+    print("indep test")
     t0=time.time()
     x,residuals,rank,s=np.linalg.lstsq(indep_train,dep_train,rcond=None)
     print(f"lstsq: {time.time()-t0:.2f}s")
