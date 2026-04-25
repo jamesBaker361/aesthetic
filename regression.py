@@ -58,10 +58,10 @@ os.makedirs(dest_dir,exist_ok=True)
 if __name__=="__main__":
     print_args(parser)
     args=parser.parse_args()
+    indep_chunks=[]
     dependent=[]
-    independent=[]
     with open(info_path,"r") as file:
-        for l,line in enumerate(tqdm(file.readlines())):
+        for l,line in enumerate(tqdm(file)):
             if l==args.limit:
                 break
             [imgpath,aesthetic,punsafe]=line.strip().split(",")
@@ -77,19 +77,20 @@ if __name__=="__main__":
             npz_file=os.path.join(sparse_dir,imgpath+".npz")
             if os.path.exists(npz_file):
                 features=np.load(npz_file)[args.block]
-                n=features.shape[0]
                 if l<10:
                     print(features.shape)
-                
-                features=[f for f in features if np.isfinite(f).all()]
-                independent.extend([f for f in features])
-                dependent.extend([target for _ in range(len(features))])
+                mask=np.isfinite(features).all(axis=1)
+                features=features[mask]
+                if len(features):
+                    indep_chunks.append(features)
+                    dependent.extend([target]*len(features))
             elif l<10:
                 print(npz_file,"doesnt exists")
-            
+
     print(" len samples",len(dependent))
-    
-    independent=np.array(independent)
+
+    independent=np.vstack(indep_chunks)
+    del indep_chunks
     dependent=np.array(dependent)
 
     indep_mean = independent.mean(axis=0)
