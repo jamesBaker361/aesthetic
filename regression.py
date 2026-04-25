@@ -99,9 +99,11 @@ if __name__=="__main__":
     dep_std = dependent.std()
     dependent = (dependent - dep_mean) / dep_std
 
-    indep_train, indep_test, dep_train, dep_test = train_test_split(
-        dependent, independent, test_size=0.05, random_state=42
-    )
+    split=int(len(dependent)*0.05)
+    indep_test=independent[:split]
+    indep_train=independent[split:]
+    dep_test=dependent[:split]
+    dep_train=dependent[split:]
     
     
     for var,name in zip([indep_train, indep_test, dep_train, dep_test,independent,dependent],
@@ -109,7 +111,7 @@ if __name__=="__main__":
         print(name,var.shape)
     print("indep test")
     t0=time.time()
-    x,residuals,rank,s=np.linalg.lstsq(indep_train,np.expand_dims(dep_train,axis=0),rcond=None)
+    x,residuals,rank,s=np.linalg.lstsq(indep_train,dep_train,rcond=None)
     print(f"lstsq: {time.time()-t0:.2f}s")
     t0=time.time()
     covariance=np.corrcoef(independent)
