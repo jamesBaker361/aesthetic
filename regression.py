@@ -4,6 +4,9 @@ import os
 import csv
 import time
 from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+from sklearn.metrics import r2_score
 
 class ElasticRegression:
     def __init__(self, learning_rate, iterations, l1_penalty, l2_penalty):
@@ -85,13 +88,55 @@ if __name__=="__main__":
     
     independent=np.array(independent)
     dependent=np.array(dependent)
+
+    indep_mean = independent.mean(axis=0)
+    indep_std = independent.std(axis=0)
+    indep_std[indep_std == 0] = 1
+    independent = (independent - indep_mean) / indep_std
+    independent = np.hstack([independent, np.ones((independent.shape[0], 1))])
+
+    dep_mean = dependent.mean()
+    dep_std = dependent.std()
+    dependent = (dependent - dep_mean) / dep_std
+
+    indep_train, indep_test, dep_train, dep_test = train_test_split(
+        dependent, independent, test_size=0.05, random_state=42
+    )
+    
     print("dependnent",dependent.shape)
     print("indpednent ",independent.shape)
     t0=time.time()
-    x,residuals,rank,s=np.linalg.lstsq(independent,dependent,rcond=None)
+    x,residuals,rank,s=np.linalg.lstsq(indep_train,dep_train,rcond=None)
     print(f"lstsq: {time.time()-t0:.2f}s")
     t0=time.time()
     covariance=np.corrcoef(independent)
     print(f"covariance: {time.time()-t0:.2f}s")
-    np.savez(os.path.join(dest_dir,args.block),weights=x,covar=covariance)
+    
+    pred=x @ indep_test
+    print("linear regression")
+    mse = mean_squared_error(dep_test, pred)
+    print("\tmse ",mse)
+    rmse=np.sqrt(mse)
+    print("\trmse ",rmse)
+    r2 = r2_score(dep_test, pred)
+    print("\tR2 Score:", r2)
+    
+    #elastic regression
+    model = ElasticRegression(
+        iterations=10000,
+        learning_rate=0.01,
+        l1_penalty=500,
+        l2_penalty=1
+    )
+    model.fit(indep_train,dep_train)
+    print("elastic regression")
+    pred=model.predict(indep_test)
+    mse = mean_squared_error(dep_test, pred)
+    print("\tmse ",mse)
+    rmse=np.sqrt(mse)
+    print("\trmse ",rmse)
+    r2 = r2_score(dep_test, pred)
+    print("\tR2 Score:", r2)
+    
+    np.savez(os.path.join(dest_dir,args.block),weights_linear=x,covar=covariance)
     
