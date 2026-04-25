@@ -88,8 +88,8 @@ if __name__=="__main__":
             
     print(" len samples",len(dependent))
     
-    independent=np.array(independent).astype(np.float16)
-    dependent=np.array(dependent).astype(np.float16)
+    independent=np.array(independent)
+    dependent=np.array(dependent)
 
     indep_mean = independent.mean(axis=0)
     indep_std = independent.std(axis=0)
@@ -116,7 +116,7 @@ if __name__=="__main__":
     x,residuals,rank,s=np.linalg.lstsq(indep_train,dep_train,rcond=None)
     print(f"lstsq: {time.time()-t0:.2f}s")
     t0=time.time()
-    covariance=np.corrcoef(independent)
+    covariance=np.corrcoef(independent.astype(np.float16))
     print(f"covariance: {time.time()-t0:.2f}s")
     
     pred=x @ indep_test
