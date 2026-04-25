@@ -19,7 +19,7 @@ class ElasticRegression:
     def fit(self, X, Y):
         self.m, self.n = X.shape
         self.W = np.zeros(self.n)
-        self.b = 0
+        #self.b = 0
         self.X = X
         self.Y = Y
         for i in range(self.iterations):
@@ -29,19 +29,20 @@ class ElasticRegression:
     def update_weights(self):
         Y_pred = self.predict(self.X)
         dW = np.zeros(self.n)
+        residual = self.Y - Y_pred
         for j in range(self.n):
             l1_grad = self.l1_penalty if self.W[j] > 0 else -self.l1_penalty
             dW[j] = (
-                -2 * (self.X[:, j]).dot(self.Y - Y_pred) +
+                -2 * (self.X[:, j]).dot(residual) +
                 l1_grad + 2 * self.l2_penalty * self.W[j]
             ) / self.m
-        db = -2 * np.sum(self.Y - Y_pred) / self.m
+        #db = -2 * np.sum(self.Y - Y_pred) / self.m
         self.W -= self.learning_rate * dW
-        self.b -= self.learning_rate * db
+        #self.b -= self.learning_rate * db
         return self
 
     def predict(self, X):
-        return X.dot(self.W) + self.b
+        return X.dot(self.W)  #+ self.b
 
 parser=argparse.ArgumentParser()
 parser.add_argument("--y_column",type=str,default="aesthetic") #column 0 = aesthetic column = 1 = p(unsafe)
@@ -95,6 +96,7 @@ if __name__=="__main__":
     indep_std = independent.std(axis=0)
     indep_std[indep_std == 0] = 1
     independent = (independent - indep_mean) / indep_std
+    #independent = np.hstack([independent, np.ones((independent.shape[0], 1))]) bias doesn't rlly matter?
     independent = np.hstack([independent, np.ones((independent.shape[0], 1))])
 
     dep_mean = dependent.mean()
@@ -116,10 +118,10 @@ if __name__=="__main__":
     x,residuals,rank,s=np.linalg.lstsq(indep_train,dep_train,rcond=None)
     print(f"lstsq: {time.time()-t0:.2f}s")
     t0=time.time()
-    covariance=np.corrcoef(independent.astype(np.float16))
+    covariance=np.corrcoef(independent.astype(np.float16),rowvar=False)
     print(f"covariance: {time.time()-t0:.2f}s")
     
-    pred=x @ indep_test
+    pred= indep_test @ x
     print("linear regression")
     mse = mean_squared_error(dep_test, pred)
     print("\tmse ",mse)
