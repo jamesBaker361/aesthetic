@@ -25,6 +25,7 @@ os.makedirs(dest_dir,exist_ok=True)
 if __name__=="__main__":
     print_args(parser)
     args=parser.parse_args()
+    print(args)
     indep_chunks=[]
     dependent=[]
     with open(info_path,"r") as file:
