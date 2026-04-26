@@ -65,24 +65,24 @@ if __name__=="__main__":
     indep_std = independent.std(axis=0)
     indep_std[indep_std == 0] = 1
     independent = (independent - indep_mean) / indep_std
-    #independent = np.hstack([independent, np.ones((independent.shape[0], 1))]) bias doesn't rlly matter?
+    
+    t0=time.time()
+    covariance=np.cov(independent,rowvar=False)
+    print(f"covariance: {time.time()-t0:.2f}s")
+    
     independent = np.hstack([independent, np.ones((independent.shape[0], 1))])
 
     dep_mean = dependent.mean()
     dep_std = dependent.std()
     dependent = (dependent - dep_mean) / dep_std
 
-    split=int(len(dependent)*0.05)
-    indep_test=independent[:split]
-    indep_train=independent[split:]
-    dep_test=dependent[:split]
-    dep_train=dependent[split:]
-    
-    
+    indep_train, indep_test, dep_train, dep_test = train_test_split(
+        independent, dependent, test_size=0.05, random_state=42)
+
     for var,name in zip([indep_train, indep_test, dep_train, dep_test,independent,dependent],
                         ["indep_train", "indep_test", "dep_train", "dep_test","independent","dependent"]):
         print(name,var.shape)
-        
+
     npz_dict={}
     for solver_class,name in zip(
             [LinearRegression,ElasticNet,Ridge,Lasso],
@@ -90,19 +90,17 @@ if __name__=="__main__":
         model=solver_class()
         t0=time.time()
         model.fit(indep_train,dep_train)
+        preds=model.predict(indep_test)
+        mse=mean_squared_error(dep_test,preds)
+        r2=r2_score(dep_test,preds)
+        print(f"{name} {time.time()-t0:.2f}s  mse={mse:.4f}  r2={r2:.4f}")
+        npz_dict[f"{name}_coef"]=model.coef_
         for key,value in model.get_params().items():
             npz_dict[f"{name}_{key}"]=value
-        print(f"{name} {time.time()-t0:.2f}s")
-        
-        
 
-    
-    
-    t0=time.time()
-    covariance=np.corrcoef(independent,rowvar=False)
-    print(f"covariance: {time.time()-t0:.2f}s")
-    
-    np.savez(os.path.join(dest_dir,args.block,args.y_column),
+    save_dir=os.path.join(dest_dir,args.block)
+    os.makedirs(save_dir,exist_ok=True)
+    np.savez(os.path.join(save_dir,args.y_column),
              covar=covariance,
              indep_mean=indep_mean,
              dep_mean=dep_mean,
