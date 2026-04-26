@@ -8,41 +8,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 from sklearn.metrics import r2_score
 from experiment_helpers.argprint import print_args
+from sklearn.linear_model import Ridge,LinearRegression,ElasticNet,Lasso
 
-class ElasticRegression:
-    def __init__(self, learning_rate, iterations, l1_penalty, l2_penalty):
-        self.learning_rate = learning_rate
-        self.iterations = iterations
-        self.l1_penalty = l1_penalty
-        self.l2_penalty = l2_penalty
-
-    def fit(self, X, Y):
-        self.m, self.n = X.shape
-        self.W = np.zeros(self.n)
-        #self.b = 0
-        self.X = X
-        self.Y = Y
-        for i in range(self.iterations):
-            self.update_weights()
-        return self
-
-    def update_weights(self):
-        Y_pred = self.predict(self.X)
-        dW = np.zeros(self.n)
-        residual = self.Y - Y_pred
-        for j in range(self.n):
-            l1_grad = self.l1_penalty if self.W[j] > 0 else -self.l1_penalty
-            dW[j] = (
-                -2 * (self.X[:, j]).dot(residual) +
-                l1_grad + 2 * self.l2_penalty * self.W[j]
-            ) / self.m
-        #db = -2 * np.sum(self.Y - Y_pred) / self.m
-        self.W -= self.learning_rate * dW
-        #self.b -= self.learning_rate * db
-        return self
-
-    def predict(self, X):
-        return X.dot(self.W)  #+ self.b
 
 parser=argparse.ArgumentParser()
 parser.add_argument("--y_column",type=str,default="aesthetic") #column 0 = aesthetic column = 1 = p(unsafe)
@@ -114,46 +81,30 @@ if __name__=="__main__":
     for var,name in zip([indep_train, indep_test, dep_train, dep_test,independent,dependent],
                         ["indep_train", "indep_test", "dep_train", "dep_test","independent","dependent"]):
         print(name,var.shape)
-    print("indep test")
+        
+    npz_dict={}
+    for solver_class,name in zip(
+            [LinearRegression,ElasticNet,Ridge,Lasso],
+            ["LinearRegression","ElasticNet","Ridge","Lasso"]):
+        model=solver_class()
+        t0=time.time()
+        model.fit(indep_train,dep_train)
+        for key,value in model.get_params().items():
+            npz_dict[f"{name}_{key}"]=value
+        print(f"{name} {time.time()-t0:.2f}s")
+        
+        
+
+    
+    
     t0=time.time()
-    x,residuals,rank,s=np.linalg.lstsq(indep_train,dep_train,rcond=None)
-    print(f"lstsq: {time.time()-t0:.2f}s")
-    t0=time.time()
-    covariance=np.corrcoef(independent.astype(np.float16),rowvar=False)
+    covariance=np.corrcoef(independent,rowvar=False)
     print(f"covariance: {time.time()-t0:.2f}s")
     
-    pred= indep_test @ x
-    print("linear regression")
-    mse = mean_squared_error(dep_test, pred)
-    print("\tmse ",mse)
-    rmse=np.sqrt(mse)
-    print("\trmse ",rmse)
-    r2 = r2_score(dep_test, pred)
-    print("\tR2 Score:", r2)
-    
-    #elastic regression
-    model = ElasticRegression(
-        iterations=10000,
-        learning_rate=0.01,
-        l1_penalty=500,
-        l2_penalty=1
-    )
-    model.fit(indep_train,dep_train)
-    print("elastic regression")
-    pred=model.predict(indep_test)
-    mse = mean_squared_error(dep_test, pred)
-    print("\tmse ",mse)
-    rmse=np.sqrt(mse)
-    print("\trmse ",rmse)
-    r2 = r2_score(dep_test, pred)
-    print("\tR2 Score:", r2)
-    
     np.savez(os.path.join(dest_dir,args.block,args.y_column),
-             weights_linear=x,
-             weights_elastic=model.W,
              covar=covariance,
              indep_mean=indep_mean,
              dep_mean=dep_mean,
              indep_std=indep_std,
-             dep_std=dep_std)
+             dep_std=dep_std,**npz_dict)
     
