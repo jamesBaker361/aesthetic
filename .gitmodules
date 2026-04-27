@@ -7,3 +7,6 @@
 [submodule "improved-aesthetic-predictor"]
 	path = improved-aesthetic-predictor
 	url = https://github.com/christophschuhmann/improved-aesthetic-predictor.git
+[submodule "CLIP-based-NSFW-Detector"]
+	path = CLIP-based-NSFW-Detector
+	url = https://github.com/LAION-AI/CLIP-based-NSFW-Detector.git
