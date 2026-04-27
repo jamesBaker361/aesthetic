@@ -4,3 +4,6 @@
 [submodule "clip_surgery"]
 	path = clip_surgery
 	url = https://github.com/xmed-lab/CLIP_Surgery.git
+[submodule "improved-aesthetic-predictor"]
+	path = improved-aesthetic-predictor
+	url = https://github.com/christophschuhmann/improved-aesthetic-predictor.git
