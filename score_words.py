@@ -212,71 +212,72 @@ class NSFWScorer(nn.Module):
             embeddings = torch.from_numpy(embeddings.copy())
         return self.nsfw_model(embeddings.to(self.device)).squeeze(1)  # type: ignore[no-any-return]
     
-aesthetic_model = MLP(768)  # CLIP embedding dim is 768 for CLIP ViT L 14
-state_dict = torch.load("improved-aesthetic-predictor/sac+logos+ava1-l14-linearMSE.pth")   # load the model you trained previously or the model available in this repo
-aesthetic_model.load_state_dict(state_dict)
-aesthetic_model.eval()
+if __name__=="__main__":
+    aesthetic_model = MLP(768)  # CLIP embedding dim is 768 for CLIP ViT L 14
+    state_dict = torch.load("improved-aesthetic-predictor/sac+logos+ava1-l14-linearMSE.pth")   # load the model you trained previously or the model available in this repo
+    aesthetic_model.load_state_dict(state_dict)
+    aesthetic_model.eval()
 
-NSFWScorer.download_weights_on_node(os.getcwd())
-nsfw_model=NSFWScorer(model_dir=os.getcwd())
-nsfw_model.setup()
+    NSFWScorer.download_weights_on_node(os.getcwd())
+    nsfw_model=NSFWScorer(model_dir=os.getcwd())
+    nsfw_model.setup()
 
-clip_model = CLIPTextModelWithProjection.from_pretrained("openai/clip-vit-large-patch14")
-tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+    clip_model = CLIPTextModelWithProjection.from_pretrained("openai/clip-vit-large-patch14")
+    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
 
-vocab = tokenizer.get_vocab()   # dict: token -> id
-vocab = list(vocab.keys())
-import nltk
-from nltk.corpus import wordnet as wn
+    vocab = tokenizer.get_vocab()   # dict: token -> id
+    vocab = list(vocab.keys())
+    import nltk
+    from nltk.corpus import wordnet as wn
 
-nltk.download("wordnet")
+    nltk.download("wordnet")
 
-words = set()
-for syn in wn.all_synsets():
-    for lemma in syn.lemma_names():
-        words.add(lemma.lower())
+    words = set()
+    for syn in wn.all_synsets():
+        for lemma in syn.lemma_names():
+            words.add(lemma.lower())
 
-word_list=[w for w in words]
-random.shuffle(word_list)
-word_list=word_list[:5000]
+    word_list=[w for w in words]
+    random.shuffle(word_list)
+    word_list=word_list[:5000]
 
-vocab.extend(word_list)
+    vocab.extend(word_list)
 
-nsfw_data=load_dataset("AIML-TUDA/i2p",split="train") #might have to filter this so its only the first 200 of each image
-for row in nsfw_data:
-    vocab.append(row["prompt"])
-    
-aesthetic_data=load_dataset("moonworks/lunara-aesthetic",split="train")
-for row in aesthetic_data:
-    vocab.append(row["prompt"])
+    nsfw_data=load_dataset("AIML-TUDA/i2p",split="train") #might have to filter this so its only the first 200 of each image
+    for row in nsfw_data:
+        vocab.append(row["prompt"])
+        
+    aesthetic_data=load_dataset("moonworks/lunara-aesthetic",split="train")
+    for row in aesthetic_data:
+        vocab.append(row["prompt"])
 
-output_file = "output.csv"
+    output_file = "output.csv"
 
-if os.path.exists(output_file):
-    with open(output_file, "r") as f:
-        num_lines = sum(1 for _ in f)
-else:
-    num_lines = 0
+    if os.path.exists(output_file):
+        with open(output_file, "r") as f:
+            num_lines = sum(1 for _ in f)
+    else:
+        num_lines = 0
 
-with open(output_file, "a") as f:
-    if num_lines == 0:
-        f.write("word,aesthetic_score,nsfw_score\n")
-        num_lines = 1
-    for t,word in enumerate(vocab):
-        if t< num_lines:
-            continue
-        word = word.strip()
-        word = re.sub(r'[^a-zA-Z0-9 ]', '', word).strip()
-        if not word:
-            continue
-        inputs = tokenizer([word], padding=True, return_tensors="pt")
-        with torch.inference_mode():
-            outputs = clip_model(**inputs)
-        text_embeds = F.normalize(outputs.text_embeds, dim=-1)
-        if t == num_lines:
-            print(type(text_embeds))
-            print(text_embeds.size())
-        with torch.no_grad():
-            aesthetic_score = aesthetic_model(text_embeds)
-        nsfw_score = nsfw_model(text_embeds)
-        f.write(f"{word},{aesthetic_score.item():.4f},{nsfw_score.item():.4f}\n")
+    with open(output_file, "a") as f:
+        if num_lines == 0:
+            f.write("word,aesthetic_score,nsfw_score\n")
+            num_lines = 1
+        for t,word in enumerate(vocab):
+            if t< num_lines:
+                continue
+            word = word.strip()
+            word = re.sub(r'[^a-zA-Z0-9 ]', '', word).strip()
+            if not word:
+                continue
+            inputs = tokenizer([word], padding=True, return_tensors="pt")
+            with torch.inference_mode():
+                outputs = clip_model(**inputs)
+            text_embeds = F.normalize(outputs.text_embeds, dim=-1)
+            if t == num_lines:
+                print(type(text_embeds))
+                print(text_embeds.size())
+            with torch.no_grad():
+                aesthetic_score = aesthetic_model(text_embeds)
+            nsfw_score = nsfw_model(text_embeds)
+            f.write(f"{word},{aesthetic_score.item():.4f},{nsfw_score.item():.4f}\n")
