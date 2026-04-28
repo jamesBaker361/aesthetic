@@ -39,13 +39,23 @@ def jpeg_compressibility():
 
 
 def aesthetic_score():
-    from d3po.d3po_pytorch.aesthetic_scorer import AestheticScorer
+    from score_words import MLP
+    
+    aesthetic_model = MLP(768)  # CLIP embedding dim is 768 for CLIP ViT L 14
+    state_dict = torch.load("improved-aesthetic-predictor/sac+logos+ava1-l14-linearMSE.pth")   # load the model you trained previously or the model available in this repo
+    aesthetic_model.load_state_dict(state_dict)
+    aesthetic_model.eval()
+    
+    clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").cuda()
+    processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
-    scorer = AestheticScorer(dtype=torch.float32).cuda()
 
     def _fn(images, prompts, metadata):
         images = (images * 255).round().clamp(0, 255).to(torch.uint8)
-        scores = scorer(images)
+        inputs = {k: v.cuda() for k, v in processor(images=images, return_tensors="pt").items()}
+        outputs = clip_model(**inputs)
+        image_embeds = F.normalize(outputs.image_embeds, dim=-1)
+        scores = aesthetic_model(image_embeds)
         return scores, {}
 
     return _fn
