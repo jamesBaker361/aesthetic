@@ -59,7 +59,7 @@ def train_and_save(config,
          pretrained_model:str,
          prompt_fn_name:str,
          reward_fn_name:str,
-         batch_size:int):
+         batch_size:int)->StableDiffusionPipeline:
 
     unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
     if not config.run_name:
@@ -630,6 +630,7 @@ def train_and_save(config,
 
             if epoch!=0 and (epoch+1) % config.save_freq == 0 and accelerator.is_main_process:
                 accelerator.save_state()
+    return pipeline
 
 
 if __name__ == "__main__":
