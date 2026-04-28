@@ -144,13 +144,16 @@ def main(args):
                     
             
             image_pt=image_processor.preprocess(image,size,size).to(device=device,dtype=dtype) #all images have to be the same size so we can do batching
-
+            if r==count:
+                print("image size ",image_pt.size())
             if torch.isnan(image_pt).any():
                 print("nann image")
                 
             print("max min ",image_pt.max(),image_pt.min())
 
             latents=vae.config.scaling_factor* vae.encode(image_pt).latent_dist.sample()
+            if r==count:
+                print("ilatnes size ",latents.size())
             if torch.isnan(latents).any():
                 print("nan latents")
             noise = torch.randn_like(latents)
@@ -213,6 +216,8 @@ def main(args):
                         value=value[0]
                     if torch.isnan(value).any():
                         print(npz_path,"nan value ",key)
+                    if r==count:
+                        print(f"{key}.{name}  size ",value.size())
                     result_dict[f"{key}.{name}"]=value.cpu().detach().numpy()
             
             np.savez(npz_path,**result_dict) #no saving while debugging
