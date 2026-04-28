@@ -92,5 +92,6 @@ if __name__=="__main__":
         img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
         big_img_list.append(img)
         
-    concat_images_vertically(big_img_list).save("sparse?")
+    concat_images_vertically(big_img_list).save("sparse.png")
+    print('all done')
             
