@@ -12,8 +12,9 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed, ProjectConfiguration
 from accelerate.logging import get_logger
 from diffusers import StableDiffusionPipeline, DDIMScheduler, UNet2DConditionModel
-from diffusers.loaders import AttnProcsLayers
-from diffusers.models.attention_processor import LoRAAttnProcessor
+from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
+from diffusers.utils.torch_utils import is_compiled_module
+from diffusers.training_utils import cast_training_params, compute_snr
 import numpy as np
 import d3po_prompts
 import d3po_rewards
@@ -25,9 +26,32 @@ from functools import partial
 import tqdm
 import tempfile
 from PIL import Image
+from peft import LoraConfig, get_peft_model
+from diffusers.utils import (
+    check_min_version,
+    convert_state_dict_to_diffusers,
+    convert_unet_state_dict_to_peft,
+    is_wandb_available,
+)
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
+def unet_lora_state_dict(unet: UNet2DConditionModel) -> dict[str, torch.Tensor]:
+    r"""
+    Returns:
+        A state dict containing just the LoRA parameters.
+    """
+    lora_state_dict = {}
 
+    for name, module in unet.named_modules():
+        if hasattr(module, "set_lora_layer"):
+            lora_layer = getattr(module, "lora_layer")
+            if lora_layer is not None:
+                current_lora_layer_sd = lora_layer.state_dict()
+                for lora_layer_matrix_name, lora_param in current_lora_layer_sd.items():
+                    # The matrix name can either be "down" or "up".
+                    lora_state_dict[f"{name}.lora.{lora_layer_matrix_name}"] = lora_param
+
+    return lora_state_dict
 
 
 def train_and_save(config,
@@ -115,55 +139,82 @@ def train_and_save(config,
         
     if config.use_lora:
         # Set correct lora layers
-        lora_attn_procs = {}
-        for name in pipeline.unet.attn_processors.keys():
-            cross_attention_dim = (
-                None if name.endswith("attn1.processor") else pipeline.unet.config.cross_attention_dim
-            )
-            if name.startswith("mid_block"):
-                hidden_size = pipeline.unet.config.block_out_channels[-1]
-            elif name.startswith("up_blocks"):
-                block_id = int(name[len("up_blocks.")])
-                hidden_size = list(reversed(pipeline.unet.config.block_out_channels))[block_id]
-            elif name.startswith("down_blocks"):
-                block_id = int(name[len("down_blocks.")])
-                hidden_size = pipeline.unet.config.block_out_channels[block_id]
-
-            lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
-        pipeline.unet.set_attn_processor(lora_attn_procs)
-        trainable_layers = AttnProcsLayers(pipeline.unet.attn_processors)
+        unet=pipeline.unet
+        UNET_TARGET_MODULES = [
+            "to_q",
+            "to_k",
+            "to_v",
+        ]
+        config = LoraConfig(
+            r=8,
+            lora_alpha=8,
+            target_modules=UNET_TARGET_MODULES,
+            lora_dropout=0.0,
+            bias="none",
+            init_lora_weights=True,
+        )
+        
+        unet.requires_grad_(False)
+        unet.add_adapter(config)
+        trainable_layers = filter(lambda p: p.requires_grad, unet.parameters())
     else:
         trainable_layers = pipeline.unet
 
     # set up diffusers-friendly checkpoint saving with Accelerate
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
 
     def save_model_hook(models, weights, output_dir):
-        assert len(models) == 1
-        if config.use_lora and isinstance(models[0], AttnProcsLayers):
-            pipeline.unet.save_attn_procs(output_dir)
-        elif not config.use_lora and isinstance(models[0], UNet2DConditionModel):
-            models[0].save_pretrained(os.path.join(output_dir, "unet"))
-        else:
-            raise ValueError(f"Unknown model type {type(models[0])}")
-        weights.pop()  # ensures that accelerate doesn't try to handle saving of the model
+        if accelerator.is_main_process:
+            unet_lora_layers_to_save = None
+
+            for model in models:
+                if isinstance(model, type(unwrap_model(unet))):
+                    unet_lora_layers_to_save = get_peft_model_state_dict(model)
+                else:
+                    raise ValueError(f"Unexpected save model: {model.__class__}")
+
+                # make sure to pop weight so that corresponding model is not saved again
+                weights.pop()
+
+            StableDiffusionPipeline.save_lora_weights(
+                save_directory=output_dir,
+                unet_lora_layers=unet_lora_layers_to_save,
+                safe_serialization=True,
+            )
 
     def load_model_hook(models, input_dir):
-        assert len(models) == 1
-        if config.use_lora and isinstance(models[0], AttnProcsLayers):
-            tmp_unet = UNet2DConditionModel.from_pretrained(
-                config.pretrained.model, revision=config.pretrained.revision, subfolder="unet"
-            )
-            tmp_unet.load_attn_procs(input_dir)
-            models[0].load_state_dict(AttnProcsLayers(tmp_unet.attn_processors).state_dict())
-            del tmp_unet
-        elif not config.use_lora and isinstance(models[0], UNet2DConditionModel):
-            load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
-            models[0].register_to_config(**load_model.config)
-            models[0].load_state_dict(load_model.state_dict())
-            del load_model
-        else:
-            raise ValueError(f"Unknown model type {type(models[0])}")
-        models.pop()  # ensures that accelerate doesn't try to handle loading of the model
+        unet_ = None
+
+        while len(models) > 0:
+            model = models.pop()
+            if isinstance(model, type(unwrap_model(unet))):
+                unet_ = model
+            else:
+                raise ValueError(f"unexpected save model: {model.__class__}")
+
+        # returns a tuple of state dictionary and network alphas
+        lora_state_dict, network_alphas = StableDiffusionPipeline.lora_state_dict(input_dir)
+
+        unet_state_dict = {f"{k.replace('unet.', '')}": v for k, v in lora_state_dict.items() if k.startswith("unet.")}
+        unet_state_dict = convert_unet_state_dict_to_peft(unet_state_dict)
+        incompatible_keys = set_peft_model_state_dict(unet_, unet_state_dict, adapter_name="default")
+
+        if incompatible_keys is not None:
+            # check only for unexpected keys
+            unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
+            # throw warning if some unexpected keys are found and continue loading
+            if unexpected_keys:
+                print(
+                    f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
+                    f" {unexpected_keys}. "
+                )
+
+        # Make sure the trainable params are in float32
+        if config.mixed_precision in ["fp16"]:
+            cast_training_params([unet_], dtype=torch.float32)
 
     # Support multi-dimensional comparison. Default demension is 1. You can add many rewards instead of only one to judge the preference of images.
     # For example: A: clipscore-30 blipscore-10 LAION aesthetic score-6.0 ; B: 20, 8, 5.0  then A is prefered than B
