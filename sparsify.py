@@ -71,7 +71,7 @@ def sparsify_embeddings():
 def get_top_k_images(block:str,index:int,k:int=10)->list[Image.Image]:
     rankings=[]
     for file in [f for f in os.listdir(image_src_dir) if f.endswith("jpg")]:
-        new_path=os.path.join(sparse_dest_dir,file)
+        new_path=os.path.join(sparse_dest_dir,file.replace(".jpg",".npz"))
         if os.path.exists(new_path):
             npz_dict=np.load(new_path)
             sparse_embedding=npz_dict[block]
@@ -80,10 +80,10 @@ def get_top_k_images(block:str,index:int,k:int=10)->list[Image.Image]:
             print(features.shape)
             largest=max(features)
             rankings.append([largest,file])
-            
+
     rankings.sort(key=lambda x:-x[0])
     rankings=rankings[:k]
-    return [Image.open(os.path.join(f[1])) for f in rankings]
+    return [Image.open(os.path.join(image_src_dir,f[1])) for f in rankings]
 
 if __name__=="__main__":
     big_img_list=[]
