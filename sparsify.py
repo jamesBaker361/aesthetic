@@ -81,7 +81,8 @@ def get_top_k_images(block:str,index:int,k:int=10)->Image.Image:
             largest=max(features)
             rankings.append([largest,file])
             
-    rankings.sort(key=lambda x:-x[0])[:k]
+    rankings.sort(key=lambda x:-x[0])
+    rankings=rankings[:k]
     return [Image.open(os.path.join(f[1])) for f in rankings]
 
 if __name__=="__main__":
