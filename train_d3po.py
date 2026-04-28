@@ -17,7 +17,7 @@ from diffusers.models.attention_processor import LoRAAttnProcessor
 import numpy as np
 import d3po_prompts
 import d3po_rewards
-from d3po.d3po_pytorch.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob
+from pipeline_with_logprob import pipeline_with_logprob
 from ddim_with_logprob import ddim_step_with_logprob
 import torch
 import wandb
