@@ -72,7 +72,7 @@ def train_and_save(config,
     available_devices = accelerator.num_processes
     random_seeds = np.random.randint(0,100000,size=available_devices)
     device_seed = random_seeds[accelerator.process_index]
-    set_seed(device_seed, device_specific=True)
+    set_seed(123)
 
     # load scheduler, tokenizer and models.
     pipeline = StableDiffusionPipeline.from_pretrained(pretrained_model, torch_dtype=torch.float16)
