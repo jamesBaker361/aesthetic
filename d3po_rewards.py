@@ -45,14 +45,16 @@ def aesthetic_score():
     state_dict = torch.load("improved-aesthetic-predictor/sac+logos+ava1-l14-linearMSE.pth")   # load the model you trained previously or the model available in this repo
     aesthetic_model.load_state_dict(state_dict)
     aesthetic_model.eval()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    aesthetic_model.to(device)
     
-    clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").cuda()
+    clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").to(device)
     processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
 
     def _fn(images, prompts, metadata):
         images = (images * 255).round().clamp(0, 255).to(torch.uint8)
-        inputs = {k: v.cuda() for k, v in processor(images=images, return_tensors="pt").items()}
+        inputs = {k: v.to(device) for k, v in processor(images=images, return_tensors="pt").items()}
         outputs = clip_model(**inputs)
         image_embeds = F.normalize(outputs.image_embeds, dim=-1)
         scores = aesthetic_model(image_embeds)
@@ -67,12 +69,14 @@ def nsfw_score():
     nsfw_model=NSFWScorer(model_dir=os.getcwd())
     nsfw_model.setup()
     
-    clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").cuda()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").to(device)
     processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
     def _fn(images, prompts, metadata):
         images = (images * 255).round().clamp(0, 255).to(torch.uint8)
-        inputs = {k: v.cuda() for k, v in processor(images=images, return_tensors="pt").items()}
+        inputs = {k: v.to(device) for k, v in processor(images=images, return_tensors="pt").items()}
         outputs = clip_model(**inputs)
         image_embeds = F.normalize(outputs.image_embeds, dim=-1)
         scores = nsfw_model(image_embeds)
