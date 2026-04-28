@@ -4,7 +4,7 @@ import os
 import numpy as np
 from tqdm import tqdm
 from PIL import Image
-
+from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
 
 
 block_list=[
@@ -68,7 +68,7 @@ def sparsify_embeddings():
         np.savez(new_path,**result)
         
         
-def get_top_k_images(block:str,index:int,k:int=10)->Image.Image:
+def get_top_k_images(block:str,index:int,k:int=10)->list[Image.Image]:
     rankings=[]
     for file in [f for f in os.listdir(image_src_dir) if f.endswith("jpg")]:
         new_path=os.path.join(sparse_dest_dir,file)
@@ -86,5 +86,11 @@ def get_top_k_images(block:str,index:int,k:int=10)->Image.Image:
     return [Image.open(os.path.join(f[1])) for f in rankings]
 
 if __name__=="__main__":
-    get_top_k_images("down_blocks.2.attentions.1",0)
+    big_img_list=[]
+    for n in range(10):
+        img_list=get_top_k_images("down_blocks.2.attentions.1",n)
+        img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
+        big_img_list.append(img)
+        
+    concat_images_vertically(big_img_list).save("sparse?")
             
