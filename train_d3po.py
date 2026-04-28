@@ -145,7 +145,7 @@ def train_and_save(config,
             "to_k",
             "to_v",
         ]
-        config = LoraConfig(
+        lora_config = LoraConfig(
             r=8,
             lora_alpha=8,
             target_modules=UNET_TARGET_MODULES,
@@ -155,7 +155,7 @@ def train_and_save(config,
         )
         
         unet.requires_grad_(False)
-        unet.add_adapter(config)
+        unet.add_adapter(lora_config)
         trainable_layers = filter(lambda p: p.requires_grad, unet.parameters())
     else:
         trainable_layers = pipeline.unet
