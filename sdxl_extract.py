@@ -112,6 +112,7 @@ def main(args):
     print(f"processed {count}/{len(path_list)} images")
     
     session_count=0
+    started=True
     
     for r,jpg_path in enumerate(tqdm(path_list)):
         if r<count:
@@ -144,7 +145,7 @@ def main(args):
                     
             
             image_pt=image_processor.preprocess(image,size,size).to(device=device,dtype=dtype) #all images have to be the same size so we can do batching
-            if r==count:
+            if started:
                 print("image size ",image_pt.size())
             if torch.isnan(image_pt).any():
                 print("nann image")
@@ -152,7 +153,7 @@ def main(args):
             print("max min ",image_pt.max(),image_pt.min())
 
             latents=vae.config.scaling_factor* vae.encode(image_pt).latent_dist.sample()
-            if r==count:
+            if started:
                 print("ilatnes size ",latents.size())
             if torch.isnan(latents).any():
                 print("nan latents")
@@ -216,12 +217,13 @@ def main(args):
                         value=value[0]
                     if torch.isnan(value).any():
                         print(npz_path,"nan value ",key)
-                    if r==count:
+                    if started:
                         print(f"{key}.{name}  size ",value.size())
                     result_dict[f"{key}.{name}"]=value.cpu().detach().numpy()
             
             np.savez(npz_path,**result_dict) #no saving while debugging
             session_count+=1
+            started=False
             if session_count%250==0:
                 print(f"processed {session_count}+{count}={session_count+count} / {len(path_list)}")
                 
