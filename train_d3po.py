@@ -59,7 +59,7 @@ def train_and_save(config,
          pretrained_model:str,
          prompt_fn_name:str,
          reward_fn_name:str,
-         batch_size:int)->StableDiffusionPipeline:
+         batch_size:int,save_dir:str)->StableDiffusionPipeline:
 
     unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
     if not config.run_name:
@@ -67,17 +67,17 @@ def train_and_save(config,
     else:
         config.run_name += "_" + unique_id
 
-    if config.resume_from:
-        config.resume_from = os.path.normpath(os.path.expanduser(config.resume_from))
-        if "checkpoint_" not in os.path.basename(config.resume_from):
-            # get the most recent checkpoint in this directory
-            checkpoints = list(filter(lambda x: "checkpoint_" in x, os.listdir(config.resume_from)))
-            if len(checkpoints) == 0:
-                raise ValueError(f"No checkpoints found in {config.resume_from}")
-            config.resume_from = os.path.join(
-                config.resume_from,
-                sorted(checkpoints, key=lambda x: int(x.split("_")[-1]))[-1],
-            )
+    os.makedirs(save_dir,exist_ok=True)
+    config.resume_from=save_dir
+    if "checkpoint_" not in os.path.basename(config.resume_from):
+        # get the most recent checkpoint in this directory
+        checkpoints = list(filter(lambda x: "checkpoint_" in x, os.listdir(config.resume_from)))
+        if len(checkpoints) == 0:
+            raise ValueError(f"No checkpoints found in {config.resume_from}")
+        config.resume_from = os.path.join(
+            config.resume_from,
+            sorted(checkpoints, key=lambda x: int(x.split("_")[-1]))[-1],
+        )
 
     # number of timesteps within each trajectory to train on
     num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
