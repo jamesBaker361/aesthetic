@@ -228,7 +228,7 @@ def train_and_save(config,
             max_length=pipeline.tokenizer.model_max_length,
         ).input_ids.to(accelerator.device)
     )[0]
-    sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.batch_size, 1, 1)
+    sample_neg_prompt_embeds = neg_prompt_embed.repeat(batch_size, 1, 1)
     train_neg_prompt_embeds = neg_prompt_embed.repeat(batch_size, 1, 1)
     # for some reason, autocast is necessary for non-lora training but for lora training it isn't necessary and it uses
     # more memory
@@ -282,16 +282,8 @@ def train_and_save(config,
                 truncation=True,
                 max_length=pipeline.tokenizer.model_max_length,
             ).input_ids.to(accelerator.device)
-
-            prompt_ids2 = pipeline.tokenizer(
-                prompts2,
-                return_tensors="pt",
-                padding="max_length",
-                truncation=True,
-                max_length=pipeline.tokenizer.model_max_length,
-            ).input_ids.to(accelerator.device)
             prompt_embeds1 = pipeline.text_encoder(prompt_ids1)[0]
-            prompt_embeds2 = pipeline.text_encoder(prompt_ids2)[0]
+            prompt_embeds2 = prompt_embeds1
 
             # sample
             with autocast():
@@ -314,7 +306,7 @@ def train_and_save(config,
                     guidance_scale=config.sample.guidance_scale,
                     eta=config.sample.eta,
                     output_type="pt",
-                    latents = latents1[:,0,:,:,:]
+                    latents = latents1[:,0,:,:,:]  # same init noise; requires eta > 0 to diverge
                 )
                 latents2 = torch.stack(latents2, dim=1)
                 log_probs2 = torch.stack(log_probs2, dim=1)
@@ -327,10 +319,11 @@ def train_and_save(config,
             next_latents = latents[:, :, 1:]
             timesteps = pipeline.scheduler.timesteps.repeat(config.sample.batch_size, 1)  # (batch_size, num_steps)
 
-            # compute rewards asynchronously
-            rewards1 = executor.submit(reward_fn, images1, prompts1, prompt_metadata).result()[0]
-            # yield to to make sure reward computation starts
-            rewards2 = executor.submit(reward_fn, images2, prompts2, prompt_metadata).result()[0]
+            # compute rewards concurrently
+            future1 = executor.submit(reward_fn, images1, prompts1, prompt_metadata)
+            future2 = executor.submit(reward_fn, images2, prompts2, prompt_metadata)
+            rewards1 = future1.result()[0]
+            rewards2 = future2.result()[0]
             if isinstance(rewards1, np.ndarray):
                 rewards = np.c_[rewards1, rewards2]
             else:
@@ -585,7 +578,7 @@ def train_and_save(config,
                     i + 1
                 ) % config.train.gradient_accumulation_steps == 0
                 # log training-related stuff
-                info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                info = {k: torch.tensor(v).mean() for k, v in info.items()}
                 info = accelerator.reduce(info, reduction="mean")
                 info.update({"epoch": epoch, "inner_epoch": inner_epoch})
                 accelerator.log(info, step=global_step)
