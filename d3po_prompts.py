@@ -61,3 +61,6 @@ def _load_aesthetic_vocab():
 
 def aesthetic_prompts():
     return random.choice(_load_aesthetic_vocab()), {}
+
+def merged_prompts():
+    return random.choice(_load_aesthetic_vocab() + _load_nsfw_vocab()), {}
