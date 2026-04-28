@@ -244,21 +244,10 @@ def train_and_save(config,
     if config.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    # Initialize the optimizer
-    if config.train.use_8bit_adam:
-        try:
-            import bitsandbytes as bnb
-        except ImportError:
-            raise ImportError(
-                "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
-            )
-
-        optimizer_cls = bnb.optim.AdamW8bit
-    else:
-        optimizer_cls = torch.optim.AdamW
+    optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
-        trainable_layers.parameters(),
+        trainable_layers,
         lr=config.train.learning_rate,
         betas=(config.train.adam_beta1, config.train.adam_beta2),
         weight_decay=config.train.adam_weight_decay,
@@ -618,7 +607,7 @@ def train_and_save(config,
                         # backward pass
                         accelerator.backward(loss)
                         if accelerator.sync_gradients:
-                            accelerator.clip_grad_norm_(trainable_layers.parameters(), config.train.max_grad_norm)
+                            accelerator.clip_grad_norm_(trainable_layers, config.train.max_grad_norm)
                         optimizer.step()
                         optimizer.zero_grad()
                         info["loss"].append(loss.item())
