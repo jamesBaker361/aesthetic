@@ -4,9 +4,6 @@ import functools
 import random
 from datasets import load_dataset
 
-ASSETS_PATH = resources.files("d3po_pytorch.assets")
-
-
 @functools.cache
 def _load_lines(path)->list[str]:
     """
@@ -14,10 +11,9 @@ def _load_lines(path)->list[str]:
     `d3po_pytorch/assets` directory for a file named `path`.
     """
     if not os.path.exists(path):
-        newpath = ASSETS_PATH.joinpath(path)
-        if not os.path.exists(newpath):
+        path =os.path.join("d3po","d3po_pytorch","assets",path)
+        if not os.path.exists(path):
             raise FileNotFoundError(f"Could not find {path} or ddpo_pytorch.assets/{path}")
-        path = newpath
     with open(path, "r") as f:
         return [line.strip() for line in f.readlines()]
 
