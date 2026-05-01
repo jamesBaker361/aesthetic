@@ -67,17 +67,7 @@ def train_and_save(config,
     else:
         config.run_name += "_" + unique_id
 
-    os.makedirs(save_dir,exist_ok=True)
-    config.resume_from=save_dir
-    if "checkpoint_" not in os.path.basename(config.resume_from):
-        # get the most recent checkpoint in this directory
-        checkpoints = list(filter(lambda x: "checkpoint_" in x, os.listdir(config.resume_from)))
-        if len(checkpoints) == 0:
-            raise ValueError(f"No checkpoints found in {config.resume_from}")
-        config.resume_from = os.path.join(
-            config.resume_from,
-            sorted(checkpoints, key=lambda x: int(x.split("_")[-1]))[-1],
-        )
+    
 
     # number of timesteps within each trajectory to train on
     num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
@@ -290,12 +280,21 @@ def train_and_save(config,
     assert config.sample.batch_size >= batch_size
     assert config.sample.batch_size % batch_size == 0
     assert samples_per_epoch % total_train_batch_size == 0
-
-    if config.resume_from:
-        accelerator.load_state(config.resume_from)
-        first_epoch = int(config.resume_from.split("_")[-1]) + 1
-    else:
-        first_epoch = 0
+    
+    os.makedirs(save_dir,exist_ok=True)
+    config.resume_from=save_dir
+    if "checkpoint_" not in os.path.basename(config.resume_from):
+        # get the most recent checkpoint in this directory
+        checkpoints = list(filter(lambda x: "checkpoint_" in x, os.listdir(config.resume_from)))
+        if len(checkpoints) == 0:
+            first_epoch = 0
+        else:
+            config.resume_from = os.path.join(
+                config.resume_from,
+                sorted(checkpoints, key=lambda x: int(x.split("_")[-1]))[-1],
+            )
+            accelerator.load_state(config.resume_from)
+            first_epoch = int(config.resume_from.split("_")[-1]) + 1
 
     global_step = 0
     for epoch in range(first_epoch, config.num_epochs):
