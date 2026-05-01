@@ -430,7 +430,7 @@ def train_and_save(config,
         rewards = accelerator.gather(samples["rewards"]).cpu().numpy()
         #record the better images' reward based on the reward model.
         if eval_rewards is not None:
-            eval_rewards = accelerator.gather(samples["eval_rewards"]).cpu().numpy()
+            eval_rewards = accelerator.gather(samples["eval_rewards"]).cpu().detach().numpy()
             accelerator.log(
                 {"eval_reward": eval_rewards, "num_samples": epoch*available_devices*config.sample.batch_size, "eval_reward_mean": eval_rewards.mean(), "eval_reward_std": eval_rewards.std()},
                 step=global_step,
