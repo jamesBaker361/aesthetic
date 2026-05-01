@@ -10,6 +10,13 @@ from sklearn.metrics import r2_score
 from experiment_helpers.argprint import print_args
 from sklearn.linear_model import Ridge,LinearRegression,ElasticNet,Lasso
 
+def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
+    #for each image find relevant patches and scores and save them
+    pass
+
+def run_regression(block:str,y_column:str,limit:int,clip_src_dir:str,stats_dest_dir:str):
+    pass
+
 
 parser=argparse.ArgumentParser()
 parser.add_argument("--y_column",type=str,default="aesthetic") #column 0 = aesthetic column = 1 = p(unsafe)

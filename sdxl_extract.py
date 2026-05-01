@@ -37,7 +37,12 @@ def main(args):
     src_dir : str = args.src_dir
     size: int = args.size
     
-
+def extract_vanilla(
+    save_dir : str,
+    src_dir : str,
+    limit : int,
+    size: int
+):
     for d in [save_dir]:
         os.makedirs(d,exist_ok=True)
 
@@ -229,8 +234,7 @@ def main(args):
                 
 
 
-    
-        
+
 
 
 if __name__=='__main__':

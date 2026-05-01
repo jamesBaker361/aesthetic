@@ -23,7 +23,7 @@ embedding_src_dir="embeddings"
 image_src_dir= "laion"
 
 
-def sparsify_embeddings():
+def sparsify_embeddings(sparse_dest_dir:str="sparse_embeddings",embedding_src_dir:str="embeddings"):
     saes_dict:dict[str,SparseAutoencoder] = {}
     means_dict = {}
     for block in tqdm(block_list, desc="Loading SAEs"):
@@ -68,7 +68,7 @@ def sparsify_embeddings():
         np.savez(new_path,**result)
         
         
-def get_top_k_images(block:str,index:int,k:int=10)->list[Image.Image]:
+def get_top_k_images(block:str,index:int,k:int=10,image_src_dir:str= "laion")->list[Image.Image]:
     rankings=[]
     for file in [f for f in os.listdir(image_src_dir) if f.endswith("jpg")]:
         new_path=os.path.join(sparse_dest_dir,file.replace(".jpg",".npz"))
