@@ -637,5 +637,5 @@ if __name__ == "__main__":
     from d3po.config.base import get_config
     config=get_config()
     train_and_save(
-        config,"testing_d3po","SimianLuo/LCM_Dreamshaper_v7","merged_prompts","aesthetic_score",2
+        config,"testing_d3po","SimianLuo/LCM_Dreamshaper_v7","merged_prompts","aesthetic_score",2,"ddpo_save_dir"
     )
