@@ -63,7 +63,7 @@ def sparsify_embeddings(sparse_dest_dir:str="sparse_embeddings",embedding_src_di
                 features=sae.encode(x)
                 if torch.isnan(features).any():
                     print("nan features ",new_path)
-                features=features.cpu()-means_dict[block].cpu()
+                features=features.cpu() #-means_dict[block].cpu()
                 result[block]=features.cpu().detach().numpy()
         np.savez(new_path,**result)
         
