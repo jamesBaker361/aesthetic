@@ -427,7 +427,7 @@ def train_and_save(config,
         del samples[0]["prompts"]
         samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
         images = samples["images"]
-        rewards = accelerator.gather(samples["rewards"]).cpu().numpy()
+        rewards = accelerator.gather(samples["rewards"]).cpu().detach().numpy()
         #record the better images' reward based on the reward model.
         if eval_rewards is not None:
             eval_rewards = accelerator.gather(samples["eval_rewards"]).cpu().detach().numpy()
@@ -444,7 +444,7 @@ def train_and_save(config,
         # this is a hack to force wandb to log the images as JPEGs instead of PNGs
         with tempfile.TemporaryDirectory() as tmpdir:
             for i, image in enumerate(images):
-                pil = Image.fromarray((image[0].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
+                pil = Image.fromarray((image[0].cpu().detach().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
                 pil = pil.resize((256, 256))
                 pil.save(os.path.join(tmpdir, f"{i}.jpg"))
             accelerator.log(
