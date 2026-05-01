@@ -25,6 +25,7 @@ from regression import run_regression,clip_attribution
 
 
 parser=default_parser()
+UNTRAINED="untrained"
 
 parser.add_argument("--y_column",type=str,default="aesthetic") #column 0 = aesthetic column = 1 = p(unsafe)
 parser.add_argument("--num_inference_steps",type=int,default=8)
@@ -32,7 +33,7 @@ parser.add_argument("--size",type=int,default=512)
 parser.add_argument("--method",type=str,default="clip")
 parser.add_argument("--image_src_dir",type=str,default="laion")
 parser.add_argument("--n_random",type=int,default=50)
-parser.add_argument("--image_generation_method",type=str,default="untrained")
+parser.add_argument("--image_generation_method",type=str,default=UNTRAINED)
 parser.add_argument("--embedding_dir",type=str,default="embeddings")
 parser.add_argument("--sparse_embedding_dir",type=str,default="sparse_embeddings")
 parser.add_argument("--clip_dir",type=str,default="clip_sparse_embeddings")
@@ -46,6 +47,8 @@ parser.add_argument("--stats_dir",type=str,default="statistics")
 # extract to -> sparse
 # regress scores on activations
 # 
+
+
 
 def get_images(image_dest_dir:str,method:str,n_random:int,size:int,num_inference_steps:int):
     
@@ -64,7 +67,7 @@ def get_images(image_dest_dir:str,method:str,n_random:int,size:int,num_inference
     device="cuda" if torch.cuda.is_available() else "cpu"
     
     base_pipe=DiffusionPipeline.from_pretrained("SimianLuo/LCM_Dreamshaper_v7").to(device)
-    if method=="untrained":
+    if method==UNTRAINED:
         diff_pipe=base_pipe
     else:
         pass
@@ -101,8 +104,18 @@ def main(args):
     val_interval : int = args.val_interval
     load_hf  = args.load_hf
     y_column : str = args.y_column
-    size: int=args.size
-    method:str=args.method
+    num_inference_steps : int = args.num_inference_steps
+    size : int = args.size
+    method : str = args.method
+    image_src_dir : str = args.image_src_dir
+    n_random : int = args.n_random
+    image_generation_method : str = args.image_generation_method
+    embedding_dir : str = args.embedding_dir
+    sparse_embedding_dir : str = args.sparse_embedding_dir
+    clip_dir : str = args.clip_dir
+    clip_limit : int = args.clip_limit
+    regression_limit : int = args.regression_limit
+    stats_dir : str = args.stats_dir
     
     block_list=[
         "down_blocks.2.attentions.1",
@@ -111,11 +124,12 @@ def main(args):
          "up_blocks.0.attentions.1"
     ]
     
-    #get_images(args.image_src)
-    #extract_vanilla()
-    #sparsify_embeddings()
-    #clip_atribution
-    #run_regression
+    get_images(image_src_dir,method,n_random,size,num_inference_steps)
+    extract_vanilla(embedding_dir,image_src_dir,limit,size)
+    sparsify_embeddings(sparse_embedding_dir,embedding_dir)
+    clip_attribution(image_src_dir,clip_dir,clip_limit)
+    for block in block_list:
+        run_regression(block,y_column,regression_limit,clip_dir,stats_dir)
     #load regression means, covariance matrix for each layer
     sae_dict={} #load saes for each layer
     
