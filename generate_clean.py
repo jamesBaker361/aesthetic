@@ -30,10 +30,9 @@ UNTRAINED="untrained"
 parser.add_argument("--y_column",type=str,default="aesthetic") #column 0 = aesthetic column = 1 = p(unsafe)
 parser.add_argument("--num_inference_steps",type=int,default=8)
 parser.add_argument("--size",type=int,default=512)
-parser.add_argument("--method",type=str,default="clip")
+parser.add_argument("--method",type=str,default=UNTRAINED)
 parser.add_argument("--image_src_dir",type=str,default="laion")
 parser.add_argument("--n_random",type=int,default=50)
-parser.add_argument("--image_generation_method",type=str,default=UNTRAINED)
 parser.add_argument("--embedding_dir",type=str,default="embeddings")
 parser.add_argument("--sparse_embedding_dir",type=str,default="sparse_embeddings")
 parser.add_argument("--clip_dir",type=str,default="clip_sparse_embeddings")
@@ -109,7 +108,6 @@ def main(args):
     method : str = args.method
     image_src_dir : str = args.image_src_dir
     n_random : int = args.n_random
-    image_generation_method : str = args.image_generation_method
     embedding_dir : str = args.embedding_dir
     sparse_embedding_dir : str = args.sparse_embedding_dir
     clip_dir : str = args.clip_dir
