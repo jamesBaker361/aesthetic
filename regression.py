@@ -9,10 +9,106 @@ from sklearn.metrics import mean_squared_error
 from sklearn.metrics import r2_score
 from experiment_helpers.argprint import print_args
 from sklearn.linear_model import Ridge,LinearRegression,ElasticNet,Lasso
+from d3po_rewards import get_nsfw_model,get_aesthetic_model
+from transformers import AutoTokenizer, CLIPTextModelWithProjection, CLIPVisionModelWithProjection, CLIPImageProcessor
+import torch
+import torch.nn.functional as F
+from PIL import Image
+import torchvision.transforms as transforms
+import os
+import torch
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+from torchvision import transforms
+import cv2
 
 def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
     #for each image find relevant patches and scores and save them
-    pass
+    os.makedirs(dest_dir,exist_ok=True)
+    # get models
+    nsfw_model=get_nsfw_model()
+    aesthetic_model=get_aesthetic_model()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").to(device)
+    processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
+    
+
+
+    for n, file in enumerate([f for f in os.listdir(image_src_dir) if f.endswith("jpg")][:limit]):
+        
+        # --- Load image ---
+        pil_img = Image.open(os.path.join(image_src_dir, file)).convert("RGB")
+        og_w, og_h = pil_img.size  # NOTE: PIL = (W, H) supposedly...
+
+        img_tensor = transforms.PILToTensor()(pil_img)  # [C,H,W]
+
+        # --- CLIP forward ---
+        inputs = {k: v.to(device) for k, v in processor(images=img_tensor, return_tensors="pt").items()}
+        outputs = clip_model(**inputs, output_hidden_states=True, output_attentions=True)
+
+        last_hidden_state = outputs.last_hidden_state  # [1, 1+N, D]
+        last_hidden_state.retain_grad()
+
+        image_embeds = F.normalize(outputs.image_embeds, dim=-1)
+
+        # --- Score (your aesthetic model or direction) ---
+        score = aesthetic_model(image_embeds)
+        score.backward()
+
+        # --- Importance (Grad * Activation) ---
+        grads = last_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
+        acts  = last_hidden_state[0, 1:, :]             # [N, D]
+
+        importance = grads * acts                       # [N, D]
+        importance = importance.norm(dim=-1)            # [N]
+
+        # --- Reshape to patch grid ---
+        num_patches = importance.shape[0]
+        h = w = int(num_patches ** 0.5)
+        importance = importance.reshape(h, w)
+
+        # --- Normalize ---
+        importance = importance - importance.min()
+        importance = importance / (importance.max() + 1e-8)
+
+        # --- Upsample to image size ---
+        importance = importance.unsqueeze(0).unsqueeze(0)  # [1,1,h,w]
+
+        big_importance = F.interpolate(
+            importance,
+            size=(og_h, og_w),   # torch = (H, W)
+            mode="bilinear",
+            align_corners=False
+        )[0, 0]
+
+        # --- Convert for plotting ---
+        img_np = img_tensor.permute(1, 2, 0).cpu().numpy() / 255.0
+        heatmap = big_importance.detach().cpu().numpy()
+
+        # --- Optional sharpening ---
+        heatmap = np.clip(heatmap, 0, 1)
+        heatmap = heatmap ** 0.5
+        
+
+        # convert heatmap → color
+        heatmap_uint8 = np.uint8(255 * heatmap)
+        heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+
+        # convert original image
+        img_uint8 = np.uint8(img_np * 255)
+
+        # blend
+        overlay = cv2.addWeighted(img_uint8, 0.6, heatmap_color, 0.4, 0)
+
+        # save
+        save_path = os.path.join(dest_dir, file)
+        cv2.imwrite(save_path, overlay[:, :, ::-1])  # RGB → BGR
+ 
+        
+        
 
 def run_regression(block:str,y_column:str,limit:int,clip_src_dir:str,stats_dest_dir:str):
     pass
@@ -30,6 +126,10 @@ dest_dir="statistics"
 os.makedirs(dest_dir,exist_ok=True)
 
 if __name__=="__main__":
+    
+    clip_attribution("test_imgs","test_maps",-1)
+    
+    exit(0)
     print_args(parser)
     args=parser.parse_args()
     print(args)

@@ -5,6 +5,7 @@ import torch
 import os
 from transformers import AutoTokenizer, CLIPTextModelWithProjection, CLIPVisionModelWithProjection, CLIPImageProcessor
 import torch.nn.functional as F
+import functools
 
 def light_reward():
     def _fn(images, prompts, metadata):
@@ -37,8 +38,8 @@ def jpeg_compressibility():
 
     return _fn
 
-
-def aesthetic_score():
+@functools.cache
+def get_aesthetic_model():
     from score_words import MLP
     
     aesthetic_model = MLP(768)  # CLIP embedding dim is 768 for CLIP ViT L 14
@@ -48,6 +49,22 @@ def aesthetic_score():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     aesthetic_model.to(device)
     
+    return aesthetic_model
+
+@functools.cache
+def get_nsfw_model():
+    from score_words import NSFWScorer
+    
+    NSFWScorer.download_weights_on_node(os.getcwd())
+    nsfw_model=NSFWScorer(model_dir=os.getcwd())
+    nsfw_model.setup()
+    
+    return nsfw_model
+
+def aesthetic_score():
+    
+    aesthetic_model=get_aesthetic_model()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").to(device)
     processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
@@ -63,12 +80,8 @@ def aesthetic_score():
     return _fn
 
 def nsfw_score():
-    from score_words import NSFWScorer
     
-    NSFWScorer.download_weights_on_node(os.getcwd())
-    nsfw_model=NSFWScorer(model_dir=os.getcwd())
-    nsfw_model.setup()
-    
+    nsfw_model=get_nsfw_model()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").to(device)
