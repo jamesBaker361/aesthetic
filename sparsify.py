@@ -72,6 +72,8 @@ def get_top_k_images(block:str,index:int,k:int=10,image_src_dir:str= "laion")->l
     rankings=[]
     for file in [f for f in os.listdir(image_src_dir) if f.endswith("jpg")]:
         new_path=os.path.join(sparse_dest_dir,file.replace(".jpg",".npz"))
+        if not os.path.exists(new_path):
+            new_path=os.path.join(sparse_dest_dir,file+".npz")
         if os.path.exists(new_path):
             npz_dict=np.load(new_path)
             sparse_embedding=npz_dict[block]
