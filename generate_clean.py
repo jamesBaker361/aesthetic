@@ -36,7 +36,12 @@ parser.add_argument("--image_generation_method",type=str,default="untrained")
 parser.add_argument("--num_inference_steps",type=int,default=8)
 parser.add_argument("--embedding_dir",type=str,default="embeddings")
 parser.add_argument("--sparse_embedding_dir",type=str,default="sparse_embeddings")
-
+parser.add_argument("--clip_dir",type=str,default="clip_sparse_embeddings")
+parser.add_argument("--clip_limit",type=int,default=-1)
+parser.add_argument("--regression_limit",type=int,default=-1)
+parser.add_argument("--stats_dir",type=str,default="statistics")
+#def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
+# def run_regression(block:str,y_column:str,limit:int,clip_src_dir:str,stats_dest_dir:str):
 # generate images using RL or prompts
 # sdxl extract 
 # extract to -> sparse
