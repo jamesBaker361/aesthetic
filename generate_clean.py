@@ -66,6 +66,7 @@ def get_images(image_dest_dir:str,method:str,n_random:int,size:int,num_inference
     device="cuda" if torch.cuda.is_available() else "cpu"
     
     base_pipe=DiffusionPipeline.from_pretrained("SimianLuo/LCM_Dreamshaper_v7").to(device)
+    setattr(base_pipe,"safety_checker",None)
     if method==UNTRAINED:
         diff_pipe=base_pipe
     else:
