@@ -45,22 +45,27 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
 
         img_tensor = transforms.PILToTensor()(pil_img)  # [C,H,W]
 
-        # --- CLIP forward ---
-        inputs = {k: v.to(device) for k, v in processor(images=img_tensor, return_tensors="pt").items()}
-        outputs = clip_model(**inputs, output_hidden_states=True, output_attentions=True)
+        with torch.enable_grad():
+            inputs = {k: v.to(device) for k, v in processor(images=img_tensor, return_tensors="pt").items()}
+            inputs['pixel_values'].requires_grad_(True)
+            outputs = clip_model(**inputs, output_hidden_states=True, output_attentions=True)
 
-        last_hidden_state = outputs.last_hidden_state  # [1, 1+N, D]
-        last_hidden_state.retain_grad() #maybe we should use a different state
+            hidden_states=outputs.hidden_states
+            target_hidden_state=hidden_states[-2]
+            target_hidden_state.retain_grad()
 
-        image_embeds = F.normalize(outputs.image_embeds, dim=-1)
+            last_hidden_state = outputs.last_hidden_state  # [1, 1+N, D]
+            last_hidden_state.retain_grad() #maybe we should use a different state
 
-        # --- Score (your aesthetic model or direction) ---
-        score = aesthetic_model(image_embeds)
-        score.backward()
+            image_embeds = F.normalize(outputs.image_embeds, dim=-1)
+
+            # --- Score (your aesthetic model or direction) ---
+            score = aesthetic_model(image_embeds)
+            score.backward()
 
         # --- Importance (Grad * Activation) ---
-        grads = last_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
-        acts  = last_hidden_state[0, 1:, :]             # [N, D]
+        grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
+        acts  = target_hidden_state[0, 1:, :]             # [N, D]
         
         num_patches = acts.shape[0]
         h = w = int(num_patches ** 0.5)
