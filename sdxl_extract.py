@@ -144,7 +144,7 @@ def extract_vanilla(
             if torch.isnan(image_pt).any():
                 print("nann image")
                 
-            print("max min ",image_pt.max(),image_pt.min())
+            #print("max min ",image_pt.max(),image_pt.min())
 
             latents=vae.config.scaling_factor* vae.encode(image_pt).latent_dist.sample()
             if started:
