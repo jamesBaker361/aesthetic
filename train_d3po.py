@@ -55,6 +55,7 @@ def unet_lora_state_dict(unet: UNet2DConditionModel) -> dict[str, torch.Tensor]:
 
 
 def train_and_save(config,
+                   size:int,
          project_name:str,
          pretrained_model:str,
          prompt_fn_name:str,
@@ -328,6 +329,8 @@ def train_and_save(config,
             with autocast():
                 images1, _, latents1, log_probs1 = pipeline_with_logprob(
                     pipeline,
+                    height=size,
+                    width=size,
                     prompt_embeds=prompt_embeds1,
                     negative_prompt_embeds=sample_neg_prompt_embeds,
                     num_inference_steps=config.sample.num_steps,
@@ -339,6 +342,8 @@ def train_and_save(config,
                 log_probs1 = torch.stack(log_probs1, dim=1)
                 images2, _, latents2, log_probs2 = pipeline_with_logprob(
                     pipeline,
+                    height=size,
+                    width=size,
                     prompt_embeds=prompt_embeds2,
                     negative_prompt_embeds=sample_neg_prompt_embeds,
                     num_inference_steps=config.sample.num_steps,
@@ -639,5 +644,5 @@ if __name__ == "__main__":
     config.sample.num_steps=2
     config.num_epochs=2
     train_and_save(
-        config,"testing_d3po","SimianLuo/LCM_Dreamshaper_v7","merged_prompts","aesthetic_score",2,"ddpo_save_dir"
+        config,64,"testing_d3po","SimianLuo/LCM_Dreamshaper_v7","merged_prompts","aesthetic_score",2,"ddpo_save_dir"
     )
