@@ -50,7 +50,7 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
         outputs = clip_model(**inputs, output_hidden_states=True, output_attentions=True)
 
         last_hidden_state = outputs.last_hidden_state  # [1, 1+N, D]
-        last_hidden_state.retain_grad()
+        last_hidden_state.retain_grad() #maybe we should use a different state
 
         image_embeds = F.normalize(outputs.image_embeds, dim=-1)
 
@@ -61,9 +61,18 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
         # --- Importance (Grad * Activation) ---
         grads = last_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
         acts  = last_hidden_state[0, 1:, :]             # [N, D]
+        
+        num_patches = acts.shape[0]
+        h = w = int(num_patches ** 0.5)
+        
+        print("grads")
+        print(grads.norm(dim=-1).reshape(h, w))
+        
+        print("acts")
+        print(acts.norm(dim=-1).reshape(h, w))
 
         importance = grads * acts                       # [N, D]
-        importance = importance.norm(dim=-1)            # [N]
+        importance = importance.norm(dim=-1)            # [N] should we sum? 
 
         # --- Reshape to patch grid ---
         num_patches = importance.shape[0]
@@ -73,6 +82,9 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
         # --- Normalize ---
         importance = importance - importance.min()
         importance = importance / (importance.max() + 1e-8)
+        
+        print("importance")
+        print(importance)
 
         # --- Upsample to image size ---
         importance = importance.unsqueeze(0).unsqueeze(0)  # [1,1,h,w]
@@ -80,8 +92,8 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
         big_importance = F.interpolate(
             importance,
             size=(og_h, og_w),   # torch = (H, W)
-            mode="bilinear",
-            align_corners=False
+            mode="nearest",
+            #align_corners=False
         )[0, 0]
 
         # --- Convert for plotting ---
