@@ -187,8 +187,8 @@ def extract_vanilla(
 
             actual_batch_size = noisy_model_input.shape[0]
             prompt_embeds = prompt_embeds.expand(actual_batch_size, -1, -1).contiguous()
-            add_text_embeds = add_text_embeds.expand(actual_batch_size, -1).contiguous()
-            add_time_ids = add_time_ids.expand(actual_batch_size, -1).contiguous()
+            add_text_embeds = add_text_embeds.expand(actual_batch_size, -1).contiguous().to(device)
+            add_time_ids = add_time_ids.expand(actual_batch_size, -1).contiguous().to(device)
             added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
             
             for tensor,var_name in zip([prompt_embeds,add_text_embeds,add_time_ids],['prompt_embeds','add_text_embeds','add_time_ids']):
