@@ -41,7 +41,8 @@ def extract_vanilla(
     save_dir : str,
     src_dir : str,
     limit : int,
-    size: int
+    size: int,
+    mixed_precision:str
 ):
     for d in [save_dir]:
         os.makedirs(d,exist_ok=True)
@@ -49,7 +50,7 @@ def extract_vanilla(
 
 
 
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and mixed_precision=="fp16":
         dtype=torch.float16
     else:
         dtype=torch.float32
