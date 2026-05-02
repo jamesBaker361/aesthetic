@@ -71,6 +71,7 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
         h = w = int(num_patches ** 0.5)
         
         print("grads")
+        print(grads.shape)
         print(grads.norm(dim=-1).reshape(h, w))
         
         print("acts")
