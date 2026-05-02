@@ -48,23 +48,23 @@ def extract_vanilla(
 
 
 
-    dtype=torch.float16
 
     if torch.cuda.is_available():
-
-        pipe = HookedStableDiffusionXLWithUNetPipeline.from_pretrained(
-            'stabilityai/sdxl-turbo',
-            torch_dtype=dtype,
-            device_map="balanced",
-            variant=("fp16" if dtype==torch.float16 else None)
-        )
+        dtype=torch.float16
     else:
-         pipe = HookedStableDiffusionXLWithUNetPipeline.from_pretrained(
-            'stabilityai/sdxl-turbo',
+        dtype=torch.float32
+
+    if torch.cuda.is_available():
+        pipe = HookedStableDiffusionXLWithUNetPipeline.from_pretrained(
+            "stabilityai/sdxl-turbo",
             torch_dtype=dtype,
-            device_map="cpu",
-            variant=("fp16" if dtype==torch.float16 else None)
-        )
+            variant=("fp16" if dtype == torch.float16 else None)
+        ).to("cuda")
+    else:
+        pipe = HookedStableDiffusionXLWithUNetPipeline.from_pretrained(
+            "stabilityai/sdxl-turbo",
+            torch_dtype=dtype
+        ).to("cpu")
 
     
     path_to_checkpoints = './sdxl_unbox/checkpoints/'
@@ -76,8 +76,7 @@ def extract_vanilla(
          "up_blocks.0.attentions.1"
     ]
     
-    model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
-    processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
     image_processor=VaeImageProcessor()
     
     def hook(module, input, output):
@@ -136,19 +135,8 @@ def extract_vanilla(
             print("hella small ",jpg_path)
             continue
         with torch.no_grad():
-            clip_inputs = processor(images=image, return_tensors="pt")
-            clip_outputs=model(**clip_inputs,return_dict=True,output_attentions=True,output_hidden_states=True)
             
             result_dict={}
-            for attr in ["image_embeds", "last_hidden_state","hidden_states"]:
-                try:
-                    result_dict[attr]=getattr(clip_outputs,attr).cpu().detach().numpy()
-                except AttributeError:
-                    hidden_states=getattr(clip_outputs,attr)
-                    hidden_states=np.stack([h.cpu().detach().numpy() for h in hidden_states])
-                    result_dict[attr]=hidden_states
-                    
-            
             image_pt=image_processor.preprocess(image,size,size).to(device=device,dtype=dtype) #all images have to be the same size so we can do batching
             if started:
                 print("image size ",image_pt.size())
