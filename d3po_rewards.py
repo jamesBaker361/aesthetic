@@ -43,7 +43,10 @@ def get_aesthetic_model():
     from score_words import MLP
     
     aesthetic_model = MLP(768)  # CLIP embedding dim is 768 for CLIP ViT L 14
-    state_dict = torch.load("improved-aesthetic-predictor/sac+logos+ava1-l14-linearMSE.pth")   # load the model you trained previously or the model available in this repo
+    if torch.cuda.is_available():
+        state_dict = torch.load("improved-aesthetic-predictor/sac+logos+ava1-l14-linearMSE.pth")   # load the model you trained previously or the model available in this repo
+    else:
+        state_dict = torch.load("improved-aesthetic-predictor/sac+logos+ava1-l14-linearMSE.pth",map_location="cpu")   # load the model you trained previously or the model available in this repo
     aesthetic_model.load_state_dict(state_dict)
     aesthetic_model.eval()
     device = "cuda" if torch.cuda.is_available() else "cpu"
