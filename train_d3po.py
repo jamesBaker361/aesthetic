@@ -635,6 +635,9 @@ def train_and_save(config,
 if __name__ == "__main__":
     from d3po.config.base import get_config
     config=get_config()
+    config.sample.batch_size=1
+    config.sample.num_steps=2
+    config.num_epochs=2
     train_and_save(
         config,"testing_d3po","SimianLuo/LCM_Dreamshaper_v7","merged_prompts","aesthetic_score",2,"ddpo_save_dir"
     )
