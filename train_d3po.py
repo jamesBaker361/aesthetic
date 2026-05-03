@@ -152,6 +152,8 @@ def train_and_save(config,
         trainable_layers = filter(lambda p: p.requires_grad, unet.parameters())
     else:
         trainable_layers = pipeline.unet
+        if config.mixed_precision == "fp16":
+            cast_training_params([pipeline.unet], dtype=torch.float32)
 
     # set up diffusers-friendly checkpoint saving with Accelerate
     def unwrap_model(model):
