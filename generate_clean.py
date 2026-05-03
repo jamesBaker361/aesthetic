@@ -128,7 +128,8 @@ def main(args):
     sparsify_embeddings(sparse_embedding_dir,embedding_dir)
     clip_attribution(image_src_dir,clip_dir,clip_limit)
     for block in block_list:
-        run_regression(block,y_column,regression_limit,clip_dir,stats_dir)
+        run_regression(block,y_column,regression_limit,sparse_embedding_dir,stats_dir) #use sparse dir for now; in the future only use clip_dir
+        #run_regression(block,y_column,regression_limit,clip_dir,stats_dir)
     #load regression means, covariance matrix for each layer
     sae_dict={} #load saes for each layer
     
