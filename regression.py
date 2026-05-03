@@ -67,6 +67,7 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
         except FileNotFoundError:
             pass
         for layer_idx,target_hidden_state in enumerate(hidden_states):
+            
             # --- Importance (Grad * Activation) ---
             grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
             acts  = target_hidden_state[0, 1:, :]             # [N, D]
@@ -77,7 +78,7 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
 
 
             importance = grads * acts                       # [N, D]
-            importance = importance.norm(dim=-1)            # [N] should we sum? 
+            importance = torch.abs(importance).sum(dim=-1)            # [N] should we sum? 
 
             # --- Reshape to patch grid ---
             num_patches = importance.shape[0]
