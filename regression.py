@@ -124,7 +124,7 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
             pil_img=VaeImageProcessor.numpy_to_pil(overlay)[0]
             
             img_list.append(pil_img)
-        path=os.path.join(dest_dir,file)
+        path=os.path.join(dest_dir,file).replace("jpg","png")
         concat=concat_images_horizontally(img_list)
         arr = np.array(concat)
 
