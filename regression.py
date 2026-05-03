@@ -125,7 +125,7 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
             img_list.append(pil_img)
         path=os.path.join(dest_dir,file)
         concat=concat_images_horizontally(img_list)
-        concat.save(path)
+        concat.save(path,quality=60)
         
         
 
