@@ -67,7 +67,7 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
             score = aesthetic_model(image_embeds)
             score.backward()
         img_list=[]
-        for n,target_hidden_state in hidden_states:
+        for n,target_hidden_state in enumerate(hidden_states):
             # --- Importance (Grad * Activation) ---
             grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
             acts  = target_hidden_state[0, 1:, :]             # [N, D]
