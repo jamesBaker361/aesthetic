@@ -9,6 +9,7 @@ from sklearn.metrics import mean_squared_error
 from sklearn.metrics import r2_score
 from experiment_helpers.argprint import print_args
 from sklearn.linear_model import Ridge,LinearRegression,ElasticNet,Lasso
+from diffusers.image_processor import VaeImageProcessor
 from d3po_rewards import get_nsfw_model,get_aesthetic_model
 from transformers import AutoTokenizer, CLIPTextModelWithProjection, CLIPVisionModelWithProjection, CLIPImageProcessor
 import torch
@@ -30,7 +31,7 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
     clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").to(device)
     processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
     
-
+    img_pro=VaeImageProcessor()
 
     for n, file in enumerate([f for f in os.listdir(image_src_dir) if f.endswith("jpg")][:limit]):
         
@@ -116,7 +117,11 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
             # blend
             overlay = cv2.addWeighted(img_uint8, 0.6, heatmap_color, 0.4, 0)
             
-            pil_img = Image.fromarray(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+            
+            
+            
+            overlay=cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+            pil_img=VaeImageProcessor.numpy_to_pil(overlay)[0]
             img_list.append(pil_img)
         path=os.path.join(dest_dir,file)
         concat=concat_images_horizontally(img_list)
@@ -128,10 +133,7 @@ def run_regression(block:str,y_column:str,limit:int,clip_src_dir:str,stats_dest_
     pass
 
 
-parser=argparse.ArgumentParser()
-parser.add_argument("--y_column",type=str,default="aesthetic") #column 0 = aesthetic column = 1 = p(unsafe)
-parser.add_argument("--block",type=str,default="down_blocks.2.attentions.1")
-parser.add_argument("--limit",type=int,default=-1)
+
 
 info_path="laion/info.csv"
 sparse_dir="sparse_embeddings"
@@ -140,6 +142,10 @@ dest_dir="statistics"
 os.makedirs(dest_dir,exist_ok=True)
 
 if __name__=="__main__":
+    parser=argparse.ArgumentParser()
+    parser.add_argument("--y_column",type=str,default="aesthetic") #column 0 = aesthetic column = 1 = p(unsafe)
+    parser.add_argument("--block",type=str,default="down_blocks.2.attentions.1")
+    parser.add_argument("--limit",type=int,default=-1)
     
     clip_attribution("test_imgs","test_maps",-1)
     
