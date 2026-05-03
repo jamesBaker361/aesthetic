@@ -24,7 +24,7 @@ from PIL import Image
 from torchvision import transforms
 import cv2
 
-def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
+def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sparse_embeddings"):
     #for each image find relevant patches and scores and save them
     os.makedirs(dest_dir,exist_ok=True)
     # get models
@@ -67,6 +67,10 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
             score = aesthetic_model(image_embeds)
             score.backward()
         img_list=[]
+        npz_dict=np.load(os.path.join(sparse_dir, file.replace("jpg","npz")))
+        npz_dict["aesthetic"]=score.cpu().detach().numpy()
+        npz_dict["nsfw"]=0.
+        np.savez(os.path.join(dest_dir,file.replace("jpg","npz")), ** npz_dict)
         for n,target_hidden_state in enumerate(hidden_states):
             # --- Importance (Grad * Activation) ---
             grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
