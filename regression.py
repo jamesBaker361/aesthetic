@@ -58,10 +58,13 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
             score = aesthetic_model(image_embeds)
             score.backward()
         img_list=[]
-        npz_dict=dict(np.load(os.path.join(sparse_dir, file.replace("jpg","npz"))))
-        npz_dict["aesthetic"]=score.cpu().detach().numpy()
-        npz_dict["nsfw"]=0.
-        np.savez(os.path.join(dest_dir,file.replace("jpg","npz")), ** npz_dict)
+        try:
+            npz_dict=dict(np.load(os.path.join(sparse_dir, file.replace("jpg","npz"))))
+            npz_dict["aesthetic"]=score.cpu().detach().numpy()
+            npz_dict["nsfw"]=0.
+            np.savez(os.path.join(dest_dir,file.replace("jpg","npz")), ** npz_dict)
+        except FileNotFoundError:
+            pass
         for layer_idx,target_hidden_state in enumerate(hidden_states):
             # --- Importance (Grad * Activation) ---
             grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
