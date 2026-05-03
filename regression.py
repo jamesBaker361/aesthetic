@@ -122,10 +122,17 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
             
             overlay=cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
             pil_img=VaeImageProcessor.numpy_to_pil(overlay)[0]
+            
             img_list.append(pil_img)
         path=os.path.join(dest_dir,file)
         concat=concat_images_horizontally(img_list)
-        concat.save(path,quality=60)
+        arr = np.array(concat)
+
+        arr = np.ascontiguousarray(arr)
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+        img = Image.fromarray(arr).convert("RGB")
+        img.save(path, quality=65)
         
         
 
