@@ -120,7 +120,7 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
             
             
             
-            overlay=cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+            #overlay=cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
             pil_img=VaeImageProcessor.numpy_to_pil(overlay)[0]
             
             img_list.append(pil_img)
