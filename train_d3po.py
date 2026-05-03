@@ -122,6 +122,8 @@ def train_and_save(config,
 
     # Move unet, vae and text_encoder to device and cast to inference_dtype
     pipeline.vae.to(accelerator.device, dtype=inference_dtype)
+    pipeline.vae.use_slicing = True
+    pipeline.vae.use_tiling = True
     pipeline.text_encoder.to(accelerator.device, dtype=inference_dtype)
     pipeline.unet.to(accelerator.device, dtype=inference_dtype)
     ref =  copy.deepcopy(pipeline.unet)
