@@ -278,7 +278,7 @@ def train_and_save(config,
     )
 
 
-    assert config.sample.batch_size >= batch_size
+    assert config.sample.batch_size >= batch_size, f"f{config.sample.batch_size} < {batch_size} "
     assert config.sample.batch_size % batch_size == 0
     assert samples_per_epoch % total_train_batch_size == 0
     
