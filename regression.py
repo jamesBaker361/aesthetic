@@ -15,13 +15,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 import torchvision.transforms as transforms
-import os
-import torch
 from experiment_helpers.image_helpers import concat_images_horizontally
-import numpy as np
 import matplotlib.pyplot as plt
-from PIL import Image
-from torchvision import transforms
 import cv2
 
 def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sparse_embeddings"):
@@ -44,22 +39,18 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
         og_w, og_h = pil_img.size  # NOTE: PIL = (W, H) supposedly...
 
         img_tensor = transforms.PILToTensor()(pil_img)  # [C,H,W]
-        inputs = {k: v.to(device) for k, v in processor(images=img_tensor, return_tensors="pt").items()}
-        inputs['pixel_values'].requires_grad_(True)
-        outputs = clip_model(**inputs, output_hidden_states=True, output_attentions=True)
-
-        hidden_states=outputs.hidden_states
-        for t in hidden_states:
-            t.retain_grad()
-        
 
         with torch.enable_grad():
             inputs = {k: v.to(device) for k, v in processor(images=img_tensor, return_tensors="pt").items()}
             inputs['pixel_values'].requires_grad_(True)
             outputs = clip_model(**inputs, output_hidden_states=True, output_attentions=True)
 
+            hidden_states = outputs.hidden_states
+            for t in hidden_states:
+                t.retain_grad()
+
             last_hidden_state = outputs.last_hidden_state  # [1, 1+N, D]
-            last_hidden_state.retain_grad() #maybe we should use a different state
+            last_hidden_state.retain_grad()
 
             image_embeds = F.normalize(outputs.image_embeds, dim=-1)
 
@@ -67,11 +58,11 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
             score = aesthetic_model(image_embeds)
             score.backward()
         img_list=[]
-        npz_dict=np.load(os.path.join(sparse_dir, file.replace("jpg","npz")))
+        npz_dict=dict(np.load(os.path.join(sparse_dir, file.replace("jpg","npz"))))
         npz_dict["aesthetic"]=score.cpu().detach().numpy()
         npz_dict["nsfw"]=0.
         np.savez(os.path.join(dest_dir,file.replace("jpg","npz")), ** npz_dict)
-        for n,target_hidden_state in enumerate(hidden_states):
+        for layer_idx,target_hidden_state in enumerate(hidden_states):
             # --- Importance (Grad * Activation) ---
             grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
             acts  = target_hidden_state[0, 1:, :]             # [N, D]
