@@ -644,5 +644,5 @@ if __name__ == "__main__":
     config.sample.num_steps=2
     config.num_epochs=2
     train_and_save(
-        config,64,"testing_d3po","SimianLuo/LCM_Dreamshaper_v7","merged_prompts","aesthetic_score",2,"ddpo_save_dir"
+        config,64,"testing_d3po","SimianLuo/LCM_Dreamshaper_v7","merged_prompts","aesthetic_score",1,"ddpo_save_dir"
     )
