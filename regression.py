@@ -17,7 +17,7 @@ from PIL import Image
 import torchvision.transforms as transforms
 import os
 import torch
-import torch.nn.functional as F
+from experiment_helpers.image_helpers import concat_images_horizontally
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -44,15 +44,19 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
         og_w, og_h = pil_img.size  # NOTE: PIL = (W, H) supposedly...
 
         img_tensor = transforms.PILToTensor()(pil_img)  # [C,H,W]
+        inputs = {k: v.to(device) for k, v in processor(images=img_tensor, return_tensors="pt").items()}
+        inputs['pixel_values'].requires_grad_(True)
+        outputs = clip_model(**inputs, output_hidden_states=True, output_attentions=True)
+
+        hidden_states=outputs.hidden_states
+        for t in hidden_states:
+            t.retain_grad()
+        
 
         with torch.enable_grad():
             inputs = {k: v.to(device) for k, v in processor(images=img_tensor, return_tensors="pt").items()}
             inputs['pixel_values'].requires_grad_(True)
             outputs = clip_model(**inputs, output_hidden_states=True, output_attentions=True)
-
-            hidden_states=outputs.hidden_states
-            target_hidden_state=hidden_states[-2]
-            target_hidden_state.retain_grad()
 
             last_hidden_state = outputs.last_hidden_state  # [1, 1+N, D]
             last_hidden_state.retain_grad() #maybe we should use a different state
@@ -62,69 +66,63 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
             # --- Score (your aesthetic model or direction) ---
             score = aesthetic_model(image_embeds)
             score.backward()
+        img_list=[]
+        for n,target_hidden_state in hidden_states:
+            # --- Importance (Grad * Activation) ---
+            grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
+            acts  = target_hidden_state[0, 1:, :]             # [N, D]
+            
+            num_patches = acts.shape[0]
+            h = w = int(num_patches ** 0.5)
+            
 
-        # --- Importance (Grad * Activation) ---
-        grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
-        acts  = target_hidden_state[0, 1:, :]             # [N, D]
-        
-        num_patches = acts.shape[0]
-        h = w = int(num_patches ** 0.5)
-        
-        print("grads")
-        print(grads.shape)
-        print(grads.norm(dim=-1).reshape(h, w))
-        
-        print("acts")
-        print(acts.norm(dim=-1).reshape(h, w))
 
-        importance = grads * acts                       # [N, D]
-        importance = importance.norm(dim=-1)            # [N] should we sum? 
+            importance = grads * acts                       # [N, D]
+            importance = importance.norm(dim=-1)            # [N] should we sum? 
 
-        # --- Reshape to patch grid ---
-        num_patches = importance.shape[0]
-        h = w = int(num_patches ** 0.5)
-        importance = importance.reshape(h, w)
+            # --- Reshape to patch grid ---
+            num_patches = importance.shape[0]
+            h = w = int(num_patches ** 0.5)
+            importance = importance.reshape(h, w)
 
-        # --- Normalize ---
-        importance = importance - importance.min()
-        importance = importance / (importance.max() + 1e-8)
-        
-        print("importance")
-        print(importance)
+            # --- Normalize ---
+            importance = importance - importance.min()
+            importance = importance / (importance.max() + 1e-8)
 
-        # --- Upsample to image size ---
-        importance = importance.unsqueeze(0).unsqueeze(0)  # [1,1,h,w]
+            # --- Upsample to image size ---
+            importance = importance.unsqueeze(0).unsqueeze(0)  # [1,1,h,w]
 
-        big_importance = F.interpolate(
-            importance,
-            size=(og_h, og_w),   # torch = (H, W)
-            mode="nearest",
-            #align_corners=False
-        )[0, 0]
+            big_importance = F.interpolate(
+                importance,
+                size=(og_h, og_w),   # torch = (H, W)
+                mode="nearest",
+                #align_corners=False
+            )[0, 0]
 
-        # --- Convert for plotting ---
-        img_np = img_tensor.permute(1, 2, 0).cpu().numpy() / 255.0
-        heatmap = big_importance.detach().cpu().numpy()
+            # --- Convert for plotting ---
+            img_np = img_tensor.permute(1, 2, 0).cpu().numpy() / 255.0
+            heatmap = big_importance.detach().cpu().numpy()
 
-        # --- Optional sharpening ---
-        heatmap = np.clip(heatmap, 0, 1)
-        heatmap = heatmap ** 0.5
-        
+            # --- Optional sharpening ---
+            heatmap = np.clip(heatmap, 0, 1)
+            heatmap = heatmap ** 0.5
+            
 
-        # convert heatmap → color
-        heatmap_uint8 = np.uint8(255 * heatmap)
-        heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+            # convert heatmap → color
+            heatmap_uint8 = np.uint8(255 * heatmap)
+            heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
 
-        # convert original image
-        img_uint8 = np.uint8(img_np * 255)
+            # convert original image
+            img_uint8 = np.uint8(img_np * 255)
 
-        # blend
-        overlay = cv2.addWeighted(img_uint8, 0.6, heatmap_color, 0.4, 0)
-
-        # save
-        save_path = os.path.join(dest_dir, file)
-        cv2.imwrite(save_path, overlay[:, :, ::-1])  # RGB → BGR
- 
+            # blend
+            overlay = cv2.addWeighted(img_uint8, 0.6, heatmap_color, 0.4, 0)
+            
+            pil_img = Image.fromarray(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+            img_list.append(pil_img)
+        path=os.path.join(dest_dir,file)
+        concat=concat_images_horizontally(img_list)
+        concat.save(path)
         
         
 
