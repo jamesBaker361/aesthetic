@@ -606,19 +606,19 @@ def train_and_save(config,
                                 eta=config.sample.eta,
                                 prev_sample=sample_1["next_latents"][:, j],
                             )
-                        human_prefer = compare(sample_0['rewards'],sample_1['rewards'])
-                        # clip the Q value
-                        ratio_0 = torch.clamp(torch.exp(total_prob_0-total_ref_prob_0),1 - config.train.eps, 1 + config.train.eps)
-                        ratio_1 = torch.clamp(torch.exp(total_prob_1-total_ref_prob_1),1 - config.train.eps, 1 + config.train.eps)
-                        loss = -torch.log(torch.sigmoid(config.train.beta*(torch.log(ratio_0))*human_prefer[:,0] + config.train.beta*(torch.log(ratio_1))*human_prefer[:, 1])).mean()
+                            human_prefer = compare(sample_0['rewards'],sample_1['rewards'])
+                            # clip the Q value
+                            ratio_0 = torch.clamp(torch.exp(total_prob_0-total_ref_prob_0),1 - config.train.eps, 1 + config.train.eps)
+                            ratio_1 = torch.clamp(torch.exp(total_prob_1-total_ref_prob_1),1 - config.train.eps, 1 + config.train.eps)
+                            loss = -torch.log(torch.sigmoid(config.train.beta*(torch.log(ratio_0))*human_prefer[:,0] + config.train.beta*(torch.log(ratio_1))*human_prefer[:, 1])).mean()
 
-                        # backward pass
-                        accelerator.backward(loss)
-                        if accelerator.sync_gradients:
-                            accelerator.clip_grad_norm_(trainable_layers, config.train.max_grad_norm)
-                        optimizer.step()
-                        optimizer.zero_grad()
-                        info["loss"].append(loss.item())
+                            # backward pass
+                            accelerator.backward(loss)
+                            if accelerator.sync_gradients:
+                                accelerator.clip_grad_norm_(trainable_layers, config.train.max_grad_norm)
+                            optimizer.step()
+                            optimizer.zero_grad()
+                            info["loss"].append(loss.item())
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
