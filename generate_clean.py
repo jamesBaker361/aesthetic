@@ -126,7 +126,7 @@ def main(args):
     get_images(image_src_dir,method,n_random,size,num_inference_steps)
     extract_vanilla(embedding_dir,image_src_dir,limit,size,mixed_precision)
     sparsify_embeddings(sparse_embedding_dir,embedding_dir)
-    clip_attribution(image_src_dir,clip_dir,clip_limit)
+    clip_attribution(image_src_dir,clip_dir,clip_limit,use_grad=True)
     for block in block_list:
         run_regression(block,y_column,regression_limit,clip_dir,stats_dir,"fp16",2,10) #use sparse dir for now; in the future only use clip_dir
         #run_regression(block,y_column,regression_limit,clip_dir,stats_dir)
