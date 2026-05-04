@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 import torchvision.transforms as transforms
-from experiment_helpers.image_helpers import concat_images_horizontally
+from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
 import matplotlib.pyplot as plt
 import cv2
 from accelerate import Accelerator
@@ -127,6 +127,10 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
             
             #overlay=cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
             pil_img=VaeImageProcessor.numpy_to_pil(overlay)[0]
+            
+            heat_map_pil=VaeImageProcessor.numpy_to_pil(heatmap_color)[0]
+            
+            pil_img=concat_images_vertically([pil_img,heat_map_pil])
             
             img_list.append(pil_img)
         path=os.path.join(dest_dir,file).replace("jpg","png")
