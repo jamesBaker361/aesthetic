@@ -90,7 +90,7 @@ def train_and_save(config,
     set_seed(123)
 
     # load scheduler, tokenizer and models.
-    pipeline = StableDiffusionPipeline.from_pretrained(pretrained_model, torch_dtype=torch.float16)
+    pipeline = StableDiffusionPipeline.from_pretrained(pretrained_model) #, torch_dtype=torch.float16)
     if config.use_xformers:
         pipeline.enable_xformers_memory_efficient_attention()
     # freeze parameters of models to save more memory
@@ -121,11 +121,11 @@ def train_and_save(config,
         inference_dtype = torch.bfloat16
 
     # Move unet, vae and text_encoder to device and cast to inference_dtype
-    pipeline.vae.to(accelerator.device, dtype=inference_dtype)
+    pipeline.vae.to(accelerator.device) #, dtype=inference_dtype)
     pipeline.vae.use_slicing = True
     pipeline.vae.use_tiling = True
-    pipeline.text_encoder.to(accelerator.device, dtype=inference_dtype)
-    pipeline.unet.to(accelerator.device, dtype=inference_dtype)
+    pipeline.text_encoder.to(accelerator.device) #, dtype=inference_dtype)
+    pipeline.unet.to(accelerator.device) #, dtype=inference_dtype)
     ref =  copy.deepcopy(pipeline.unet)
     for param in ref.parameters():
         param.requires_grad = False
@@ -152,8 +152,8 @@ def train_and_save(config,
         trainable_layers = filter(lambda p: p.requires_grad, unet.parameters())
     else:
         trainable_layers = pipeline.unet
-        if config.mixed_precision == "fp16":
-            cast_training_params([pipeline.unet], dtype=torch.float32)
+        '''if config.mixed_precision == "fp16":
+            cast_training_params([pipeline.unet], dtype=torch.float32)'''
 
     # set up diffusers-friendly checkpoint saving with Accelerate
     def unwrap_model(model):
@@ -208,8 +208,8 @@ def train_and_save(config,
                 )
 
         # Make sure the trainable params are in float32
-        if config.mixed_precision in ["fp16"]:
-            cast_training_params([unet_], dtype=torch.float32)
+        '''if config.mixed_precision in ["fp16"]:
+            cast_training_params([unet_], dtype=torch.float32)'''
 
     # Support multi-dimensional comparison. Default demension is 1. You can add many rewards instead of only one to judge the preference of images.
     # For example: A: clipscore-30 blipscore-10 LAION aesthetic score-6.0 ; B: 20, 8, 5.0  then A is prefered than B
@@ -270,7 +270,7 @@ def train_and_save(config,
     autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
 
     # Prepare everything with our `accelerator`.
-    trainable_layers, optimizer = accelerator.prepare(trainable_layers, optimizer)
+    trainable_layers, optimizer,pipeline.vae,pipeline.net,pipeline.text_encoder = accelerator.prepare(trainable_layers, optimizer,pipeline.vae,pipeline.net,pipeline.text_encoder)
 
     # executor to perform callbacks asynchronously.
     executor = futures.ThreadPoolExecutor(max_workers=2)
