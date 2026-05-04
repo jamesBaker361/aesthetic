@@ -70,19 +70,19 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
         except FileNotFoundError:
             pass
         for layer_idx,target_hidden_state in enumerate(hidden_states):
-            if use_grad:
-                # --- Importance (Grad * Activation) ---
-                grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
-                acts  = target_hidden_state[0, 1:, :]             # [N, D]
-                
-                num_patches = acts.shape[0]
-                h = w = int(num_patches ** 0.5)
-                
+            #if use_grad:
+            # --- Importance (Grad * Activation) ---
+            grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
+            acts  = target_hidden_state[0, 1:, :]             # [N, D]
+            
+            num_patches = acts.shape[0]
+            h = w = int(num_patches ** 0.5)
+            
 
 
-                importance = grads * acts                       # [N, D]
-                #importance = torch.abs(importance).sum(dim=-1)            # [N] should we sum? 
-                importance=importance.norm(dim=-1)
+            importance = grads * acts                       # [N, D]
+            #importance = torch.abs(importance).sum(dim=-1)            # [N] should we sum? 
+            importance=importance.norm(dim=-1)
 
             # --- Reshape to patch grid ---
             num_patches = importance.shape[0]
@@ -130,9 +130,81 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
             
             heat_map_pil=VaeImageProcessor.numpy_to_pil(heatmap_color)[0]
             
-            pil_img=concat_images_vertically([pil_img,heat_map_pil])
+            big_img=concat_images_vertically([pil_img,heat_map_pil])
+            
+            #img_list.append(pil_img)
+            
+            #second importance
+            
+            '''grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
+            acts  = target_hidden_state[0, 1:, :]             # [N, D]
+            
+            num_patches = acts.shape[0]
+            h = w = int(num_patches ** 0.5)
+            
+
+
+            importance = grads * acts                       # [N, D]
+            #importance = torch.abs(importance).sum(dim=-1)            # [N] should we sum? 
+            importance=importance.norm(dim=-1)'''
+            
+            cls=target_hidden_state[0,0, :]
+            acts  = target_hidden_state[0, 1:, :]
+            importance = torch.stack([torch.dot(cls, a) for a in acts])
+
+            
+            
+
+            # --- Reshape to patch grid ---
+            num_patches = importance.shape[0]
+            h = w = int(num_patches ** 0.5)
+            importance = importance.reshape(h, w)
+
+            # --- Normalize ---
+            importance = importance - importance.min()
+            importance = importance / (importance.max() + 1e-8)
+
+            # --- Upsample to image size ---
+            importance = importance.unsqueeze(0).unsqueeze(0)  # [1,1,h,w]
+
+            big_importance = F.interpolate(
+                importance,
+                size=(og_h, og_w),   # torch = (H, W)
+                mode="nearest",
+                #align_corners=False
+            )[0, 0]
+
+            # --- Convert for plotting ---
+            img_np = img_tensor.permute(1, 2, 0).cpu().numpy() / 255.0
+            heatmap = big_importance.detach().cpu().numpy()
+
+            # --- Optional sharpening ---
+            heatmap = np.clip(heatmap, 0, 1)
+            heatmap = heatmap ** 0.5
+            
+
+            # convert heatmap → color
+            heatmap_uint8 = np.uint8(255 * heatmap)
+            heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+
+            # convert original image
+            img_uint8 = np.uint8(img_np * 255)
+
+            # blend
+            overlay = cv2.addWeighted(img_uint8, 0.6, heatmap_color, 0.4, 0)
+            
+            
+            
+            
+            #overlay=cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+            pil_img=VaeImageProcessor.numpy_to_pil(overlay)[0]
+            
+            heat_map_pil=VaeImageProcessor.numpy_to_pil(heatmap_color)[0]
+            
+            pil_img=concat_images_vertically([big_img,pil_img,heat_map_pil])
             
             img_list.append(pil_img)
+            
         path=os.path.join(dest_dir,file).replace("jpg","png")
         concat=concat_images_horizontally(img_list)
         arr = np.array(concat)
