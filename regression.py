@@ -8,6 +8,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 from sklearn.metrics import r2_score
 from experiment_helpers.argprint import print_args
+from experiment_helpers.data_helpers import split_data
 from sklearn.linear_model import Ridge,LinearRegression,ElasticNet,Lasso
 from diffusers.image_processor import VaeImageProcessor
 from d3po_rewards import get_nsfw_model,get_aesthetic_model
@@ -19,8 +20,9 @@ import torchvision.transforms as transforms
 from experiment_helpers.image_helpers import concat_images_horizontally
 import matplotlib.pyplot as plt
 import cv2
+from accelerate import Accelerator
 
-def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sparse_embeddings"):
+def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sparse_embeddings",use_grad:bool=False):
     #for each image find relevant patches and scores and save them
     os.makedirs(dest_dir,exist_ok=True)
     # get models
@@ -56,7 +58,8 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
             image_embeds = F.normalize(outputs.image_embeds, dim=-1)
 
             # --- Score (your aesthetic model or direction) ---
-            score = aesthetic_model(image_embeds)
+            #score = aesthetic_model(image_embeds)
+            score=nsfw_model(image_embeds)
             score.backward()
         img_list=[]
         try:
@@ -67,18 +70,19 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
         except FileNotFoundError:
             pass
         for layer_idx,target_hidden_state in enumerate(hidden_states):
-            
-            # --- Importance (Grad * Activation) ---
-            grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
-            acts  = target_hidden_state[0, 1:, :]             # [N, D]
-            
-            num_patches = acts.shape[0]
-            h = w = int(num_patches ** 0.5)
-            
+            if use_grad:
+                # --- Importance (Grad * Activation) ---
+                grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
+                acts  = target_hidden_state[0, 1:, :]             # [N, D]
+                
+                num_patches = acts.shape[0]
+                h = w = int(num_patches ** 0.5)
+                
 
 
-            importance = grads * acts                       # [N, D]
-            importance = torch.abs(importance).sum(dim=-1)            # [N] should we sum? 
+                importance = grads * acts                       # [N, D]
+                #importance = torch.abs(importance).sum(dim=-1)            # [N] should we sum? 
+                importance=importance.norm(dim=-1)
 
             # --- Reshape to patch grid ---
             num_patches = importance.shape[0]
@@ -135,27 +139,156 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
         img = Image.fromarray(arr).convert("RGB")
         img.save(path, quality=65)
         
+import numpy as np
+import os
+import torch
+
+def compute_stats(file_list, block, y_column):
+    X_sum, X_sq_sum, count = None, None, 0
+    y_sum, y_sq_sum = None, None
+
+    for file in file_list:
+        data = np.load(file)
+
+        X = data[block].reshape(-1, data[block].shape[-1])
+        y = data[y_column].reshape(-1, 1)
+
+        if X_sum is None:
+            X_sum = X.sum(axis=0)
+            X_sq_sum = (X**2).sum(axis=0)
+            y_sum = y.sum(axis=0)
+            y_sq_sum = (y**2).sum(axis=0)
+        else:
+            X_sum += X.sum(axis=0)
+            X_sq_sum += (X**2).sum(axis=0)
+            y_sum += y.sum(axis=0)
+            y_sq_sum += (y**2).sum(axis=0)
+
+        count += X.shape[0]
+
+    X_mean = X_sum / count
+    X_std = np.sqrt(X_sq_sum / count - X_mean**2) + 1e-6
+
+    y_mean = y_sum / count
+    y_std = np.sqrt(y_sq_sum / count - y_mean**2) + 1e-6
+
+    return X_mean, X_std, y_mean, y_std
+
+class RegressionDataset(torch.utils.data.Dataset):
+    def __init__(self, file_list, block, y_column, X_mean, X_std, y_mean, y_std):
+        self.file_list = file_list
+        self.block = block
+        self.y_column = y_column
+
+        self.X_mean = torch.tensor(X_mean, dtype=torch.float32)
+        self.X_std = torch.tensor(X_std, dtype=torch.float32)
+        self.y_mean = torch.tensor(y_mean, dtype=torch.float32)
+        self.y_std = torch.tensor(y_std, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, index):
+        data = np.load(self.file_list[index])
+
+        X = torch.tensor(data[self.block], dtype=torch.float32)
+        y = torch.tensor(data[self.y_column], dtype=torch.float32)
+
+        X = X.flatten(0, -2)  # ensure (N, dim)
+        y = y.view(-1, 1)
+
+        # 🔹 normalize
+        X = (X - self.X_mean) / self.X_std
+        y = (y - self.y_mean) / self.y_std
+
+        return {"indep": X, "dep": y}
         
 
-def run_regression(block:str,y_column:str,limit:int,clip_src_dir:str,stats_dest_dir:str):
-    pass
+def run_regression(block:str,y_column:str,
+                   limit:int,clip_src_dir:str,
+                   stats_dest_dir:str,
+                   mixed_precision:str,
+                   gradient_accumulation_steps:int,
+                   epochs:int):
+    for file in os.listdir(clip_src_dir):
+        if file.endswith("npz"):
+            embeds=np.load(os.path.join(clip_src_dir,file))[block]
+            dim=embeds.shape[-1]
+            break
+    
+    linear=torch.nn.Linear(dim,1)
+    optimizer=torch.optim.AdamW(linear.parameters())
+    file_list = [
+        os.path.join(clip_src_dir, f)
+        for f in os.listdir(clip_src_dir)
+        if f.endswith("npz")
+    ]
+
+    X_mean, X_std, y_mean, y_std = compute_stats(file_list, block, y_column)
+
+    dataset = RegressionDataset(
+        file_list, block, y_column,
+        X_mean, X_std, y_mean, y_std
+    )
+    train,test,val=split_data(dataset,0.9,1)
+    
+    accelerator:Accelerator=Accelerator(mixed_precision=mixed_precision,gradient_accumulation_steps=gradient_accumulation_steps)
+    save_path=os.path.join(stats_dest_dir, f"regression_{block}_{y_column}.pt")
+    try:
+        checkpoint=torch.load(save_path,map_location="cpu")
+        linear.load_state_dict(checkpoint["model_state_dict"])
+        start_epoch=checkpoint["e"]+1
+    except:
+        start_epoch=0
+    
+    linear,optimizer,train,test,val=accelerator.prepare(linear,optimizer,train,test,val)
+    
+    
+    for e in range(start_epoch,epochs):
+        loss_list=[]
+        for b,batch in enumerate(train):
+            if b==-1:
+                break
+            x=batch["indep"].flatten(0,1)
+            y=batch["dep"]
+            with accelerator.accumulate(linear):
+                with accelerator.autocast():
+                    optimizer.zero_grad()
+                    predicted=linear(x)
+                    loss=F.mse_loss(predicted,y)
+                    accelerator.backward(loss)
+                    optimizer.step()
+                    loss_list.append(loss.cpu().detach().float().numpy())
+        print(e,np.mean(loss_list))
+        if accelerator.is_main_process:
+            os.makedirs(stats_dest_dir, exist_ok=True)
+
+            unwrapped = accelerator.unwrap_model(linear)
+
+            accelerator.save({
+                "model_state_dict": unwrapped.state_dict(),
+                "e":e
+            }, save_path)
+    
+        
 
 
 
 
-info_path="laion/info.csv"
-sparse_dir="sparse_embeddings"
-dest_dir="statistics"
 
-os.makedirs(dest_dir,exist_ok=True)
 
 if __name__=="__main__":
+    info_path="laion/info.csv"
+    sparse_dir="sparse_embeddings"
+    dest_dir="statistics"
+
+    os.makedirs(dest_dir,exist_ok=True)
     parser=argparse.ArgumentParser()
     parser.add_argument("--y_column",type=str,default="aesthetic") #column 0 = aesthetic column = 1 = p(unsafe)
     parser.add_argument("--block",type=str,default="down_blocks.2.attentions.1")
     parser.add_argument("--limit",type=int,default=-1)
     
-    clip_attribution("test_imgs","test_maps",-1)
+    clip_attribution("test_imgs","test_maps",-1,use_grad=True)
     
     exit(0)
     print_args(parser)

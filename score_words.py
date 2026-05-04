@@ -111,7 +111,6 @@ class NSFWModel(nn.Module):
         self.act = nn.ReLU()
         self.act_out = nn.Sigmoid()
 
-    @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the NSFW model.
 
@@ -198,7 +197,6 @@ class NSFWScorer(nn.Module):
         self.nsfw_model.to(self.device)
         self.nsfw_model.eval()
 
-    @torch.no_grad()
     def __call__(self, embeddings: torch.Tensor | npt.NDArray[np.float32]) -> torch.Tensor:
         """Score the NSFW likelihood of input embeddings.
 

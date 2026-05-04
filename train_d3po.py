@@ -267,7 +267,7 @@ def train_and_save(config,
     train_neg_prompt_embeds = neg_prompt_embed.repeat(batch_size, 1, 1)
     # for some reason, autocast is necessary for non-lora training but for lora training it isn't necessary and it uses
     # more memory
-    autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
+    autocast = accelerator.autocast
 
     # Prepare everything with our `accelerator`.
     trainable_layers, optimizer,pipeline.vae,pipeline.net,pipeline.text_encoder = accelerator.prepare(trainable_layers, optimizer,pipeline.vae,pipeline.net,pipeline.text_encoder)
