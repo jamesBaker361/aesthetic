@@ -358,7 +358,7 @@ class RegressionDataset(torch.utils.data.Dataset):
         return {"indep": X, "dep": y}
         
 
-def run_regression(block:str,y_column:str,
+def run_regression(block:str,dim:int,y_column:str,
                    limit:int,clip_src_dir:str,
                    stats_dest_dir:str,
                    mixed_precision:str,
