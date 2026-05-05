@@ -5,6 +5,7 @@ import numpy as np
 from tqdm import tqdm
 from PIL import Image
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
+from experiment_helpers.gpu_details import print_details
 
 
 block_list=[
@@ -96,6 +97,7 @@ def get_top_k_images(block:str,index:int,k:int=10,image_src_dir:str= "laion",lim
     return [Image.open(os.path.join(image_src_dir,f[1])) for f in rankings]
 
 if __name__=="__main__":
+    print_details()
     big_img_list=[]
     for n in range(10):
         img_list=get_top_k_images("down_blocks.2.attentions.1",n)
