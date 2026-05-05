@@ -61,6 +61,7 @@ def get_maps(pil_img: Image.Image,
         #if use_grad:
         # --- Importance (Grad * Activation) ---
         grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
+        grads=torch.nn.ReLU()(grads)
         acts  = target_hidden_state[0, 1:, :]             # [N, D]
         
         num_patches = acts.shape[0]
