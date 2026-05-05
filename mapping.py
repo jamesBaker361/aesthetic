@@ -35,7 +35,7 @@ folder="smutfolder"
 
 os.makedirs(folder,exist_ok=True)
 
-for n in range(10,20):
+for n in range(10):
     try:
         file_path = hf_hub_download(
         repo_id="wallstoneai/civitai-top-nsfw-images-with-metadata",
@@ -47,7 +47,7 @@ for n in range(10,20):
         img=img.resize((h//4,w//4))
         new_img,concat=get_maps(img,nsfw_model,aesthetic_model,device,processor,clip_model)
         new_img.save(f"{folder}/{n}.png")
-        concat.save(f"{folder}_concat/{n}.png")
+        concat.save(f"{folder}/concat_{n}.png")
     except:
         pass
     

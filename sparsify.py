@@ -72,7 +72,7 @@ def sparsify_embeddings(sparse_dest_dir:str="sparse_embeddings",embedding_src_di
         np.savez(new_path,**result)
         
         
-def get_top_k_images(block:str,index:int,k:int=10,image_src_dir:str= "laion",limit:int=30000)->list[Image.Image]:
+def get_top_k_images(block:str,index:int,k:int=10,image_src_dir:str= "laion",limit:int=1_000_000)->list[Image.Image]:
     files = [f for f in os.listdir(image_src_dir) if f.endswith("jpg")][:limit]
 
     def load_score(file):

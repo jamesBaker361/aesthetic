@@ -128,7 +128,7 @@ def main(args):
     #sparsify_embeddings(sparse_embedding_dir,embedding_dir)
     #clip_attribution(image_src_dir,clip_dir,clip_limit,use_grad=True)
     for block in block_list:
-        dim=1280 #dim is this for all of these
+        dim=5000 #idr but itll break and tell us
         run_regression(block,dim,y_column,regression_limit,clip_dir,stats_dir+block,"fp16",2,10) #use sparse dir for now; in the future only use clip_dir
         #run_regression(block,y_column,regression_limit,clip_dir,stats_dir)
     #load regression means, covariance matrix for each layer
