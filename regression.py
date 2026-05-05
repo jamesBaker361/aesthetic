@@ -51,6 +51,7 @@ def get_maps(pil_img: Image.Image,
         score.backward()
     img_list=[]
     try:
+        pass
         npz_dict=dict(np.load(os.path.join(sparse_dir, file.replace("jpg","npz"))))
         npz_dict["aesthetic"]=score.cpu().detach().numpy()
         npz_dict["nsfw"]=0.
@@ -69,7 +70,7 @@ def get_maps(pil_img: Image.Image,
         
 
 
-        importance = grads * acts                       # [N, D]
+        importance = grads #* acts                       # [N, D]
         #importance = torch.abs(importance).sum(dim=-1)            # [N] should we sum? 
         importance=importance.norm(dim=-1)
 
@@ -185,7 +186,7 @@ def get_maps(pil_img: Image.Image,
         
         
         
-        #overlay=cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+        overlay=cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
         pil_img=VaeImageProcessor.numpy_to_pil(overlay)[0]
         
         heat_map_pil=VaeImageProcessor.numpy_to_pil(heatmap_color)[0]
