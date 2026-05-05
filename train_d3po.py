@@ -270,7 +270,7 @@ def train_and_save(config,
     autocast = accelerator.autocast
 
     # Prepare everything with our `accelerator`.
-    trainable_layers, optimizer,pipeline.vae,pipeline.net,pipeline.text_encoder = accelerator.prepare(trainable_layers, optimizer,pipeline.vae,pipeline.net,pipeline.text_encoder)
+    trainable_layers, optimizer,pipeline.vae,pipeline.unet,pipeline.text_encoder = accelerator.prepare(trainable_layers, optimizer,pipeline.vae,pipeline.unet,pipeline.text_encoder)
 
     # executor to perform callbacks asynchronously.
     executor = futures.ThreadPoolExecutor(max_workers=2)
