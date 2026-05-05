@@ -123,9 +123,9 @@ def main(args):
          "up_blocks.0.attentions.1"
     ]
     
-    get_images(image_src_dir,method,n_random,size,num_inference_steps)
-    extract_vanilla(embedding_dir,image_src_dir,limit,size,mixed_precision)
-    sparsify_embeddings(sparse_embedding_dir,embedding_dir)
+    #get_images(image_src_dir,method,n_random,size,num_inference_steps)
+    #extract_vanilla(embedding_dir,image_src_dir,limit,size,mixed_precision)
+    #sparsify_embeddings(sparse_embedding_dir,embedding_dir)
     #clip_attribution(image_src_dir,clip_dir,clip_limit,use_grad=True)
     for block in block_list:
         dim=1280 #dim is this for all of these
