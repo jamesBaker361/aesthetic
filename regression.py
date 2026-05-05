@@ -203,6 +203,34 @@ def get_maps(pil_img: Image.Image,
     img = Image.fromarray(arr).convert("RGB")
     return img
 
+def get_importance(pil_img: Image.Image,
+             nsfw_model,
+             aesthetic_model,
+             device,
+             processor,
+             clip_model)->torch.Tensor:
+    og_w, og_h = pil_img.size  # NOTE: PIL = (W, H) supposedly...
+    img_tensor = transforms.PILToTensor()(pil_img)  # [C,H,W]
+
+    with torch.enable_grad():
+        inputs = {k: v.to(device) for k, v in processor(images=img_tensor, return_tensors="pt").items()}
+        inputs['pixel_values'].requires_grad_(True)
+        outputs = clip_model(**inputs, output_hidden_states=True, output_attentions=True)
+
+        hidden_states = outputs.hidden_states
+        for t in hidden_states:
+            t.retain_grad()
+
+        last_hidden_state = outputs.last_hidden_state  # [1, 1+N, D]
+        last_hidden_state.retain_grad()
+
+        image_embeds = F.normalize(outputs.image_embeds, dim=-1)
+
+        # --- Score (your aesthetic model or direction) ---
+        score = aesthetic_model(image_embeds)
+        score=nsfw_model(image_embeds)
+        score.backward()
+
 def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sparse_embeddings",use_grad:bool=False):
     #for each image find relevant patches and scores and save them
     os.makedirs(dest_dir,exist_ok=True)
