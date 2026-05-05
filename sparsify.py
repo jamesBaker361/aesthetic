@@ -85,9 +85,11 @@ def get_top_k_images(block:str,index:int,k:int=10,image_src_dir:str= "laion")->l
                 print(largest)
             largest=max(features)
             rankings.append([largest,file])
+            rankings.sort(rkey=lambda x:-x[0])
+            rankings=rankings[:k]
+            
 
     rankings.sort(key=lambda x:-x[0])
-    rankings=rankings[:k]
     return [Image.open(os.path.join(image_src_dir,f[1])) for f in rankings]
 
 if __name__=="__main__":
