@@ -97,7 +97,7 @@ def get_maps(pil_img: Image.Image,
         clip_grad_maps.append(big_importance)
 
         # --- Convert for plotting ---
-        img_np = img_tensor.permute(1, 2, 0).cpu().numpy() / 255.0
+        img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
         heatmap = big_importance.detach().cpu().numpy()
 
         # --- Optional sharpening ---
@@ -111,14 +111,14 @@ def get_maps(pil_img: Image.Image,
         heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
 
         # convert original image
-        img_uint8 = np.uint8(img_np * 255)
+        img_uint8 = np.uint8(img_np)
 
         # blend
         overlay = cv2.addWeighted(img_uint8, 0.6, heatmap_color, 0.4, 0)
 
-        pil_img=VaeImageProcessor.numpy_to_pil(overlay)[0]
+        pil_img=VaeImageProcessor.numpy_to_pil(255-overlay)[0]
 
-        heat_map_pil=VaeImageProcessor.numpy_to_pil(heatmap_color)[0]
+        heat_map_pil=VaeImageProcessor.numpy_to_pil(255-heatmap_color)[0]
         
         big_img=concat_images_vertically([pil_img,heat_map_pil])
         
@@ -184,9 +184,9 @@ def get_maps(pil_img: Image.Image,
         # blend
         overlay = cv2.addWeighted(img_uint8, 0.6, heatmap_color, 0.4, 0)
 
-        pil_img=VaeImageProcessor.numpy_to_pil(overlay)[0]
+        pil_img=VaeImageProcessor.numpy_to_pil(255-overlay)[0]
 
-        heat_map_pil=VaeImageProcessor.numpy_to_pil(heatmap_color)[0]
+        heat_map_pil=VaeImageProcessor.numpy_to_pil(255-heatmap_color)[0]
         
         pil_img=concat_images_vertically([big_img,pil_img,heat_map_pil])
         
@@ -200,8 +200,6 @@ def get_maps(pil_img: Image.Image,
     arr = np.clip(arr, 0, 255).astype(np.uint8)
 
     img = Image.fromarray(arr).convert("RGB")
-    
-    
     
     return img
 
