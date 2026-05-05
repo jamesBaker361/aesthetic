@@ -58,6 +58,7 @@ def get_maps(pil_img: Image.Image,
         np.savez(os.path.join(dest_dir,file.replace("jpg","npz")), ** npz_dict)
     except (FileNotFoundError,NameError):
         pass
+    clip_grad_maps=[]
     for layer_idx,target_hidden_state in enumerate(hidden_states): # so the middle 4 layers seem to be the only not totally dogshit- maybe we should pool
         #if use_grad:
         # --- Importance (Grad * Activation) ---
@@ -92,6 +93,8 @@ def get_maps(pil_img: Image.Image,
             mode="nearest",
             #align_corners=False
         )[0, 0]
+        
+        clip_grad_maps.append(big_importance)
 
         # --- Convert for plotting ---
         img_np = img_tensor.permute(1, 2, 0).cpu().numpy() / 255.0
@@ -105,19 +108,16 @@ def get_maps(pil_img: Image.Image,
         # convert heatmap → color
         heatmap_uint8 = np.uint8(255 * heatmap)
         heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_BONE)
+        heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
 
         # convert original image
         img_uint8 = np.uint8(img_np * 255)
 
         # blend
         overlay = cv2.addWeighted(img_uint8, 0.6, heatmap_color, 0.4, 0)
-        
-        
-        
-        
-        #overlay=cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+
         pil_img=VaeImageProcessor.numpy_to_pil(overlay)[0]
-        
+
         heat_map_pil=VaeImageProcessor.numpy_to_pil(heatmap_color)[0]
         
         big_img=concat_images_vertically([pil_img,heat_map_pil])
@@ -176,19 +176,16 @@ def get_maps(pil_img: Image.Image,
         # convert heatmap → color
         heatmap_uint8 = np.uint8(255 * heatmap)
         heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_BONE)
+        heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
 
         # convert original image
         img_uint8 = np.uint8(img_np * 255)
 
         # blend
         overlay = cv2.addWeighted(img_uint8, 0.6, heatmap_color, 0.4, 0)
-        
-        
-        
-        
-        overlay=cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+
         pil_img=VaeImageProcessor.numpy_to_pil(overlay)[0]
-        
+
         heat_map_pil=VaeImageProcessor.numpy_to_pil(heatmap_color)[0]
         
         pil_img=concat_images_vertically([big_img,pil_img,heat_map_pil])
@@ -203,6 +200,9 @@ def get_maps(pil_img: Image.Image,
     arr = np.clip(arr, 0, 255).astype(np.uint8)
 
     img = Image.fromarray(arr).convert("RGB")
+    
+    
+    
     return img
 
 def get_importance(pil_img: Image.Image,
