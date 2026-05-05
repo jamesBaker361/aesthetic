@@ -22,7 +22,7 @@ import zipfile
 from pathlib import Path
 
 zip_path = Path(file_path)
-target_dir = Path("path/to/extract")
+target_dir = Path("nsfw_dataset")
 
 target_dir.mkdir(parents=True, exist_ok=True)
 
