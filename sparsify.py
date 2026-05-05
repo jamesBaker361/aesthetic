@@ -4,6 +4,9 @@ import os
 import numpy as np
 from tqdm import tqdm
 from PIL import Image
+import time
+import heapq
+from concurrent.futures import ThreadPoolExecutor
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
 from experiment_helpers.gpu_details import print_details
 
@@ -69,39 +72,42 @@ def sparsify_embeddings(sparse_dest_dir:str="sparse_embeddings",embedding_src_di
         np.savez(new_path,**result)
         
         
-def get_top_k_images(block:str,index:int,k:int=10,image_src_dir:str= "laion",limit:int=15000)->list[Image.Image]:
-    rankings=[]
+def get_top_k_images(block:str,index:int,k:int=10,image_src_dir:str= "laion",limit:int=30000)->list[Image.Image]:
+    files = [f for f in os.listdir(image_src_dir) if f.endswith("jpg")][:limit]
 
-    for n,file in enumerate([f for f in os.listdir(image_src_dir) if f.endswith("jpg")]):
-        if n==limit:
-            break
-        npz_path=os.path.join(sparse_dest_dir,file.replace(".jpg",".npz"))
+    def load_score(file):
+        npz_path = os.path.join(sparse_dest_dir, file.replace(".jpg", ".npz"))
         if not os.path.exists(npz_path):
-            npz_path=os.path.join(sparse_dest_dir,file+".npz")
-        if os.path.exists(npz_path):
-            npz_dict=np.load(npz_path)
-            sparse_embedding=npz_dict[block]
-            
-            features=sparse_embedding[:,index]
-            if n==0:
-                print(sparse_embedding.shape)
-                print(features.shape)
-                print(largest)
-            largest=max(features)
-            rankings.append([largest,file])
-            rankings.sort(key=lambda x:-x[0])
-            rankings=rankings[:k]
-            
+            npz_path = os.path.join(sparse_dest_dir, file + ".npz")
+        if not os.path.exists(npz_path):
+            return None
+        npz_dict = np.load(npz_path)
+        sparse_embedding = npz_dict[block]
+        return float(np.max(sparse_embedding[:, index])), file
 
-    rankings.sort(key=lambda x:-x[0])
-    return [Image.open(os.path.join(image_src_dir,f[1])).resize((256,256)) for f in rankings]
+    heap = []  # min-heap of (score, file), size <= k
+    with ThreadPoolExecutor() as executor:
+        for result in tqdm(executor.map(load_score, files), total=len(files), desc="Scoring"):
+            if result is None:
+                continue
+            score, file = result
+            if len(heap) < k:
+                heapq.heappush(heap, (score, file))
+            elif score > heap[0][0]:
+                heapq.heapreplace(heap, (score, file))
+
+    heap.sort(reverse=True)
+    return [Image.open(os.path.join(image_src_dir, f[1])).resize((256, 256)) for f in heap]
 
 if __name__=="__main__":
     print_details()
     big_img_list=[]
-    for n in range(2):
+    for n in range(4):
+        start=time.time()
         img_list=get_top_k_images("down_blocks.2.attentions.1",n)
         img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
+        end=time.time()
+        print(f"elpased {end-start}")
         big_img_list.append(img)
         
     concat_images_vertically(big_img_list).save("sparse.png")

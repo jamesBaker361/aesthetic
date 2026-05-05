@@ -201,7 +201,37 @@ def get_maps(pil_img: Image.Image,
 
     img = Image.fromarray(arr).convert("RGB")
     
-    return img
+    avg_importance=torch.stack(clip_grad_maps).mean(0)
+    
+    heatmap = avg_importance.detach().cpu().numpy()
+
+    # --- Optional sharpening ---
+    heatmap = np.clip(heatmap, 0, 1)
+    heatmap = heatmap ** 0.5
+    
+
+    # convert heatmap → color
+    heatmap_uint8 = np.uint8(255 * heatmap)
+    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_BONE)
+    heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+    avg_pil=VaeImageProcessor.numpy_to_pil(255-heatmap_color)[0]
+    max_importance=torch.stack(clip_grad_maps).max(dim=0)
+    heatmap = max_importance.detach().cpu().numpy()
+
+    # --- Optional sharpening ---
+    heatmap = np.clip(heatmap, 0, 1)
+    heatmap = heatmap ** 0.5
+    
+
+    # convert heatmap → color
+    heatmap_uint8 = np.uint8(255 * heatmap)
+    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_BONE)
+    heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+    max_pil=VaeImageProcessor.numpy_to_pil(255-heatmap_color)[0]
+    
+    concat2=concat_images_horizontally([avg_pil,pil_img,max_pil])
+    
+    return img,concat2
 
 def get_importance(pil_img: Image.Image,
              nsfw_model,
