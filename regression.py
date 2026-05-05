@@ -102,7 +102,7 @@ def get_maps(pil_img: Image.Image,
 
         # convert heatmap → color
         heatmap_uint8 = np.uint8(255 * heatmap)
-        heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+        heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_BONE)
 
         # convert original image
         img_uint8 = np.uint8(img_np * 255)
@@ -173,7 +173,7 @@ def get_maps(pil_img: Image.Image,
 
         # convert heatmap → color
         heatmap_uint8 = np.uint8(255 * heatmap)
-        heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+        heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_BONE)
 
         # convert original image
         img_uint8 = np.uint8(img_np * 255)
@@ -230,6 +230,42 @@ def get_importance(pil_img: Image.Image,
         score = aesthetic_model(image_embeds)
         score=nsfw_model(image_embeds)
         score.backward()
+        
+    target_layers=[]
+    for layer_idx,target_hidden_state in enumerate(hidden_states): # so the middle 4 layers seem to be the only not totally dogshit- maybe we should pool
+        #if use_grad:
+        # --- Importance (Grad * Activation) ---
+        grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
+        acts  = target_hidden_state[0, 1:, :]             # [N, D]
+        
+        num_patches = acts.shape[0]
+        h = w = int(num_patches ** 0.5)
+        
+
+
+        importance = grads * acts                       # [N, D]
+        #importance = torch.abs(importance).sum(dim=-1)            # [N] should we sum? 
+        importance=importance.norm(dim=-1)
+
+        # --- Reshape to patch grid ---
+        num_patches = importance.shape[0]
+        h = w = int(num_patches ** 0.5)
+        importance = importance.reshape(h, w)
+
+        # --- Normalize ---
+        importance = importance - importance.min()
+        importance = importance / (importance.max() + 1e-8)
+
+        # --- Upsample to image size ---
+        importance = importance.unsqueeze(0).unsqueeze(0)  # [1,1,h,w]
+
+        big_importance = F.interpolate(
+            importance,
+            size=(og_h, og_w),   # torch = (H, W)
+            mode="nearest",
+            #align_corners=False
+        )[0, 0]
+
 
 def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sparse_embeddings",use_grad:bool=False):
     #for each image find relevant patches and scores and save them
