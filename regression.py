@@ -46,7 +46,7 @@ def get_maps(pil_img: Image.Image,
         image_embeds = F.normalize(outputs.image_embeds, dim=-1)
 
         # --- Score (your aesthetic model or direction) ---
-        score = aesthetic_model(image_embeds)
+        #score = aesthetic_model(image_embeds)
         score=nsfw_model(image_embeds)
         score.backward()
     img_list=[]
