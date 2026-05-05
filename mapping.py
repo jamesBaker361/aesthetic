@@ -48,8 +48,8 @@ for n in range(10):
         new_img,concat=get_maps(img,nsfw_model,aesthetic_model,device,processor,clip_model)
         new_img.save(f"{folder}/{n}.png")
         concat.save(f"{folder}/concat_{n}.png")
-    except:
-        pass
+    except Exception as e:
+        print(e)
     
     
     
