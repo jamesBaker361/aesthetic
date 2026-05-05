@@ -379,9 +379,6 @@ class RegressionDataset(torch.utils.data.Dataset):
         X = torch.tensor(data[self.block], dtype=torch.float32)
         y = torch.tensor(data[self.y_column], dtype=torch.float32)
 
-        X = X.flatten(0, -2)  # ensure (N, dim)
-        y = y.view(-1, 1)
-
         # 🔹 normalize
         X = (X - self.X_mean) / self.X_std
         y = (y - self.y_mean) / self.y_std
@@ -434,8 +431,11 @@ def run_regression(block:str,dim:int,y_column:str,
         for b,batch in enumerate(train):
             if b==limit:
                 break
-            x=batch["indep"].flatten(0,1)
+            x=batch["indep"]
             y=batch["dep"]
+            if b==0 and e==start_epoch:
+                print("x size",x.size())
+                print("y size ",y.size())
             with accelerator.accumulate(linear):
                 with accelerator.autocast():
                     optimizer.zero_grad()
