@@ -215,7 +215,7 @@ def get_maps(pil_img: Image.Image,
     heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_BONE)
     heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
     avg_pil=VaeImageProcessor.numpy_to_pil(255-heatmap_color)[0]
-    max_importance=torch.stack(clip_grad_maps).max(dim=0)
+    max_importance=torch.stack(clip_grad_maps).max(dim=0).values
     heatmap = max_importance.detach().cpu().numpy()
 
     # --- Optional sharpening ---
