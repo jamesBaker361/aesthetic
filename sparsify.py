@@ -99,7 +99,7 @@ def get_top_k_images(block:str,index:int,k:int=10,image_src_dir:str= "laion",lim
 if __name__=="__main__":
     print_details()
     big_img_list=[]
-    for n in range(10):
+    for n in range(2):
         img_list=get_top_k_images("down_blocks.2.attentions.1",n)
         img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
         big_img_list.append(img)
