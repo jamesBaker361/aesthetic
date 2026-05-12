@@ -261,7 +261,8 @@ def get_importance(pil_img: Image.Image,
         score=nsfw_model(image_embeds)
         score.backward()
         
-    target_layers=[]
+    importance_nsfw=[]
+    
     for layer_idx,target_hidden_state in enumerate(hidden_states): # so the middle 4 layers seem to be the only not totally dogshit- maybe we should pool
         #if use_grad:
         # --- Importance (Grad * Activation) ---
@@ -296,9 +297,78 @@ def get_importance(pil_img: Image.Image,
             mode="nearest",
             #align_corners=False
         )[0, 0]
+        importance_nsfw.append(big_importance)
+    
+    importance_aesthetic=[]
+    
+    img_tensor = transforms.PILToTensor()(pil_img)  # [C,H,W]
+
+    with torch.enable_grad():
+        inputs = {k: v.to(device) for k, v in processor(images=img_tensor, return_tensors="pt").items()}
+        inputs['pixel_values'].requires_grad_(True)
+        outputs = clip_model(**inputs, output_hidden_states=True, output_attentions=True)
+
+        hidden_states = outputs.hidden_states
+        for t in hidden_states:
+            t.retain_grad()
+
+        last_hidden_state = outputs.last_hidden_state  # [1, 1+N, D]
+        last_hidden_state.retain_grad()
+
+        image_embeds = F.normalize(outputs.image_embeds, dim=-1)
+
+        # --- Score (your aesthetic model or direction) ---
+        #score = aesthetic_model(image_embeds)
+        score=aesthetic_model(image_embeds)
+        score.backward()
+        
+    
+    
+    for layer_idx,target_hidden_state in enumerate(hidden_states): # so the middle 4 layers seem to be the only not totally dogshit- maybe we should pool
+        #if use_grad:
+        # --- Importance (Grad * Activation) ---
+        grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
+        grads=torch.nn.ReLU()(grads)
+        acts  = target_hidden_state[0, 1:, :]             # [N, D]
+        
+        num_patches = acts.shape[0]
+        h = w = int(num_patches ** 0.5)
+        
 
 
-def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sparse_embeddings",use_grad:bool=False):
+        importance = grads * acts                       # [N, D]
+        #importance = torch.abs(importance).sum(dim=-1)            # [N] should we sum? 
+        importance=importance.norm(dim=-1)
+
+        # --- Reshape to patch grid ---
+        num_patches = importance.shape[0]
+        h = w = int(num_patches ** 0.5)
+        importance = importance.reshape(h, w)
+
+        # --- Normalize ---
+        importance = importance - importance.min()
+        importance = importance / (importance.max() + 1e-8)
+
+        # --- Upsample to image size ---
+        importance = importance.unsqueeze(0).unsqueeze(0)  # [1,1,h,w]
+
+        big_importance = F.interpolate(
+            importance,
+            size=(og_h, og_w),   # torch = (H, W)
+            mode="nearest",
+            #align_corners=False
+        )[0, 0]
+        
+        importance_aesthetic.append(big_importance)
+        
+    return importance_aesthetic,importance_nsfw
+
+def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
+                     sparse_dir:str="sparse_embeddings",
+                     use_grad:bool=False,
+                     start_layer=5,
+                     stop_layer=15,
+                     top_frac:float=0.1):
     #for each image find relevant patches and scores and save them
     os.makedirs(dest_dir,exist_ok=True)
     # get models
@@ -312,17 +382,56 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,sparse_dir:str="sp
     img_pro=VaeImageProcessor()
 
     for n, file in enumerate([f for f in os.listdir(image_src_dir) if f.endswith("jpg")][:limit]):
+        npz_file=file.replace("jpg","npz")
+        if os.path.exists(os.path.join(sparse_dir,npz_file)):
         
-        # --- Load image ---
-        pil_img = Image.open(os.path.join(image_src_dir, file)).convert("RGB")
-        og_w, og_h = pil_img.size  # NOTE: PIL = (W, H) supposedly...
-        img=get_maps(pil_img,nsfw_model,
-             aesthetic_model,
-             device,
-             processor,
-             clip_model)
-        path=os.path.join(dest_dir,file).replace("jpg","png")
-        img.save(path, quality=65)
+            # --- Load image ---
+            pil_img = Image.open(os.path.join(image_src_dir, file)).convert("RGB")
+            importance_aesthetic,importance_nsfw=get_importance(pil_img,nsfw_model,aesthetic_model,device,processor,clip_model)
+            importance_aesthetic=importance_aesthetic[start_layer:stop_layer]
+            importance_nsfw=importance_nsfw[start_layer:stop_layer]
+            
+            avg_aesthetic=torch.mean(importance_aesthetic,dim=0)
+            avg_nsfw=torch.mean(importance_nsfw,dim=0)
+            
+            avg_nsfw=avg_nsfw-avg_nsfw.min()
+            avg_nsfw=avg_nsfw/(avg_nsfw.max()+1e-8)
+            avg_aesthetic=avg_aesthetic-avg_aesthetic.min()
+            avg_aesthetic=avg_aesthetic/(avg_aesthetic.max()+1e-8)
+            aesthetic_mask = avg_aesthetic >= torch.quantile(avg_aesthetic, 0.9)
+            nsfw_mask=avg_nsfw>=torch.quantile(avg_nsfw,0.9)
+            
+            old_npz=np.load(os.path.join(sparse_dir,npz_file))
+            save_dict={}
+            for block in [
+                "down_blocks.2.attentions.1",
+                "mid_block.attentions.0",
+                "up_blocks.0.attentions.0",
+                "up_blocks.0.attentions.1"
+            ]:
+                features=torch.tensor(old_npz[block])
+                (h,w,c)=features.size()
+                for y_value,mask in zip(["nsfw","aesthetic"],[nsfw_mask,aesthetic_mask]):
+                    resized_mask = F.interpolate(mask.float(), (h, w))
+
+                    masked_features = features * resized_mask[0]
+
+                    # flatten and keep only nonzero activations
+                    sparse_values = masked_features[masked_features != 0].flatten()
+
+                    save_dict[f"{block}.{y_value}"] = sparse_values.cpu().numpy()
+                    
+            np.savez(os.path.join(dest_dir,npz_file))
+                    
+                
+                
+                
+                
+        
+        
+        
+        
+        
         
 import numpy as np
 import os

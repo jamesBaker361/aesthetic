@@ -61,7 +61,7 @@ def sparsify_embeddings(sparse_dest_dir:str="sparse_embeddings",embedding_src_di
                 sae=saes_dict[block]
                 input_data=data["saved_input."+block]
                 output_data=data["saved_output."+block]
-                x=torch.tensor(output_data-input_data).squeeze(0).permute(1,2,0).flatten(0,1)
+                x=torch.tensor(output_data-input_data).squeeze(0).permute(1,2,0)
                 if torch.isnan(x).any():
                     print("nan x ",new_path)
                 features=sae.encode(x)
@@ -102,9 +102,9 @@ def get_top_k_images(block:str,index:int,k:int=10,image_src_dir:str= "laion",lim
 if __name__=="__main__":
     print_details()
     big_img_list=[]
-    for n in range(4):
+    for n in range(10):
         start=time.time()
-        img_list=get_top_k_images("down_blocks.2.attentions.1",n)
+        img_list=get_top_k_images("down_blocks.2.attentions.1",n,limit=-1)
         img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
         end=time.time()
         print(f"elpased {end-start}")
