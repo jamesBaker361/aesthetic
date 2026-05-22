@@ -21,7 +21,9 @@ import nltk
 from nltk.corpus import wordnet as wn
 from sdxl_extract import extract_vanilla
 from sparsify import sparsify_embeddings
-from regression import run_regression,clip_attribution
+from regression import run_regression,clip_attribution,get_importance
+from d3po_rewards import get_aesthetic_model,get_nsfw_model
+from transformers import CLIPVisionModelWithProjection,CLIPImageProcessor
 
 
 parser=default_parser()
@@ -39,6 +41,8 @@ parser.add_argument("--clip_dir",type=str,default="clip_sparse_embeddings_dummy"
 parser.add_argument("--clip_limit",type=int,default=-1)
 parser.add_argument("--regression_limit",type=int,default=-1)
 parser.add_argument("--stats_dir",type=str,default="statistics")
+parser.add_argument("--start_layer",type=int,default=5)
+parser.add_argument("--stop_layer",type=int,default=20)
 #def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
 # def run_regression(block:str,y_column:str,limit:int,clip_src_dir:str,stats_dest_dir:str):
 # generate images using RL or prompts
@@ -115,6 +119,8 @@ def main(args):
     clip_limit : int = args.clip_limit
     regression_limit : int = args.regression_limit
     stats_dir : str = args.stats_dir
+    start_layer:int=args.start_layer
+    stop_layer:int=args.stop_layer
     
     block_list=[
         "down_blocks.2.attentions.1",
@@ -123,13 +129,17 @@ def main(args):
          "up_blocks.0.attentions.1"
     ]
     
-    #get_images(image_src_dir,method,n_random,size,num_inference_steps)
-    #extract_vanilla(embedding_dir,image_src_dir,limit,size,mixed_precision)
-    #sparsify_embeddings(sparse_embedding_dir,embedding_dir)
-    #clip_attribution(image_src_dir,clip_dir,clip_limit,use_grad=True)
+    get_images(image_src_dir,method,n_random,size,num_inference_steps)
+    extract_vanilla(embedding_dir,image_src_dir,limit,size,mixed_precision)
+    sparsify_embeddings(sparse_embedding_dir,embedding_dir)
+    clip_attribution(image_src_dir,clip_dir,clip_limit,use_grad=True)
     for block in block_list:
         dim=5000 #idr but itll break and tell us
-        run_regression(block,dim,y_column,regression_limit,clip_dir,stats_dir+block,"fp16",2,10) #use sparse dir for now; in the future only use clip_dir
+        save_path=run_regression(block,dim,y_column,regression_limit,clip_dir,stats_dir+block,"fp16",2,epochs) #use sparse dir for now; in the future only use clip_dir
+        print(save_path)
+        weights_dict=torch.load(save_path)["model_state_dict"]
+        print(type(weights_dict))
+        print(weights_dict.size())
         #run_regression(block,y_column,regression_limit,clip_dir,stats_dir)
     #load regression means, covariance matrix for each layer
     sae_dict={} #load saes for each layer
@@ -152,26 +162,28 @@ def main(args):
     #get list of prompts (different for aesthetic vs punsafe)
     with open("unsafe.csv","r") as file:
         reader=csv.DictReader(file)
+    
+    nsfw_model=get_nsfw_model()
+    aesthetic_model=get_aesthetic_model()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").to(device)
+    processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
+    
+    hook_list=[]
+        
+    def hook_fn(module,input,output,begin:int=6,end:int=2):
+        pass
         
     for row in reader:
         prompt=row["prompt"]
         
         rand_gen=torch.Generator()
         rand_gen.seed(123)
-        
+        break
         bad_image=pipe(prompt,size,size,generator=rand_gen).images[0]
         
-        mask=None
-        if mask=="clip":
-            #https://arxiv.org/abs/2210.04610 Red-Teaming the Stable Diffusion Safety Filter
-            #https://arxiv.org/abs/2502.18816  Grad-ECLIP: Gradient-based Visual and Textual Explanations for CLIP
-            pass
-        elif mask=="clip_surgery":
-            # https://arxiv.org/abs/2304.05653  CLIP Surgery
-            # get some bad text prompts- find where they are MOST activated in image and zero out any bad sparse features like SAEUron
-            pass
-        else:
-            pass
+        
             
         
         

@@ -229,8 +229,8 @@ def get_maps(pil_img: Image.Image,
     heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
     max_pil=VaeImageProcessor.numpy_to_pil(255-heatmap_color)[0]
     
-    concat2=concat_images_horizontally([avg_pil,pil_img,max_pil])
-    
+    concat2=concat_images_horizontally([avg_pil,max_pil])
+
     return img,concat2
 
 def get_importance(pil_img: Image.Image,
@@ -238,7 +238,7 @@ def get_importance(pil_img: Image.Image,
              aesthetic_model,
              device,
              processor,
-             clip_model)->torch.Tensor:
+             clip_model)->tuple[list[torch.Tensor],list[torch.Tensor]]:
     og_w, og_h = pil_img.size  # NOTE: PIL = (W, H) supposedly...
     img_tensor = transforms.PILToTensor()(pil_img)  # [C,H,W]
 
@@ -391,8 +391,8 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
             importance_aesthetic=importance_aesthetic[start_layer:stop_layer]
             importance_nsfw=importance_nsfw[start_layer:stop_layer]
             
-            avg_aesthetic=torch.mean(importance_aesthetic,dim=0)
-            avg_nsfw=torch.mean(importance_nsfw,dim=0)
+            avg_aesthetic=torch.stack(importance_aesthetic).mean(dim=0)
+            avg_nsfw=torch.stack(importance_nsfw).mean(dim=0)
             
             avg_nsfw=avg_nsfw-avg_nsfw.min()
             avg_nsfw=avg_nsfw/(avg_nsfw.max()+1e-8)
@@ -412,16 +412,18 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
                 features=torch.tensor(old_npz[block])
                 (h,w,c)=features.size()
                 for y_value,mask in zip(["nsfw","aesthetic"],[nsfw_mask,aesthetic_mask]):
-                    resized_mask = F.interpolate(mask.float(), (h, w))
+                    resized_mask = F.interpolate(
+                        mask.float().unsqueeze(0).unsqueeze(0), size=(h, w)
+                    )[0, 0]
 
-                    masked_features = features * resized_mask[0]
+                    masked_features = features * resized_mask.unsqueeze(-1)
 
                     # flatten and keep only nonzero activations
                     sparse_values = masked_features[masked_features != 0].flatten()
 
                     save_dict[f"{block}.{y_value}"] = sparse_values.cpu().numpy()
-                    
-            np.savez(os.path.join(dest_dir,npz_file))
+
+            np.savez(os.path.join(dest_dir,npz_file), **save_dict)
                     
                 
                 
@@ -563,7 +565,7 @@ def run_regression(block:str,dim:int,y_column:str,
                 "model_state_dict": unwrapped.state_dict(),
                 "e":e
             }, save_path)
-    
+    return save_path
         
 
 
