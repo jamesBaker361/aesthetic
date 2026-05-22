@@ -74,7 +74,7 @@ def get_images(image_dest_dir:str,method:str,n_random:int,size:int,num_inference
     if method==UNTRAINED:
         diff_pipe=base_pipe
     else:
-        pass
+        raise NotImplementedError(f"method={method} not implemented")
     for p,prompt in enumerate(prompt_list):
         base_path=f"{image_dest_dir}/base_{p}.jpg"
         if os.path.exists(base_path):
@@ -135,11 +135,12 @@ def main(args):
     clip_attribution(image_src_dir,clip_dir,clip_limit,use_grad=True)
     for block in block_list:
         dim=5000 #idr but itll break and tell us
-        save_path=run_regression(block,dim,y_column,regression_limit,clip_dir,stats_dir+block,"fp16",2,epochs) #use sparse dir for now; in the future only use clip_dir
+        save_path=run_regression(block,dim,y_column,regression_limit,clip_dir,os.path.join(stats_dir,block),"fp16",2,epochs) #use sparse dir for now; in the future only use clip_dir
         print(save_path)
         weights_dict=torch.load(save_path)["model_state_dict"]
         print(type(weights_dict))
-        print(weights_dict.size())
+        print(len(weights_dict))
+        print([k for k in weights_dict])
         #run_regression(block,y_column,regression_limit,clip_dir,stats_dir)
     #load regression means, covariance matrix for each layer
     sae_dict={} #load saes for each layer
@@ -160,28 +161,27 @@ def main(args):
     
     #generate images and edit them somehow (SAEURON just negates bad concepts)
     #get list of prompts (different for aesthetic vs punsafe)
-    with open("unsafe.csv","r") as file:
-        reader=csv.DictReader(file)
-    
     nsfw_model=get_nsfw_model()
     aesthetic_model=get_aesthetic_model()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
+
     clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").to(device)
     processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
-    
+
     hook_list=[]
-        
+
     def hook_fn(module,input,output,begin:int=6,end:int=2):
         pass
-        
-    for row in reader:
-        prompt=row["prompt"]
-        
-        rand_gen=torch.Generator()
-        rand_gen.seed(123)
-        break
-        bad_image=pipe(prompt,size,size,generator=rand_gen).images[0]
+
+    with open("unsafe.csv","r") as file:
+        reader=csv.DictReader(file)
+        for i,row in enumerate(reader):
+            prompt=row["prompt"]
+
+            rand_gen=torch.Generator()
+            rand_gen.manual_seed(i)
+            break
+            bad_image=pipe(prompt,size,size,generator=rand_gen).images[0]
         
         
             
