@@ -43,6 +43,11 @@ parser.add_argument("--regression_limit",type=int,default=-1)
 parser.add_argument("--stats_dir",type=str,default="statistics")
 parser.add_argument("--start_layer",type=int,default=5)
 parser.add_argument("--stop_layer",type=int,default=20)
+parser.add_argument("--disable_get_images",action="store_true")
+parser.add_argument("--disable_extract_vanilla",action="store_true")
+parser.add_argument("--disable_sparsify_embeddings",action="store_true")
+parser.add_argument("--disable_clip_attribution",action="store_true")
+parser.add_argument("--disable_run_regression",action="store_true")
 #def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
 # def run_regression(block:str,y_column:str,limit:int,clip_src_dir:str,stats_dest_dir:str):
 # generate images using RL or prompts
@@ -121,26 +126,37 @@ def main(args):
     stats_dir : str = args.stats_dir
     start_layer:int=args.start_layer
     stop_layer:int=args.stop_layer
-    
+    disable_get_images:bool=args.disable_get_images
+    disable_extract_vanilla:bool=args.disable_extract_vanilla
+    disable_sparsify_embeddings:bool=args.disable_sparsify_embeddings
+    disable_clip_attribution:bool=args.disable_clip_attribution
+    disable_run_regression:bool=args.disable_run_regression
+
     block_list=[
         "down_blocks.2.attentions.1",
         "mid_block.attentions.0",
         "up_blocks.0.attentions.0",
          "up_blocks.0.attentions.1"
     ]
+    if not disable_get_images:
+        get_images(image_src_dir,method,n_random,size,num_inference_steps)
+    if not disable_extract_vanilla:
+        extract_vanilla(embedding_dir,image_src_dir,limit,size,mixed_precision)
+    if not disable_sparsify_embeddings:
+        sparsify_embeddings(sparse_embedding_dir,embedding_dir)
+    if not disable_clip_attribution:
+        clip_attribution(image_src_dir,clip_dir,clip_limit,use_grad=True)
     
-    get_images(image_src_dir,method,n_random,size,num_inference_steps)
-    extract_vanilla(embedding_dir,image_src_dir,limit,size,mixed_precision)
-    sparsify_embeddings(sparse_embedding_dir,embedding_dir)
-    clip_attribution(image_src_dir,clip_dir,clip_limit,use_grad=True)
-    for block in block_list:
-        dim=5000 #idr but itll break and tell us
-        save_path=run_regression(block,dim,y_column,regression_limit,clip_dir,os.path.join(stats_dir,block),"fp16",2,epochs) #use sparse dir for now; in the future only use clip_dir
-        print(save_path)
-        weights_dict=torch.load(save_path)["model_state_dict"]
-        print(type(weights_dict))
-        print(len(weights_dict))
-        print([k for k in weights_dict])
+    if not disable_run_regression:
+        for block in block_list:
+            dim=5000 #idr but itll break and tell us
+            
+            save_path=run_regression(block,dim,y_column,regression_limit,clip_dir,os.path.join(stats_dir,block),"fp16",2,epochs) #use sparse dir for now; in the future only use clip_dir
+            print(save_path)
+            weights_dict=torch.load(save_path)["model_state_dict"]
+            print(type(weights_dict))
+            print(len(weights_dict))
+            print([k for k in weights_dict])
         #run_regression(block,y_column,regression_limit,clip_dir,stats_dir)
     #load regression means, covariance matrix for each layer
     sae_dict={} #load saes for each layer
