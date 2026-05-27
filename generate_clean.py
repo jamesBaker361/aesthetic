@@ -7,6 +7,7 @@ from diffusers import DiffusionPipeline
 import torch
 import numpy as np
 import csv
+import sys
 
 import time
 import torch.nn.functional as F
@@ -48,6 +49,9 @@ parser.add_argument("--disable_extract_vanilla",action="store_true")
 parser.add_argument("--disable_sparsify_embeddings",action="store_true")
 parser.add_argument("--disable_clip_attribution",action="store_true")
 parser.add_argument("--disable_run_regression",action="store_true")
+job_id=os.environ["SLURM_JOB_ID"]
+parser.add_argument("--err",type=str,default=f"slurm_chip/generic/{job_id}.err")
+parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
 #def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
 # def run_regression(block:str,y_column:str,limit:int,clip_src_dir:str,stats_dest_dir:str):
 # generate images using RL or prompts
@@ -131,6 +135,15 @@ def main(args):
     disable_sparsify_embeddings:bool=args.disable_sparsify_embeddings
     disable_clip_attribution:bool=args.disable_clip_attribution
     disable_run_regression:bool=args.disable_run_regression
+    out:str=args.out
+    err:str=args.err
+    path_set=out.split("/")
+    for n in range(1,len(path_set)-1):
+        new_path=os.path.join(*out[:n])
+        os.makedirs(new_path,exist_ok=True)
+    
+    sys.stderr=open(err,"w")
+    sys.stdout=open(out,"w")
 
     block_list=[
         "down_blocks.2.attentions.1",
