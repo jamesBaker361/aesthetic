@@ -35,10 +35,11 @@ parser.add_argument("--num_inference_steps",type=int,default=8)
 parser.add_argument("--size",type=int,default=512)
 parser.add_argument("--method",type=str,default=UNTRAINED)
 parser.add_argument("--image_src_dir",type=str,default="laion")
+parser.add_argument("--image_dest_dir",type=str,default="artificial_images")
 parser.add_argument("--n_random",type=int,default=50)
 parser.add_argument("--embedding_dir",type=str,default="embeddings")
 parser.add_argument("--sparse_embedding_dir",type=str,default="sparse_embeddings")
-parser.add_argument("--clip_dir",type=str,default="clip_sparse_embeddings_dummy")
+parser.add_argument("--clip_dir",type=str,default="clip_sparse_embeddings")
 parser.add_argument("--clip_limit",type=int,default=-1)
 parser.add_argument("--regression_limit",type=int,default=-1)
 parser.add_argument("--stats_dir",type=str,default="statistics")
@@ -94,10 +95,11 @@ def get_images(image_dest_dir:str,method:str,n_random:int,size:int,num_inference
         if method=="untrained":
             base_prompt=""
         base_image=base_pipe(base_prompt,height=size,width=size,generator=generator,num_inference_steps=num_inference_steps).images[0]
-        diff_image=diff_pipe(prompt,height=size,width=size,generator=generator,num_inference_steps=num_inference_steps).images[0]
-        diff_path=f"{image_dest_dir}/diff_{p}.jpg"
         base_image.save(base_path)
-        diff_image.save(diff_path)
+        if method!=UNTRAINED:
+            diff_image=diff_pipe(prompt,height=size,width=size,generator=generator,num_inference_steps=num_inference_steps).images[0]
+            diff_path=f"{image_dest_dir}/diff_{p}.jpg"
+            diff_image.save(diff_path)
 
 
 
@@ -121,6 +123,7 @@ def main(args):
     size : int = args.size
     method : str = args.method
     image_src_dir : str = args.image_src_dir
+    image_dest_dir:str=args.image_dest_dir
     n_random : int = args.n_random
     embedding_dir : str = args.embedding_dir
     sparse_embedding_dir : str = args.sparse_embedding_dir
@@ -152,7 +155,7 @@ def main(args):
          "up_blocks.0.attentions.1"
     ]
     if not disable_get_images:
-        get_images(image_src_dir,method,n_random,size,num_inference_steps)
+        get_images(image_dest_dir,method,n_random,size,num_inference_steps)
     if not disable_extract_vanilla:
         extract_vanilla(embedding_dir,image_src_dir,limit,size,mixed_precision)
     if not disable_sparsify_embeddings:
