@@ -3,7 +3,7 @@ import argparse
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.saving_helpers import save_and_load_functions
 from experiment_helpers.argprint import print_args
-from diffusers import DiffusionPipeline
+from diffusers import DiffusionPipeline,UNet2DConditionModel
 import torch
 import numpy as np
 import csv
@@ -12,6 +12,8 @@ import sys
 import time
 import torch.nn.functional as F
 from datasets import load_dataset
+import json
+from PIL import Image
 
 from experiment_helpers.loop_decorator import optimization_loop
 from experiment_helpers.data_helpers import split_data
@@ -25,6 +27,7 @@ from sparsify import sparsify_embeddings
 from regression import run_regression,clip_attribution,get_importance
 from d3po_rewards import get_aesthetic_model,get_nsfw_model
 from transformers import CLIPVisionModelWithProjection,CLIPImageProcessor
+from peft import LoraConfig
 
 
 parser=default_parser()
@@ -50,6 +53,7 @@ parser.add_argument("--disable_extract_vanilla",action="store_true")
 parser.add_argument("--disable_sparsify_embeddings",action="store_true")
 parser.add_argument("--disable_clip_attribution",action="store_true")
 parser.add_argument("--disable_run_regression",action="store_true")
+parser.add_argument("--lora_dir",type=str,default="lora")
 job_id=os.environ["SLURM_JOB_ID"]
 parser.add_argument("--err",type=str,default=f"slurm_chip/generic/{job_id}.err")
 parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
@@ -64,6 +68,7 @@ parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
 
 
 def get_images(image_dest_dir:str,method:str,n_random:int,size:int,num_inference_steps:int):
+    os.makedirs(image_dest_dir,exist_ok=True)
     
     prompt_list=[row["prompt"] for row in load_dataset("AIML-TUDA/i2p", split="train")]+[row["prompt"] for row in load_dataset("moonworks/lunara-aesthetic", split="train")]
     nltk.download("wordnet")
@@ -102,8 +107,37 @@ def get_images(image_dest_dir:str,method:str,n_random:int,size:int,num_inference
             diff_image.save(diff_path)
 
 
+class LoraDataset(torch.utils.data.Dataset):
+    def __init__(self,image_dir:str):
+        super().__init__()
+        self.path_list=[
+            os.path.join(image_dir,f) for f in os.listdir(image_dir) if f.endswith("jpg")
+        ]
+        
+    def __len__(self):
+        return len(self.path_list)
+    
+    def __getitem__(self, index):
+        image=Image.open(self.path_list[index])
+        
 
-            
+def train_lora(lora_dir:str,rank:int,device,epochs:int,image_dir:str):
+    os.makedirs(lora_dir,exist_ok=True)
+    unet_lora_config = LoraConfig(
+        r=rank,
+        lora_alpha=rank,
+        init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+    )
+    pipe=DiffusionPipeline.from_pretrained( "stabilityai/sdxl-turbo").to(device)
+    unet:UNet2DConditionModel=pipe.unet
+    unet.add_adapter(unet_lora_config)
+    start_epoch=1
+    config_path=os.path.join(lora_dir,"config.json")
+    if os.path.exists(config_path):
+        with open(config_path,"r") as file:
+            start_epoch=json.load(file)["epoch"]+1
+    
         
 def main(args):
     api,accelerator,device=repo_api_init(args)
@@ -138,6 +172,7 @@ def main(args):
     disable_sparsify_embeddings:bool=args.disable_sparsify_embeddings
     disable_clip_attribution:bool=args.disable_clip_attribution
     disable_run_regression:bool=args.disable_run_regression
+    lora_dir:str=args.lora_dir
     out:str=args.out
     err:str=args.err
     path_set=out.split("/")
