@@ -32,6 +32,25 @@ from transformers import CLIPVisionModelWithProjection,CLIPImageProcessor
 from peft import LoraConfig
 from accelerate import Accelerator
 
+def keep_top_n(x, n, dim=-1):
+    """
+    Zero all but the top-n activations along `dim`.
+    
+    Args:
+        x: input tensor
+        n: number of activations to keep
+        dim: dimension along which to keep top-n
+        
+    Returns:
+        Tensor with only top-n values preserved.
+    """
+    values, indices = torch.topk(x, n, dim=dim)
+
+    mask = torch.zeros_like(x, dtype=torch.bool)
+    mask.scatter_(dim, indices, True)
+
+    return torch.where(mask, x, torch.zeros_like(x))
+
 
 parser=default_parser()
 UNTRAINED="untrained"
@@ -56,11 +75,17 @@ parser.add_argument("--disable_extract_vanilla",action="store_true")
 parser.add_argument("--disable_sparsify_embeddings",action="store_true")
 parser.add_argument("--disable_clip_attribution",action="store_true")
 parser.add_argument("--disable_run_regression",action="store_true")
+parser.add_argument("--disable_train_lora",action="store_true")
 parser.add_argument("--lora_dir",type=str,default="lora")
 parser.add_argument("--top_k",type=int,default=10)
 parser.add_argument("--aesthetic_prompt",action="store_true")
 parser.add_argument("--nsfw_prompt",action="store_true")
 parser.add_argument("--random_prompt",action="store_true")
+parser.add_argument("--lora_epochs",type=int,default=5)
+parser.add_argument("--lora_use_mask",action="store_true")
+parser.add_argument("--lora_use_filter",action="store_true")
+parser.add_argument("--lora_use_noise",action="store_true")
+parser.add_argument("--mode",type=str,default="out")
 job_id=os.environ["SLURM_JOB_ID"]
 parser.add_argument("--err",type=str,default=f"slurm_chip/generic/{job_id}.err")
 parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
@@ -186,7 +211,8 @@ def train_lora(lora_dir:str,rank:int,device,epochs:int,image_dir:str,batch_size:
                use_mask:bool,
                use_filter:bool,
                use_noise:bool,
-               size:int=512):
+               size:int,
+               mode:str):
     assert use_noise or use_filter, "at least one of use_noise/use_filter must be True"
     os.makedirs(lora_dir,exist_ok=True)
     unet_lora_config = LoraConfig(
@@ -212,13 +238,16 @@ def train_lora(lora_dir:str,rank:int,device,epochs:int,image_dir:str,batch_size:
     # Lookup table for hook targets / filter targets — built once.
     module_dict=dict(unet.named_modules())
 
-    CACHE="cached_diff"
+    CACHE="cached_activations"
     if use_filter:
         def make_hook():
             def hook_fn(module,input,output):
                 out = output[0] if isinstance(output,tuple) else output
                 inp = input[0]  # forward-hook input is always a tuple
-                setattr(module,CACHE,out-inp)
+                if mode=="diff":
+                    setattr(module,CACHE,out-inp)
+                else:
+                    setattr(module,CACHE,out)
                 return output
             return hook_fn
         for key in filter_dict:
@@ -335,11 +364,16 @@ def main(args):
     disable_sparsify_embeddings:bool=args.disable_sparsify_embeddings
     disable_clip_attribution:bool=args.disable_clip_attribution
     disable_run_regression:bool=args.disable_run_regression
+    disable_train_lora:bool=args.disable_train_lora
     aesthetic_prompt:bool=args.aesthetic_prompt
     nsfw_prompt:bool=args.nsfw_prompt
     random_prompt:bool=args.random_prompt
-    
+    lora_epochs:int=args.lora_epochs
+    lora_use_mask:bool=args.lora_use_mask
+    lora_use_filter:bool=args.lora_use_filter
+    lora_use_noise:bool=args.lora_use_noise
     lora_dir:str=args.lora_dir
+    mode:str=args.mode
     out:str=args.out
     err:str=args.err
     path_set=out.split("/")
@@ -361,7 +395,7 @@ def main(args):
     if not disable_extract_vanilla:
         extract_vanilla(embedding_dir,image_src_dir,limit,size,mixed_precision)
     if not disable_sparsify_embeddings:
-        sparsify_embeddings(sparse_embedding_dir,embedding_dir)
+        sparsify_embeddings(sparse_embedding_dir,embedding_dir,mode)
     if not disable_clip_attribution:
         clip_attribution(image_src_dir,clip_dir,clip_limit,use_grad=True)
     
@@ -376,6 +410,11 @@ def main(args):
             print(type(weights_dict))
             print(len(weights_dict))
             print([k for k in weights_dict])
+            sparse_filter=weights_dict[[k for k in weights_dict][0]]
+            filter_dict[block]=sparse_filter
+            
+    if not disable_train_lora:
+        train_lora(lora_dir,4,device,lora_epochs,image_dest_dir,2,accelerator,0.0001,filter_dict,sae_dict,lora_use_mask,lora_use_filter,lora_use_noise,size)
             
         #run_regression(block,y_column,regression_limit,clip_dir,stats_dir)
     #load regression means, covariance matrix for each layer
@@ -405,6 +444,8 @@ def main(args):
     processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
     hook_list=[]
+    
+    #TODO: naively find "bad features" and delete them saeuron style
 
     def hook_fn(module,input,output,begin:int=6,end:int=2):
         pass

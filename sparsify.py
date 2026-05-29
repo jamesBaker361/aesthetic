@@ -27,7 +27,7 @@ embedding_src_dir="embeddings"
 image_src_dir= "laion"
 
 
-def sparsify_embeddings(sparse_dest_dir:str="sparse_embeddings",embedding_src_dir:str="embeddings"):
+def sparsify_embeddings(sparse_dest_dir:str="sparse_embeddings",embedding_src_dir:str="embeddings",mode:str="diff"):
     saes_dict:dict[str,SparseAutoencoder] = {}
     means_dict = {}
     for block in tqdm(block_list, desc="Loading SAEs"):
@@ -61,7 +61,10 @@ def sparsify_embeddings(sparse_dest_dir:str="sparse_embeddings",embedding_src_di
                 sae=saes_dict[block]
                 input_data=data["saved_input."+block]
                 output_data=data["saved_output."+block]
-                x=torch.tensor(output_data-input_data).squeeze(0).permute(1,2,0)
+                if mode=="diff":
+                    x=torch.tensor(output_data-input_data).squeeze(0).permute(1,2,0)
+                elif mode=="out":
+                    x=torch.tensor(output_data).squeeze(0).permute(1,2,0)
                 if torch.isnan(x).any():
                     print("nan x ",new_path)
                 features=sae.encode(x)
