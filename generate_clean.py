@@ -3,7 +3,9 @@ import argparse
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.saving_helpers import save_and_load_functions
 from experiment_helpers.argprint import print_args
-from diffusers import DiffusionPipeline,UNet2DConditionModel
+from diffusers import DiffusionPipeline,UNet2DConditionModel,AutoencoderKL
+from diffusers.image_processor import VaeImageProcessor
+from sdxl_unbox.SAE import SparseAutoencoder
 import torch
 import numpy as np
 import csv
@@ -28,6 +30,7 @@ from regression import run_regression,clip_attribution,get_importance
 from d3po_rewards import get_aesthetic_model,get_nsfw_model
 from transformers import CLIPVisionModelWithProjection,CLIPImageProcessor
 from peft import LoraConfig
+from accelerate import Accelerator
 
 
 parser=default_parser()
@@ -54,6 +57,10 @@ parser.add_argument("--disable_sparsify_embeddings",action="store_true")
 parser.add_argument("--disable_clip_attribution",action="store_true")
 parser.add_argument("--disable_run_regression",action="store_true")
 parser.add_argument("--lora_dir",type=str,default="lora")
+parser.add_argument("--top_k",type=int,default=10)
+parser.add_argument("--aesthetic_prompt",action="store_true")
+parser.add_argument("--nsfw_prompt",action="store_true")
+parser.add_argument("--random_prompt",action="store_true")
 job_id=os.environ["SLURM_JOB_ID"]
 parser.add_argument("--err",type=str,default=f"slurm_chip/generic/{job_id}.err")
 parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
@@ -67,21 +74,27 @@ parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
 
 
 
-def get_images(image_dest_dir:str,method:str,n_random:int,size:int,num_inference_steps:int):
+def get_images(image_dest_dir:str,method:str,n_random:int,size:int,num_inference_steps:int,aesthetic_prompt:bool,nsfw_prompt:bool,random_prompt:bool):
     os.makedirs(image_dest_dir,exist_ok=True)
     
-    prompt_list=[row["prompt"] for row in load_dataset("AIML-TUDA/i2p", split="train")]+[row["prompt"] for row in load_dataset("moonworks/lunara-aesthetic", split="train")]
-    nltk.download("wordnet")
+    prompt_list=[]
+    if nsfw_prompt:
+        prompt_list+=[row["prompt"] for row in load_dataset("AIML-TUDA/i2p", split="train")]
+    if aesthetic_prompt:
+        prompt+=[row["prompt"] for row in load_dataset("moonworks/lunara-aesthetic", split="train")]
+        
+    if random_prompt:
+        nltk.download("wordnet")
 
-    words = set()
-    for syn in wn.all_synsets():
-        for lemma in syn.lemma_names():
-            words.add(lemma.lower())
+        words = set()
+        for syn in wn.all_synsets():
+            for lemma in syn.lemma_names():
+                words.add(lemma.lower())
 
-    word_list=[w for w in words]
-    random.shuffle(word_list)
-    word_list=word_list[:n_random]
-    prompt_list+=word_list
+        word_list=[w for w in words]
+        random.shuffle(word_list)
+        word_list=word_list[:n_random]
+        prompt_list+=word_list
     device="cuda" if torch.cuda.is_available() else "cpu"
     
     base_pipe=DiffusionPipeline.from_pretrained("SimianLuo/LCM_Dreamshaper_v7").to(device)
@@ -108,20 +121,73 @@ def get_images(image_dest_dir:str,method:str,n_random:int,size:int,num_inference
 
 
 class LoraDataset(torch.utils.data.Dataset):
-    def __init__(self,image_dir:str):
+    def __init__(self,image_dir:str,vae:AutoencoderKL,device,latent_h:int,latent_w:int):
         super().__init__()
         self.path_list=[
             os.path.join(image_dir,f) for f in os.listdir(image_dir) if f.endswith("jpg")
         ]
-        
+        self.image_processor=VaeImageProcessor()
+        self.nsfw_model=get_nsfw_model()
+        self.aesthetic_model=get_aesthetic_model()
+        self.device = device
+        self.clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").to(self.device)
+        self.processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
+        self.vae=vae
+        self.latent_h=latent_h
+        self.latent_w=latent_w
+        self._cache:dict[int,dict]={}
+
     def __len__(self):
         return len(self.path_list)
-    
+
+    def _to_latent_mask(self,mask_2d:torch.Tensor)->torch.Tensor:
+        # mask_2d: (H, W) -> (1, latent_h, latent_w) float, channel dim added for broadcast
+        m=mask_2d.float().unsqueeze(0).unsqueeze(0)
+        m=F.interpolate(m,size=(self.latent_h,self.latent_w),mode="nearest")
+        return m[0]
+
     def __getitem__(self, index):
-        image=Image.open(self.path_list[index])
+        if index in self._cache:
+            return self._cache[index]
+        pil_img=Image.open(self.path_list[index]).convert("RGB")
+        pt_img=self.image_processor.preprocess(pil_img).to(self.device,dtype=self.vae.dtype)
+        importance_aesthetic,importance_nsfw=get_importance(pil_img,self.nsfw_model,self.aesthetic_model,self.device,self.processor,self.clip_model)
+        start_layer=5
+        stop_layer=15
+        importance_aesthetic=importance_aesthetic[start_layer:stop_layer]
+        importance_nsfw=importance_nsfw[start_layer:stop_layer]
+
+        avg_aesthetic=torch.stack(importance_aesthetic).mean(dim=0)
+        avg_nsfw=torch.stack(importance_nsfw).mean(dim=0)
+
+        avg_nsfw=avg_nsfw-avg_nsfw.min()
+        avg_nsfw=avg_nsfw/(avg_nsfw.max()+1e-8)
+        avg_aesthetic=avg_aesthetic-avg_aesthetic.min()
+        avg_aesthetic=avg_aesthetic/(avg_aesthetic.max()+1e-8)
+        aesthetic_mask = avg_aesthetic < torch.quantile(avg_aesthetic, 0.9)
+        nsfw_mask=avg_nsfw<torch.quantile(avg_nsfw,0.9)
+
+        with torch.no_grad():
+            latent=self.vae.encode(pt_img).latent_dist.sample()[0]
+
+        item={
+            "latent":latent.detach().cpu(),
+            "nsfw_mask":self._to_latent_mask(nsfw_mask).cpu(),
+            "aesthetic_mask":self._to_latent_mask(aesthetic_mask).cpu(),
+        }
+        self._cache[index]=item
+        return item
         
 
-def train_lora(lora_dir:str,rank:int,device,epochs:int,image_dir:str):
+def train_lora(lora_dir:str,rank:int,device,epochs:int,image_dir:str,batch_size:int,
+               accelerator:Accelerator,lr:float,
+               filter_dict:dict[str,torch.Tensor],
+               sae_dict:dict[str,SparseAutoencoder],
+               use_mask:bool,
+               use_filter:bool,
+               use_noise:bool,
+               size:int=512):
+    assert use_noise or use_filter, "at least one of use_noise/use_filter must be True"
     os.makedirs(lora_dir,exist_ok=True)
     unet_lora_config = LoraConfig(
         r=rank,
@@ -129,14 +195,111 @@ def train_lora(lora_dir:str,rank:int,device,epochs:int,image_dir:str):
         init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
-    pipe=DiffusionPipeline.from_pretrained( "stabilityai/sdxl-turbo").to(device)
+    pipe=DiffusionPipeline.from_pretrained("stabilityai/sdxl-turbo").to(device)
+    noise_scheduler=pipe.scheduler
     unet:UNet2DConditionModel=pipe.unet
-    unet.add_adapter(unet_lora_config)
+    unet.requires_grad_(False)
+
     start_epoch=1
-    config_path=os.path.join(lora_dir,"config.json")
+    config_path=os.path.join(lora_dir,"epoch_config.json")
     if os.path.exists(config_path):
         with open(config_path,"r") as file:
             start_epoch=json.load(file)["epoch"]+1
+        unet.load_lora_adapter(lora_dir)
+    else:
+        unet.add_adapter(unet_lora_config)
+
+    # Lookup table for hook targets / filter targets — built once.
+    module_dict=dict(unet.named_modules())
+
+    CACHE="cached_diff"
+    if use_filter:
+        def make_hook():
+            def hook_fn(module,input,output):
+                out = output[0] if isinstance(output,tuple) else output
+                inp = input[0]  # forward-hook input is always a tuple
+                setattr(module,CACHE,out-inp)
+                return output
+            return hook_fn
+        for key in filter_dict:
+            mod=module_dict.get(key)
+            if mod is not None:
+                mod.register_forward_hook(make_hook())
+
+    latent_h=size//8
+    latent_w=size//8
+    dataset=LoraDataset(image_dir,pipe.vae,device,latent_h,latent_w)
+    loader=torch.utils.data.DataLoader(dataset,batch_size=batch_size,shuffle=True)
+
+    optimizer=torch.optim.AdamW([p for p in unet.parameters() if p.requires_grad],lr)
+
+    # Empty-prompt conditioning is constant — compute once before prepare/train loop.
+    with torch.no_grad():
+        prompt_embeds,_,pooled_prompt_embeds,_=pipe.encode_prompt(
+            prompt=" ",
+            device=device,
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=False,
+        )
+
+    loader,unet,optimizer=accelerator.prepare(loader,unet,optimizer)
+
+    for e in range(start_epoch,epochs+1):
+        for b,batch in enumerate(loader):
+            latents=batch["latent"].to(accelerator.device)*pipe.vae.config.scaling_factor
+            bsz = latents.shape[0]
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
+            noise = torch.randn_like(latents)
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+            # SDXL conditioning: text_embeds + time_ids alongside encoder_hidden_states.
+            add_time_ids=torch.tensor(
+                [[size,size,0,0,size,size]]*bsz,
+                device=accelerator.device,
+                dtype=prompt_embeds.dtype,
+            )
+            added_cond_kwargs={
+                "text_embeds":pooled_prompt_embeds.expand(bsz,-1).to(accelerator.device),
+                "time_ids":add_time_ids,
+            }
+            encoder_hidden_states=prompt_embeds.expand(bsz,-1,-1).to(accelerator.device)
+
+            with accelerator.accumulate(unet):
+                predicted=unet(
+                    noisy_latents,timesteps,encoder_hidden_states,
+                    added_cond_kwargs=added_cond_kwargs,
+                    return_dict=False,
+                )[0]
+
+                loss=torch.zeros((),device=accelerator.device)
+                if use_noise:
+                    if use_mask:
+                        m=batch["nsfw_mask"].to(accelerator.device,dtype=predicted.dtype)
+                        noise_loss=F.mse_loss((predicted*m).float(),(noise*m).float())
+                    else:
+                        noise_loss=F.mse_loss(predicted.float(),noise.float())
+                    loss=loss+noise_loss
+                if use_filter:
+                    z_means=[]
+                    for key,sae in sae_dict.items():
+                        mod=module_dict.get(key)
+                        if mod is None or not hasattr(mod,CACHE):
+                            continue
+                        z=sae.encode(getattr(mod,CACHE))
+                        z=z*filter_dict[key].to(z.device,dtype=z.dtype)
+                        z_means.append(z.mean())
+                    if z_means:
+                        loss=loss+torch.stack(z_means).mean()
+
+                accelerator.backward(loss)
+                optimizer.step()
+                optimizer.zero_grad()
+        accelerator.unwrap_model(unet).save_lora_adapter(lora_dir)
+        with open(config_path,"w") as file:
+            json.dump({"epoch":e},file)
+    
+                
+    
     
         
 def main(args):
@@ -172,6 +335,10 @@ def main(args):
     disable_sparsify_embeddings:bool=args.disable_sparsify_embeddings
     disable_clip_attribution:bool=args.disable_clip_attribution
     disable_run_regression:bool=args.disable_run_regression
+    aesthetic_prompt:bool=args.aesthetic_prompt
+    nsfw_prompt:bool=args.nsfw_prompt
+    random_prompt:bool=args.random_prompt
+    
     lora_dir:str=args.lora_dir
     out:str=args.out
     err:str=args.err
@@ -190,7 +357,7 @@ def main(args):
          "up_blocks.0.attentions.1"
     ]
     if not disable_get_images:
-        get_images(image_dest_dir,method,n_random,size,num_inference_steps)
+        get_images(image_dest_dir,method,n_random,size,num_inference_steps,aesthetic_prompt,nsfw_prompt,random_prompt)
     if not disable_extract_vanilla:
         extract_vanilla(embedding_dir,image_src_dir,limit,size,mixed_precision)
     if not disable_sparsify_embeddings:
@@ -199,6 +366,7 @@ def main(args):
         clip_attribution(image_src_dir,clip_dir,clip_limit,use_grad=True)
     
     if not disable_run_regression:
+        filter_dict={}
         for block in block_list:
             dim=5000 #idr but itll break and tell us
             
@@ -208,6 +376,7 @@ def main(args):
             print(type(weights_dict))
             print(len(weights_dict))
             print([k for k in weights_dict])
+            
         #run_regression(block,y_column,regression_limit,clip_dir,stats_dir)
     #load regression means, covariance matrix for each layer
     sae_dict={} #load saes for each layer
