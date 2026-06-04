@@ -399,8 +399,8 @@ def main(args):
         new_path=os.path.join(*out[:n])
         os.makedirs(new_path,exist_ok=True)
     
-    sys.stderr=open(err,"w")
-    sys.stdout=open(out,"w")
+    #sys.stderr=open(err,"w")
+    #sys.stdout=open(out,"w")
 
     block_list=[
         "down_blocks.2.attentions.1",
