@@ -307,6 +307,8 @@ def train_lora(lora_dir:str,rank:int,device,epochs:int,image_dir:str,batch_size:
                         noise_loss=F.mse_loss((predicted*m).float(),(noise*m).float())
                     else:
                         noise_loss=F.mse_loss(predicted.float(),noise.float())
+                    if e==start_epoch and b==0:
+                        print("noise loss",noise_loss)
                     loss=loss+noise_loss
                 if use_filter:
                     z_means=[]
@@ -318,7 +320,10 @@ def train_lora(lora_dir:str,rank:int,device,epochs:int,image_dir:str,batch_size:
                         z=z*filter_dict[key].to(z.device,dtype=z.dtype)
                         z_means.append(z.mean())
                     if z_means:
-                        loss=loss+torch.stack(z_means).mean()
+                        z_loss =torch.stack(z_means).mean()
+                        if e==start_epoch and b==0:
+                            print("z loss ",z_loss)
+                        loss=loss+z_loss
 
                 accelerator.backward(loss)
                 optimizer.step()
@@ -329,6 +334,19 @@ def train_lora(lora_dir:str,rank:int,device,epochs:int,image_dir:str,batch_size:
     
                 
     
+def sae_forward_filtered(self:SparseAutoencoder,x:torch.Tensor,weight_filter:torch.Tensor):
+    x = x - self.pre_bias
+    latents_pre_act = self.encoder(x) + self.latent_bias
+    
+    latents_pre_act=latents_pre_act*weight_filter
+    
+    vals, inds = torch.topk(
+            latents_pre_act,
+            k=self.k,
+            dim=-1
+        )
+    
+    return self.decode_sparse(inds,vals)
     
         
 def main(args):
@@ -446,6 +464,40 @@ def main(args):
     hook_list=[]
     
     #TODO: naively find "bad features" and delete them saeuron style
+    
+    def hookify(unet:UNet2DConditionModel,
+                sae_dict:dict[str,SparseAutoencoder],
+                mode:str,
+                start_step:int,
+                end_step:int,
+                filter_dict:dict[str,torch.Tensor])->UNet2DConditionModel:
+        SAE_PRETRAINED="cached_sae"
+        COUNTER="step_counter"
+        START_STEP="timestep_start"
+        END_STEP="timestep_end"
+        WEIGHT_FILTER="sae_latent_weight_vector"
+        module_dict=dict(unet.named_modules())
+        def make_hook():
+            def hook_fn(module,input,output):
+                step=getattr(module,COUNTER)
+                if step>=start_step and step<=end_step:
+                    out = output[0] if isinstance(output,tuple) else output
+                    inp = input[0] if isinstance(input,tuple) else input  # forward-hook input is always a tuple
+                    if mode=="diff":
+                        out=out-inp
+                    sae:SparseAutoencoder=getattr(module,SAE_PRETRAINED)
+                    out=sae_forward_filtered(sae,out,getattr(module,WEIGHT_FILTER))
+                    output = (out, *output[1:]) if isinstance(output,tuple) else out
+                setattr(module,COUNTER,step+1)
+                return output
+            return hook_fn
+        for key,sae in sae_dict.items():
+            mod=module_dict.get(key)
+            if mod is not None:
+                mod.register_forward_hook(make_hook())
+                setattr(mod,SAE_PRETRAINED,sae)
+                setattr(mod,WEIGHT_FILTER,filter_dict[key])
+                
 
     def hook_fn(module,input,output,begin:int=6,end:int=2):
         pass
