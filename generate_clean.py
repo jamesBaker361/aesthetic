@@ -411,11 +411,11 @@ def main(args):
     if not disable_get_images:
         get_images(image_dest_dir,method,n_random,size,num_inference_steps,aesthetic_prompt,nsfw_prompt,random_prompt)
     if not disable_extract_vanilla:
-        extract_vanilla(embedding_dir,image_src_dir,limit,size,mixed_precision)
+        extract_vanilla(embedding_dir,image_dest_dir,limit,size,mixed_precision)
     if not disable_sparsify_embeddings:
         sparsify_embeddings(sparse_embedding_dir,embedding_dir,mode)
     if not disable_clip_attribution:
-        clip_attribution(image_src_dir,clip_dir,clip_limit,use_grad=True)
+        clip_attribution(image_dest_dir,clip_dir,clip_limit,use_grad=True)
     
     if not disable_run_regression:
         filter_dict={}
