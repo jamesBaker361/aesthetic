@@ -85,6 +85,8 @@ parser.add_argument("--lora_epochs",type=int,default=5)
 parser.add_argument("--lora_use_mask",action="store_true")
 parser.add_argument("--lora_use_filter",action="store_true")
 parser.add_argument("--lora_use_noise",action="store_true")
+parser.add_argument("--start_step",type=int,default=2)
+parser.add_argument("--end_step",type=int,default=5)
 parser.add_argument("--mode",type=str,default="out")
 job_id=os.environ["SLURM_JOB_ID"]
 parser.add_argument("--err",type=str,default=f"slurm_chip/generic/{job_id}.err")
@@ -212,7 +214,7 @@ def train_lora(lora_dir:str,rank:int,device,epochs:int,image_dir:str,batch_size:
                use_filter:bool,
                use_noise:bool,
                size:int,
-               mode:str):
+               mode:str)->DiffusionPipeline:
     assert use_noise or use_filter, "at least one of use_noise/use_filter must be True"
     os.makedirs(lora_dir,exist_ok=True)
     unet_lora_config = LoraConfig(
@@ -240,6 +242,7 @@ def train_lora(lora_dir:str,rank:int,device,epochs:int,image_dir:str,batch_size:
 
     CACHE="cached_activations"
     if use_filter:
+        hooks=[]
         def make_hook():
             def hook_fn(module,input,output):
                 out = output[0] if isinstance(output,tuple) else output
@@ -253,7 +256,7 @@ def train_lora(lora_dir:str,rank:int,device,epochs:int,image_dir:str,batch_size:
         for key in filter_dict:
             mod=module_dict.get(key)
             if mod is not None:
-                mod.register_forward_hook(make_hook())
+                hooks.append(mod.register_forward_hook(make_hook()))
 
     latent_h=size//8
     latent_w=size//8
@@ -331,7 +334,9 @@ def train_lora(lora_dir:str,rank:int,device,epochs:int,image_dir:str,batch_size:
         accelerator.unwrap_model(unet).save_lora_adapter(lora_dir)
         with open(config_path,"w") as file:
             json.dump({"epoch":e},file)
-    
+    for h in hooks:
+        h.remove()
+    return pipe
                 
     
 def sae_forward_filtered(self:SparseAutoencoder,x:torch.Tensor,weight_filter:torch.Tensor):
@@ -391,6 +396,8 @@ def main(args):
     lora_use_filter:bool=args.lora_use_filter
     lora_use_noise:bool=args.lora_use_noise
     lora_dir:str=args.lora_dir
+    start_step:int=args.start_step
+    end_step:int=args.end_step
     mode:str=args.mode
     out:str=args.out
     err:str=args.err
@@ -464,15 +471,15 @@ def main(args):
     hook_list=[]
     
     #TODO: naively find "bad features" and delete them saeuron style
-    
+    COUNTER="step_counter"
     def hookify(unet:UNet2DConditionModel,
                 sae_dict:dict[str,SparseAutoencoder],
                 mode:str,
                 start_step:int,
                 end_step:int,
-                filter_dict:dict[str,torch.Tensor])->UNet2DConditionModel:
+                filter_dict:dict[str,torch.Tensor])->list[torch.nn.Module]:
         SAE_PRETRAINED="cached_sae"
-        COUNTER="step_counter"
+        
         START_STEP="timestep_start"
         END_STEP="timestep_end"
         WEIGHT_FILTER="sae_latent_weight_vector"
@@ -491,26 +498,41 @@ def main(args):
                 setattr(module,COUNTER,step+1)
                 return output
             return hook_fn
+        hooks=[]
+        mods=[]
         for key,sae in sae_dict.items():
             mod=module_dict.get(key)
             if mod is not None:
-                mod.register_forward_hook(make_hook())
+                hooks.append(mod.register_forward_hook(make_hook()))
                 setattr(mod,SAE_PRETRAINED,sae)
                 setattr(mod,WEIGHT_FILTER,filter_dict[key])
+                mods.append(mod)
+        print(f"registered {len(hooks)} hooks")
+        return mods
                 
 
-    def hook_fn(module,input,output,begin:int=6,end:int=2):
-        pass
-
     with open("unsafe.csv","r") as file:
+        bad_image_list=[]
+        good_image_list=[]
         reader=csv.DictReader(file)
         for i,row in enumerate(reader):
             prompt=row["prompt"]
 
             rand_gen=torch.Generator()
             rand_gen.manual_seed(i)
-            break
             bad_image=pipe(prompt,size,size,generator=rand_gen).images[0]
+            bad_image_list.append(bad_image)
+            
+        mod_list=hookify(pipe.unet,sae_dict,mode,start_step,end_step)
+        for i,row in enumerate(reader):
+            prompt=row["prompt"]
+
+            rand_gen=torch.Generator()
+            rand_gen.manual_seed(i)
+            for mod in mod_list:
+                setattr(mod,COUNTER,0)
+            good_image=pipe(prompt,size,size,generator=rand_gen).images[0]
+            good_image_list.append(good_image)
         
         
             

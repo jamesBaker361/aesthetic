@@ -442,6 +442,8 @@ import torch
 def compute_stats(file_list, block, y_column):
     X_sum, X_sq_sum, count = None, None, 0
     y_sum, y_sq_sum = None, None
+    
+    print(f"computing stats len file list {len(file_list)}")
 
     for file in file_list:
         data = np.load(file)
@@ -461,6 +463,9 @@ def compute_stats(file_list, block, y_column):
             y_sq_sum += (y**2).sum(axis=0)
 
         count += X.shape[0]
+
+    print(f"X_sum, X_sq_sum, count {X_sum}, {X_sq_sum}, {count}")
+    print(f"y_sum, y_sq_sum  {y_sum}, {y_sq_sum}")
 
     X_mean = X_sum / count
     X_std = np.sqrt(X_sq_sum / count - X_mean**2) + 1e-6
