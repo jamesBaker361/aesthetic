@@ -382,7 +382,7 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
     img_pro=VaeImageProcessor()
 
     for n, file in enumerate([f for f in os.listdir(image_src_dir) if f.endswith("jpg")][:limit]):
-        npz_file=file.replace("jpg","npz")
+        npz_file=file+".npz"
         if os.path.exists(os.path.join(sparse_dir,npz_file)):
         
             # --- Load image ---
