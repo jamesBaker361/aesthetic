@@ -416,9 +416,9 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
                         mask.float().unsqueeze(0).unsqueeze(0), size=(h, w)
                     )[0, 0]
                     
-                    resized_mask=resized_mask.to(device)
+                    resized_mask=resized_mask.unsqueeze(-1).to(device)
 
-                    masked_features = features * resized_mask.unsqueeze(-1)
+                    masked_features = features * resized_mask
 
                     # flatten and keep only nonzero activations
                     sparse_values = masked_features[masked_features != 0].flatten()
