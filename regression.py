@@ -517,7 +517,11 @@ def run_regression(block:str,dim:int,y_column:str,
                    epochs:int):
     for file in os.listdir(clip_src_dir):
         if file.endswith("npz"):
-            embeds=np.load(os.path.join(clip_src_dir,file))[block]
+            try:
+                embeds=np.load(os.path.join(clip_src_dir,file))[block]
+            except Exception:
+                print(os.path.join(clip_src_dir,file))
+                print(np.load(os.path.join(clip_src_dir,file)).keys())
             dim=embeds.shape[-1]
             break
     
