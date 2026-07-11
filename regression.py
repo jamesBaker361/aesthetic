@@ -401,34 +401,34 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
             aesthetic_mask = avg_aesthetic >= torch.quantile(avg_aesthetic, 0.9)
             nsfw_mask=avg_nsfw>=torch.quantile(avg_nsfw,0.9)
             
-            old_npz=np.load(os.path.join(sparse_dir,npz_file))
-            save_dict={}
-            for block in [
-                "down_blocks.2.attentions.1",
-                "mid_block.attentions.0",
-                "up_blocks.0.attentions.0",
-                "up_blocks.0.attentions.1"
-            ]:
-                features=torch.tensor(old_npz[block])
-                (h,w,c)=features.size()
-                for y_value,mask in zip(["nsfw","aesthetic"],[nsfw_mask,aesthetic_mask]):
-                    resized_mask = F.interpolate(
-                        mask.float().unsqueeze(0).unsqueeze(0), size=(h, w)
-                    )[0, 0]
-                    
-                    resized_mask=resized_mask.unsqueeze(-1).to(device)
+            with np.load(os.path.join(sparse_dir,npz_file)) as old_npz:
+                save_dict={}
+                for block in [
+                    "down_blocks.2.attentions.1",
+                    "mid_block.attentions.0",
+                    "up_blocks.0.attentions.0",
+                    "up_blocks.0.attentions.1"
+                ]:
+                    features=torch.tensor(old_npz[block])
+                    (h,w,c)=features.size()
+                    for y_value,mask in zip(["nsfw","aesthetic"],[nsfw_mask,aesthetic_mask]):
+                        resized_mask = F.interpolate(
+                            mask.float().unsqueeze(0).unsqueeze(0), size=(h, w)
+                        )[0, 0]
 
-                    try:
-                        masked_features = features * resized_mask
-                    except RuntimeError:
-                        features=features.to(device)
-                        resized_mask=resized_mask.to(device)
-                        masked_features = features * resized_mask
+                        resized_mask=resized_mask.unsqueeze(-1).to(device)
 
-                    # flatten and keep only nonzero activations
-                    sparse_values = masked_features[masked_features != 0].flatten()
+                        try:
+                            masked_features = features * resized_mask
+                        except RuntimeError:
+                            features=features.to(device)
+                            resized_mask=resized_mask.to(device)
+                            masked_features = features * resized_mask
 
-                    save_dict[f"{block}.{y_value}"] = sparse_values.cpu().numpy()
+                        # flatten and keep only nonzero activations
+                        sparse_values = masked_features[masked_features != 0].flatten()
+
+                        save_dict[f"{block}.{y_value}"] = sparse_values.cpu().numpy()
 
             np.savez(os.path.join(dest_dir,npz_file), **save_dict)
                     
@@ -453,10 +453,9 @@ def compute_stats(file_list, block, y_column):
     print(f"computing stats len file list {len(file_list)}")
 
     for file in file_list:
-        data = np.load(file)
-
-        X = data[block].reshape(-1, data[block].shape[-1])
-        y = data[y_column].reshape(-1, 1)
+        with np.load(file) as data:
+            X = data[block].reshape(-1, data[block].shape[-1])
+            y = data[y_column].reshape(-1, 1)
 
         if X_sum is None:
             X_sum = X.sum(axis=0)
@@ -497,10 +496,9 @@ class RegressionDataset(torch.utils.data.Dataset):
         return len(self.file_list)
 
     def __getitem__(self, index):
-        data = np.load(self.file_list[index])
-
-        X = torch.tensor(data[self.block], dtype=torch.float32)
-        y = torch.tensor(data[self.y_column], dtype=torch.float32)
+        with np.load(self.file_list[index]) as data:
+            X = torch.tensor(data[self.block], dtype=torch.float32)
+            y = torch.tensor(data[self.y_column], dtype=torch.float32)
 
         # 🔹 normalize
         X = (X - self.X_mean) / self.X_std
@@ -518,10 +516,13 @@ def run_regression(block:str,dim:int,y_column:str,
     for file in os.listdir(clip_src_dir):
         if file.endswith("npz"):
             try:
-                embeds=np.load(os.path.join(clip_src_dir,file))[block]
-            except Exception:
+                with np.load(os.path.join(clip_src_dir,file)) as data:
+                    embeds=data[block]
+            except Exception as e:
                 print(os.path.join(clip_src_dir,file))
-                print(np.load(os.path.join(clip_src_dir,file)).keys())
+                with np.load(os.path.join(clip_src_dir,file)) as data:
+                    print(data.files)
+                raise e
             dim=embeds.shape[-1]
             break
     
