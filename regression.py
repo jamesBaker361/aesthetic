@@ -394,13 +394,6 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
             avg_aesthetic=torch.stack(importance_aesthetic).mean(dim=0)
             avg_nsfw=torch.stack(importance_nsfw).mean(dim=0)
             
-            avg_nsfw=avg_nsfw-avg_nsfw.min()
-            avg_nsfw=avg_nsfw/(avg_nsfw.max()+1e-8)
-            avg_aesthetic=avg_aesthetic-avg_aesthetic.min()
-            avg_aesthetic=avg_aesthetic/(avg_aesthetic.max()+1e-8)
-            aesthetic_mask = avg_aesthetic >= torch.quantile(avg_aesthetic, 0.9)
-            nsfw_mask=avg_nsfw>=torch.quantile(avg_nsfw,0.9)
-            
             with np.load(os.path.join(sparse_dir,npz_file)) as old_npz:
                 save_dict={}
                 for block in [
@@ -411,24 +404,18 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
                 ]:
                     features=torch.tensor(old_npz[block])
                     (h,w,c)=features.size()
-                    for y_value,mask in zip(["nsfw","aesthetic"],[nsfw_mask,aesthetic_mask]):
-                        resized_mask = F.interpolate(
-                            mask.float().unsqueeze(0).unsqueeze(0), size=(h, w)
-                        )[0, 0]
-
-                        resized_mask=resized_mask.unsqueeze(-1).to(device)
-
-                        try:
-                            masked_features = features * resized_mask
-                        except RuntimeError:
-                            features=features.to(device)
-                            resized_mask=resized_mask.to(device)
-                            masked_features = features * resized_mask
-
-                        # flatten and keep only nonzero activations
-                        sparse_values = masked_features[masked_features != 0].flatten()
-
-                        save_dict[f"{block}.{y_value}"] = sparse_values.cpu().numpy()
+                    save_dict[block]=features.cpu().numpy()
+                    for y_value,importance in zip(
+                        ["nsfw","aesthetic"],
+                        [avg_nsfw,avg_aesthetic]
+                    ):
+                        resized=F.interpolate(
+                            importance.unsqueeze(0).unsqueeze(0), size=(h,w)
+                        )[0,0]
+                        flat=resized.flatten()
+                        ranks=flat.argsort().argsort().float()
+                        quantile=(ranks/max(flat.numel()-1,1)).reshape(h,w)
+                        save_dict[f"{block}.{y_value}"]=quantile.cpu().numpy()
 
             np.savez(os.path.join(dest_dir,npz_file), **save_dict)
                     
@@ -449,13 +436,14 @@ import torch
 def compute_stats(file_list, block, y_column):
     X_sum, X_sq_sum, count = None, None, 0
     y_sum, y_sq_sum = None, None
-    
+
     print(f"computing stats len file list {len(file_list)}")
 
+    score_key = f"{block}.{y_column}"
     for file in file_list:
         with np.load(file) as data:
             X = data[block].reshape(-1, data[block].shape[-1])
-            y = data[y_column].reshape(-1, 1)
+            y = data[score_key].reshape(-1, 1)
 
         if X_sum is None:
             X_sum = X.sum(axis=0)
@@ -498,16 +486,18 @@ class RegressionDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         with np.load(self.file_list[index]) as data:
             X = torch.tensor(data[self.block], dtype=torch.float32)
-            y = torch.tensor(data[self.y_column], dtype=torch.float32)
+            y = torch.tensor(data[f"{self.block}.{self.y_column}"], dtype=torch.float32)
 
-        # 🔹 normalize
+        X = X.reshape(-1, X.shape[-1])
+        y = y.reshape(-1, 1)
+
         X = (X - self.X_mean) / self.X_std
         y = (y - self.y_mean) / self.y_std
 
         return {"indep": X, "dep": y}
         
 
-def run_regression(block:str,dim:int,y_column:str,
+def run_regression(block:str,y_column:str,
                    limit:int,clip_src_dir:str,
                    stats_dest_dir:str,
                    mixed_precision:str,

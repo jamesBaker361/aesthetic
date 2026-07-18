@@ -427,9 +427,7 @@ def main(args):
     if not disable_run_regression:
         filter_dict={}
         for block in block_list:
-            dim=5000 #idr but itll break and tell us
-            
-            save_path=run_regression(block,dim,y_column,regression_limit,clip_dir,os.path.join(stats_dir,block),"fp16",2,epochs) #use sparse dir for now; in the future only use clip_dir
+            save_path=run_regression(block,y_column,regression_limit,clip_dir,os.path.join(stats_dir,block),"fp16",2,epochs) #use sparse dir for now; in the future only use clip_dir
             print(save_path)
             weights_dict=torch.load(save_path)["model_state_dict"]
             print(type(weights_dict))
