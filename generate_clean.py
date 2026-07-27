@@ -424,8 +424,8 @@ def main(args):
     if not disable_clip_attribution:
         clip_attribution(image_dest_dir,clip_dir,clip_limit,use_grad=True)
     
+    filter_dict={}
     if not disable_run_regression:
-        filter_dict={}
         for block in block_list:
             save_path=run_regression(block,y_column,regression_limit,clip_dir,os.path.join(stats_dir,block),"fp16",2,epochs) #use sparse dir for now; in the future only use clip_dir
             print(save_path)
@@ -435,14 +435,20 @@ def main(args):
             print([k for k in weights_dict])
             sparse_filter=weights_dict[[k for k in weights_dict][0]]
             filter_dict[block]=sparse_filter
-            
+
+    sae_checkpoints="./sdxl_unbox/checkpoints/"
+    sae_dict:dict[str,SparseAutoencoder]={}
+    for block in block_list:
+        sae_dict[block]=SparseAutoencoder.load_from_disk(
+            os.path.join(sae_checkpoints,f"unet.{block}_k10_hidden5120_auxk256_bs4096_lr0.0001","final"),
+        )
+
     if not disable_train_lora:
         train_lora(lora_dir,4,device,lora_epochs,image_dest_dir,2,accelerator,0.0001,filter_dict,sae_dict,lora_use_mask,lora_use_filter,lora_use_noise,size)
-            
+
         #run_regression(block,y_column,regression_limit,clip_dir,stats_dir)
     #load regression means, covariance matrix for each layer
-    sae_dict={} #load saes for each layer
-    
+
     #load pipeline
     dtype={
         "fp16":torch.float16,
