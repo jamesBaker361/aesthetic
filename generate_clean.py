@@ -527,7 +527,7 @@ def main(args):
             bad_image=pipe(prompt,size,size,generator=rand_gen).images[0]
             bad_image_list.append(bad_image)
             
-        mod_list=hookify(pipe.unet,sae_dict,mode,start_step,end_step)
+        mod_list=hookify(pipe.unet,sae_dict,mode,start_step,end_step,filter_dict)
         for i,row in enumerate(reader):
             prompt=row["prompt"]
 
