@@ -444,7 +444,7 @@ def main(args):
         )
 
     if not disable_train_lora:
-        train_lora(lora_dir,4,device,lora_epochs,image_dest_dir,2,accelerator,0.0001,filter_dict,sae_dict,lora_use_mask,lora_use_filter,lora_use_noise,size)
+        train_lora(lora_dir,4,device,lora_epochs,image_dest_dir,2,accelerator,0.0001,filter_dict,sae_dict,lora_use_mask,lora_use_filter,lora_use_noise,size,mode)
 
         #run_regression(block,y_column,regression_limit,clip_dir,stats_dir)
     #load regression means, covariance matrix for each layer
