@@ -28,9 +28,10 @@ from sdxl_extract import extract_vanilla
 from sparsify import sparsify_embeddings
 from regression import run_regression,clip_attribution,get_importance
 from d3po_rewards import get_aesthetic_model,get_nsfw_model
-from transformers import CLIPVisionModelWithProjection,CLIPImageProcessor
+from transformers import CLIPVisionModelWithProjection,CLIPImageProcessor,CLIPProcessor,CLIPModel
 from peft import LoraConfig
 from accelerate import Accelerator
+from datasets import Dataset
 
 def keep_top_n(x, n, dim=-1):
     """
@@ -91,6 +92,7 @@ parser.add_argument("--mode",type=str,default="out")
 job_id=os.environ["SLURM_JOB_ID"]
 parser.add_argument("--err",type=str,default=f"slurm_chip/generic/{job_id}.err")
 parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
+parser.add_argument("--repo_id",type=str,default="jlbaker361/nsfw")
 #def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
 # def run_regression(block:str,y_column:str,limit:int,clip_src_dir:str,stats_dest_dir:str):
 # generate images using RL or prompts
@@ -146,6 +148,21 @@ def get_images(image_dest_dir:str,method:str,n_random:int,size:int,num_inference
             diff_path=f"{image_dest_dir}/diff_{p}.jpg"
             diff_image.save(diff_path)
 
+def get_image_embeds(processor:CLIPImageProcessor,clip_model:CLIPModel,img:Image.Image,device):
+    inputs = {k: v.to(device) for k, v in processor(images=img, return_tensors="pt").items()}
+    inputs['pixel_values'].requires_grad_(True)
+    outputs = clip_model(**inputs, output_hidden_states=True, output_attentions=True)
+
+    hidden_states = outputs.hidden_states
+    for t in hidden_states:
+        t.retain_grad()
+
+    last_hidden_state = outputs.last_hidden_state  # [1, 1+N, D]
+    last_hidden_state.retain_grad()
+
+    image_embeds = F.normalize(outputs.image_embeds, dim=-1)
+    
+    return image_embeds
 
 class LoraDataset(torch.utils.data.Dataset):
     def __init__(self,image_dir:str,vae:AutoencoderKL,device,latent_h:int,latent_w:int):
@@ -518,6 +535,8 @@ def main(args):
     with open("unsafe.csv","r") as file:
         bad_image_list=[]
         good_image_list=[]
+        good_score_list=[]
+        bad_score_list=[]
         reader=csv.DictReader(file)
         for i,row in enumerate(reader):
             prompt=row["prompt"]
@@ -526,7 +545,9 @@ def main(args):
             rand_gen.manual_seed(i)
             bad_image=pipe(prompt,size,size,generator=rand_gen).images[0]
             bad_image_list.append(bad_image)
-            
+            image_embeds=get_image_embeds(processor,clip_model,bad_image,device)
+            bad_score=nsfw_model(image_embeds)
+            bad_score_list.append(bad_score.cpu().detach().numpy())
         mod_list=hookify(pipe.unet,sae_dict,mode,start_step,end_step,filter_dict)
         for i,row in enumerate(reader):
             prompt=row["prompt"]
@@ -537,9 +558,22 @@ def main(args):
                 setattr(mod,COUNTER,0)
             good_image=pipe(prompt,size,size,generator=rand_gen).images[0]
             good_image_list.append(good_image)
+            image_embeds=get_image_embeds(processor,clip_model,good_image,device)
+            good_score=nsfw_model(image_embeds)
+            good_score_list.append(good_score.cpu().detach().numpy())
         
+        Dataset.from_dict(
+            {
+                "bad_image":bad_image_list,
+                "good_image":good_image_list,
+                "bad_score":bad_score_list,
+                "good_score":good_score_list
+            }
+        ).push_to_hub(args.repo_id)
         
-            
+        print("bad score avg",np.mean(bad_score_list))
+        print("good score avg", np.mean(good_score_list))
+    
         
         
         # add hooks for editing activations
