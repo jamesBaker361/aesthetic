@@ -53,7 +53,11 @@ def keep_top_n(x, n, dim=-1):
     return torch.where(mask, x, torch.zeros_like(x))
 
 
-parser=default_parser()
+parser=default_parser(
+    {
+        "repo_id":"jlbaker361/nsfw"
+    }
+)
 UNTRAINED="untrained"
 
 parser.add_argument("--y_column",type=str,default="aesthetic") #column 0 = aesthetic column = 1 = p(unsafe)
@@ -92,7 +96,6 @@ parser.add_argument("--mode",type=str,default="out")
 job_id=os.environ["SLURM_JOB_ID"]
 parser.add_argument("--err",type=str,default=f"slurm_chip/generic/{job_id}.err")
 parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
-parser.add_argument("--repo_id",type=str,default="jlbaker361/nsfw")
 #def clip_attribution(image_src_dir:str,dest_dir:str,limit:int):
 # def run_regression(block:str,y_column:str,limit:int,clip_src_dir:str,stats_dest_dir:str):
 # generate images using RL or prompts
