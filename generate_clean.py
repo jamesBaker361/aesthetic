@@ -27,24 +27,13 @@ import random
 import nltk
 from nltk.corpus import wordnet as wn
 from sdxl_extract import extract_vanilla
-from sparsify import sparsify_embeddings
+from sparsify import sparsify_embeddings, top_n_mask
 from regression import run_regression,clip_attribution,get_importance
 from rewards import get_aesthetic_model,get_nsfw_model
 from transformers import CLIPVisionModelWithProjection,CLIPImageProcessor,CLIPProcessor,CLIPModel
 from peft import LoraConfig
 from accelerate import Accelerator
 from datasets import Dataset
-
-def top_n_mask(x, n, dim=-1):
-    """
-    Build a 1.0/0.0 mask that is 1.0 at the n largest entries of `x` along `dim`.
-    """
-    values, indices = torch.topk(x, n, dim=dim)
-
-    mask = torch.zeros_like(x)
-    mask.scatter_(dim, indices, 1.0)
-
-    return mask
 
 
 parser=default_parser(
@@ -454,7 +443,7 @@ def main(args):
             print(len(weights_dict))
             print([k for k in weights_dict])
             sparse_filter=weights_dict[[k for k in weights_dict][0]]
-            select_mask=top_n_mask(sparse_filter,top_k)
+            select_mask,_=top_n_mask(sparse_filter,top_k)
             filter_dict[block]=select_mask
             zero_filter_dict[block]=1.0-select_mask
 

@@ -16,6 +16,17 @@ from concurrent.futures import ThreadPoolExecutor
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
 from experiment_helpers.gpu_details import print_details
 
+def top_n_mask(x, n, dim=-1):
+    """
+    Build a 1.0/0.0 mask that is 1.0 at the n largest entries of `x` along `dim`.
+    """
+    values, indices = torch.topk(x, n, dim=dim)
+
+    mask = torch.zeros_like(x)
+    mask.scatter_(dim, indices, 1.0)
+
+    return mask, indices
+
 
 block_list=[
         "down_blocks.2.attentions.1",
@@ -110,15 +121,33 @@ def get_top_k_images(block:str,index:int,k:int=10,image_src_dir:str= "laion",lim
 
 if __name__=="__main__":
     print_details()
-    big_img_list=[]
-    for n in range(10):
-        start=time.time()
-        img_list=get_top_k_images("down_blocks.2.attentions.1",n,limit=-1)
-        img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
-        end=time.time()
-        print(f"elpased {end-start}")
-        big_img_list.append(img)
+    
+    block_list=[
+        "mid_block.attentions.0","down_blocks.2.attentions.1",
+        "up_blocks.0.attentions.0","up_blocks.0.attentions.1"
+    ]
+    
+    save_path_list=[
+        f"statistics/{block}/regression_{block}_aesthetic.pt" for block in block_list
         
-    concat_images_vertically(big_img_list).save("sparse.png")
+    ]
+    for k,save_path in enumerate(save_path_list):
+        big_img_list=[]
+        print(save_path)
+        weights_dict=torch.load(save_path)["model_state_dict"]
+        print(type(weights_dict))
+        print(len(weights_dict))
+        print([k for k in weights_dict])
+        sparse_filter=weights_dict[[k for k in weights_dict][0]]
+        select_mask,indices=top_n_mask(sparse_filter,5)
+        for n in indices:
+            start=time.time()
+            img_list=get_top_k_images("down_blocks.2.attentions.1",n,limit=-1)
+            img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
+            end=time.time()
+            print(f"elpased {end-start}")
+            big_img_list.append(img)
+        
+        concat_images_vertically(big_img_list).save(f"sparse_{k}.png")
     print('all done')
             
