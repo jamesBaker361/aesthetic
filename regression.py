@@ -256,119 +256,57 @@ def get_importance(pil_img: Image.Image,
 
         image_embeds = F.normalize(outputs.image_embeds, dim=-1)
 
-        # --- Score (your aesthetic model or direction) ---
-        #score = aesthetic_model(image_embeds)
-        score=nsfw_model(image_embeds)
-        score.backward()
-        
-    importance_nsfw=[]
-    
-    for layer_idx,target_hidden_state in enumerate(hidden_states): # so the middle 4 layers seem to be the only not totally dogshit- maybe we should pool
-        #if use_grad:
-        # --- Importance (Grad * Activation) ---
-        grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
-        grads=torch.nn.ReLU()(grads)
-        acts  = target_hidden_state[0, 1:, :]             # [N, D]
-        
-        num_patches = acts.shape[0]
-        h = w = int(num_patches ** 0.5)
-        
-
-
-        importance = grads * acts                       # [N, D]
-        #importance = torch.abs(importance).sum(dim=-1)            # [N] should we sum? 
-        importance=importance.norm(dim=-1)
-
-        # --- Reshape to patch grid ---
-        num_patches = importance.shape[0]
-        h = w = int(num_patches ** 0.5)
-        importance = importance.reshape(h, w)
-
-        # --- Normalize ---
-        importance = importance - importance.min()
-        importance = importance / (importance.max() + 1e-8)
-
-        # --- Upsample to image size ---
-        importance = importance.unsqueeze(0).unsqueeze(0)  # [1,1,h,w]
-
-        big_importance = F.interpolate(
-            importance,
-            size=(og_h, og_w),   # torch = (H, W)
-            mode="nearest",
-            #align_corners=False
-        )[0, 0]
-        importance_nsfw.append(big_importance)
-    
-    importance_aesthetic=[]
-    
-    img_tensor = transforms.PILToTensor()(pil_img)  # [C,H,W]
-
-    with torch.enable_grad():
-        inputs = {k: v.to(device) for k, v in processor(images=img_tensor, return_tensors="pt").items()}
-        inputs['pixel_values'].requires_grad_(True)
-        outputs = clip_model(**inputs, output_hidden_states=True, output_attentions=True)
-
-        hidden_states = outputs.hidden_states
+        # one forward pass, two backward passes off the same activations
+        nsfw_score=nsfw_model(image_embeds)
+        nsfw_score.backward(retain_graph=True)
+        nsfw_grads=[t.grad.clone() for t in hidden_states]
         for t in hidden_states:
-            t.retain_grad()
+            t.grad=None
 
-        last_hidden_state = outputs.last_hidden_state  # [1, 1+N, D]
-        last_hidden_state.retain_grad()
+        aesthetic_score=aesthetic_model(image_embeds)
+        aesthetic_score.backward()
+        aesthetic_grads=[t.grad.clone() for t in hidden_states]
 
-        image_embeds = F.normalize(outputs.image_embeds, dim=-1)
+    def build_importance(grads_list):
+        importance_list=[]
+        for layer_idx,(target_hidden_state,grad) in enumerate(zip(hidden_states,grads_list)): # so the middle 4 layers seem to be the only not totally dogshit- maybe we should pool
+            # --- Importance (Grad * Activation) ---
+            grads = grad[0, 1:, :]        # remove CLS → [N, D]
+            grads=torch.nn.ReLU()(grads)
+            acts  = target_hidden_state[0, 1:, :]             # [N, D]
 
-        # --- Score (your aesthetic model or direction) ---
-        #score = aesthetic_model(image_embeds)
-        score=aesthetic_model(image_embeds)
-        score.backward()
-        
-    
-    
-    for layer_idx,target_hidden_state in enumerate(hidden_states): # so the middle 4 layers seem to be the only not totally dogshit- maybe we should pool
-        #if use_grad:
-        # --- Importance (Grad * Activation) ---
-        grads = target_hidden_state.grad[0, 1:, :]        # remove CLS → [N, D]
-        grads=torch.nn.ReLU()(grads)
-        acts  = target_hidden_state[0, 1:, :]             # [N, D]
-        
-        num_patches = acts.shape[0]
-        h = w = int(num_patches ** 0.5)
-        
+            importance = grads * acts                       # [N, D]
+            importance=importance.norm(dim=-1)
 
+            # --- Reshape to patch grid ---
+            num_patches = importance.shape[0]
+            h = w = int(num_patches ** 0.5)
+            importance = importance.reshape(h, w)
 
-        importance = grads * acts                       # [N, D]
-        #importance = torch.abs(importance).sum(dim=-1)            # [N] should we sum? 
-        importance=importance.norm(dim=-1)
+            # --- Normalize ---
+            importance = importance - importance.min()
+            importance = importance / (importance.max() + 1e-8)
 
-        # --- Reshape to patch grid ---
-        num_patches = importance.shape[0]
-        h = w = int(num_patches ** 0.5)
-        importance = importance.reshape(h, w)
+            # --- Upsample to image size ---
+            importance = importance.unsqueeze(0).unsqueeze(0)  # [1,1,h,w]
 
-        # --- Normalize ---
-        importance = importance - importance.min()
-        importance = importance / (importance.max() + 1e-8)
+            big_importance = F.interpolate(
+                importance,
+                size=(og_h, og_w),   # torch = (H, W)
+                mode="nearest",
+            )[0, 0]
+            importance_list.append(big_importance)
+        return importance_list
 
-        # --- Upsample to image size ---
-        importance = importance.unsqueeze(0).unsqueeze(0)  # [1,1,h,w]
+    importance_nsfw=build_importance(nsfw_grads)
+    importance_aesthetic=build_importance(aesthetic_grads)
 
-        big_importance = F.interpolate(
-            importance,
-            size=(og_h, og_w),   # torch = (H, W)
-            mode="nearest",
-            #align_corners=False
-        )[0, 0]
-        
-        importance_aesthetic.append(big_importance)
-        
     return importance_aesthetic,importance_nsfw
 
 def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
                      sparse_dir:str="sparse_embeddings",
-                     use_grad:bool=False,
                      start_layer=5,
-                     stop_layer=15,
-                     top_frac:float=0.1):
+                     stop_layer=15,):
     #for each image find relevant patches and scores and save them
     print("clip attributuon")
     os.makedirs(dest_dir,exist_ok=True)
@@ -413,12 +351,27 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
                         ["nsfw","aesthetic"],
                         [avg_nsfw,avg_aesthetic]
                     ):
-                        resized=F.interpolate(
-                            importance.unsqueeze(0).unsqueeze(0), size=(h,w)
-                        )[0,0]
-                        flat=resized.flatten()
-                        ranks=flat.argsort().argsort().float()
-                        quantile=(ranks/max(flat.numel()-1,1)).reshape(h,w)
+                        # Resize the importance map to match the spatial dimensions (h, w).
+                        # Two dimensions are added first to represent batch and channel dimensions,
+                        # which F.interpolate expects: [H, W] -> [1, 1, H, W].
+                        resized = F.interpolate(
+                            importance.unsqueeze(0).unsqueeze(0),
+                            size=(h, w)
+                        )[0, 0]  # Remove the batch and channel dimensions: [1, 1, h, w] -> [h, w]
+
+                        # Flatten the 2D importance map into a 1D vector so all pixels can be ranked.
+                        flat = resized.flatten()
+
+                        # Compute the rank of every value.
+                        # flat.argsort() gives the indices that would sort the values.
+                        # Applying argsort() again converts those sorted indices into each
+                        # element's rank, ranging from 0 (smallest) to N-1 (largest).
+                        ranks = flat.argsort().argsort().float()
+
+                        # Normalize ranks to the range [0, 1], producing the percentile/quantile
+                        # of each pixel rather than using its raw importance value.
+                        # max(..., 1) avoids division by zero if there is only one element.
+                        quantile = (ranks / max(flat.numel() - 1, 1)).reshape(h, w)
                         save_dict[f"{block}.{y_value}"]=quantile.cpu().numpy()
 
             np.savez(os.path.join(dest_dir,npz_file), **save_dict)
@@ -541,8 +494,9 @@ def run_regression(block:str,y_column:str,
     try:
         checkpoint=torch.load(save_path,map_location="cpu")
         linear.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch=checkpoint["e"]+1
-    except:
+    except (FileNotFoundError,KeyError):
         start_epoch=0
     
     linear,optimizer,train,test,val=accelerator.prepare(linear,optimizer,train,test,val)
@@ -574,6 +528,7 @@ def run_regression(block:str,y_column:str,
 
             accelerator.save({
                 "model_state_dict": unwrapped.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
                 "e":e
             }, save_path)
             

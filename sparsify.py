@@ -47,7 +47,6 @@ image_src_dir= "laion"
 def sparsify_embeddings(sparse_dest_dir:str="sparse_embeddings",embedding_src_dir:str="embeddings",mode:str="diff"):
     print("sparsify embeddings")
     saes_dict:dict[str,SparseAutoencoder] = {}
-    means_dict = {}
     for block in tqdm(block_list, desc="Loading SAEs"):
         sae = SparseAutoencoder.load_from_disk(
             os.path.join(path_to_checkpoints, f"unet.{block}_k10_hidden5120_auxk256_bs4096_lr0.0001", "final"),
@@ -63,7 +62,6 @@ def sparsify_embeddings(sparse_dest_dir:str="sparse_embeddings",embedding_src_di
             print(" nan mean for ",block)
         
         saes_dict[block]=sae
-        means_dict[block]=means
         
 
 

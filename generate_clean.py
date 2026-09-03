@@ -76,6 +76,8 @@ parser.add_argument("--lora_use_noise",action="store_true")
 parser.add_argument("--start_step",type=int,default=2)
 parser.add_argument("--end_step",type=int,default=5)
 parser.add_argument("--mode",type=str,default="out")
+parser.add_argument("--lora_batch_size",type=int,default=2)
+parser.add_argument("--lora_rank",type=int,default=4)
 job_id=os.environ["SLURM_JOB_ID"]
 parser.add_argument("--err",type=str,default=f"slurm_chip/generic/{job_id}.err")
 parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
@@ -406,6 +408,8 @@ def main(args):
     mode:str=args.mode
     out:str=args.out
     err:str=args.err
+    lora_batch_size:int=args.lora_batch_size
+    lora_rank:int=args.lora_rank
     path_set=out.split("/")
     for n in range(1,len(path_set)-1):
         new_path=os.path.join(*out[:n])
@@ -427,7 +431,7 @@ def main(args):
     if not disable_sparsify_embeddings:
         sparsify_embeddings(sparse_embedding_dir,embedding_dir,mode)
     if not disable_clip_attribution:
-        clip_attribution(image_dest_dir,clip_dir,clip_limit,use_grad=True)
+        clip_attribution(image_dest_dir,clip_dir,clip_limit)
     
     # filter_dict: 1.0 at the top_k features most correlated with y_column, 0.0 elsewhere.
     #   Used by train_lora to target exactly those features in its suppression loss.
@@ -443,7 +447,7 @@ def main(args):
             print(type(weights_dict))
             print(len(weights_dict))
             print([k for k in weights_dict])
-            sparse_filter=weights_dict[[k for k in weights_dict][0]]
+            sparse_filter=weights_dict["weight"]
             select_mask,indices=top_n_mask(sparse_filter,top_k)
             print(f"block {block}", indices)
             filter_dict[block]=select_mask
@@ -457,7 +461,7 @@ def main(args):
         )
 
     if not disable_train_lora:
-        train_lora(lora_dir,4,device,lora_epochs,image_dest_dir,2,accelerator,0.0001,filter_dict,sae_dict,lora_use_mask,lora_use_filter,lora_use_noise,size,mode)
+        train_lora(lora_dir,lora_rank,device,lora_epochs,image_dest_dir,lora_batch_size,accelerator,0.0001,filter_dict,sae_dict,lora_use_mask,lora_use_filter,lora_use_noise,size,mode)
 
         #run_regression(block,y_column,regression_limit,clip_dir,stats_dir)
     #load regression means, covariance matrix for each layer
@@ -484,8 +488,6 @@ def main(args):
 
     clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").to(device)
     processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
-
-    hook_list=[]
     
     #TODO: naively find "bad features" and delete them saeuron style
     COUNTER="step_counter"

@@ -44,6 +44,7 @@ def extract_vanilla(
     size: int,
     mixed_precision:str
 ):
+    print("sextract vanilla")
     for d in [save_dir]:
         os.makedirs(d,exist_ok=True)
 
@@ -102,7 +103,7 @@ def extract_vanilla(
         return param.device, param.dtype
             
     device, dtype = get_unet_device_dtype(pipe.unet)
-    pipe.vae=AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16).to(device)
+    pipe.vae=AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=dtype).to(device)
     vae=pipe.vae
     def assert_no_nan(model):
         for name, p in model.named_parameters():
@@ -120,12 +121,9 @@ def extract_vanilla(
     started=True
     
     for r,jpg_path in enumerate(tqdm(path_list)):
-        if r<count:
-            continue
-        
         if r==limit:
             break
-        
+
         npz_path=os.path.join(save_dir,jpg_path+".npz")
         if os.path.exists(npz_path):
             continue
