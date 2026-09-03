@@ -35,24 +35,16 @@ from peft import LoraConfig
 from accelerate import Accelerator
 from datasets import Dataset
 
-def keep_top_n(x, n, dim=-1):
+def top_n_mask(x, n, dim=-1):
     """
-    Zero all but the top-n activations along `dim`.
-    
-    Args:
-        x: input tensor
-        n: number of activations to keep
-        dim: dimension along which to keep top-n
-        
-    Returns:
-        Tensor with only top-n values preserved.
+    Build a 1.0/0.0 mask that is 1.0 at the n largest entries of `x` along `dim`.
     """
     values, indices = torch.topk(x, n, dim=dim)
 
-    mask = torch.zeros_like(x, dtype=torch.bool)
-    mask.scatter_(dim, indices, True)
+    mask = torch.zeros_like(x)
+    mask.scatter_(dim, indices, 1.0)
 
-    return torch.where(mask, x, torch.zeros_like(x))
+    return mask
 
 
 parser=default_parser(
@@ -420,6 +412,7 @@ def main(args):
     lora_dir:str=args.lora_dir
     start_step:int=args.start_step
     end_step:int=args.end_step
+    top_k:int=args.top_k
     mode:str=args.mode
     out:str=args.out
     err:str=args.err
@@ -446,7 +439,12 @@ def main(args):
     if not disable_clip_attribution:
         clip_attribution(image_dest_dir,clip_dir,clip_limit,use_grad=True)
     
+    # filter_dict: 1.0 at the top_k features most correlated with y_column, 0.0 elsewhere.
+    #   Used by train_lora to target exactly those features in its suppression loss.
+    # zero_filter_dict: the inverse (0.0 at the top_k features, 1.0 elsewhere).
+    #   Used at generation time to zero out those features' activations before the SAE's own top-k.
     filter_dict={}
+    zero_filter_dict={}
     if not disable_run_regression:
         for block in block_list:
             save_path=run_regression(block,y_column,regression_limit,clip_dir,os.path.join(stats_dir,block),"fp16",2,epochs) #use sparse dir for now; in the future only use clip_dir
@@ -456,7 +454,9 @@ def main(args):
             print(len(weights_dict))
             print([k for k in weights_dict])
             sparse_filter=weights_dict[[k for k in weights_dict][0]]
-            filter_dict[block]=sparse_filter
+            select_mask=top_n_mask(sparse_filter,top_k)
+            filter_dict[block]=select_mask
+            zero_filter_dict[block]=1.0-select_mask
 
     sae_checkpoints="./sdxl_unbox/checkpoints/"
     sae_dict:dict[str,SparseAutoencoder]={}
@@ -542,8 +542,8 @@ def main(args):
         good_image_list=[]
         good_score_list=[]
         bad_score_list=[]
-        reader=csv.DictReader(file)
-        for i,row in enumerate(reader):
+        rows=list(csv.DictReader(file))
+        for i,row in enumerate(rows):
             prompt=row["prompt"]
 
             rand_gen=torch.Generator()
@@ -553,8 +553,8 @@ def main(args):
             image_embeds=get_image_embeds(processor,clip_model,bad_image,device)
             bad_score=nsfw_model(image_embeds)
             bad_score_list.append(bad_score.cpu().detach().numpy())
-        mod_list=hookify(pipe.unet,sae_dict,mode,start_step,end_step,filter_dict)
-        for i,row in enumerate(reader):
+        mod_list=hookify(pipe.unet,sae_dict,mode,start_step,end_step,zero_filter_dict)
+        for i,row in enumerate(rows):
             prompt=row["prompt"]
 
             rand_gen=torch.Generator()
