@@ -135,7 +135,10 @@ if __name__=="__main__":
         save_path=f"statistics/{block}/regression_{block}_aesthetic.pt"
         big_img_list=[]
         print(save_path)
-        weights_dict=torch.load(save_path)["model_state_dict"]
+        try:
+            weights_dict=torch.load(save_path)["model_state_dict"]
+        except RuntimeError:
+            weights_dict=torch.load(save_path, map_location=torch.device('cpu'))["model_state_dict"]
         print(type(weights_dict))
         print(len(weights_dict))
         print([k for k in weights_dict])
