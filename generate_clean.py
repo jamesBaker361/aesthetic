@@ -1,3 +1,5 @@
+# this trains the sae and then does SAEURON stuyle removal I think?
+
 import os
 import argparse
 from experiment_helpers.gpu_details import print_details

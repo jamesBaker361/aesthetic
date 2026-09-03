@@ -11,7 +11,7 @@ from experiment_helpers.argprint import print_args
 from experiment_helpers.data_helpers import split_data
 from sklearn.linear_model import Ridge,LinearRegression,ElasticNet,Lasso
 from diffusers.image_processor import VaeImageProcessor
-from d3po_rewards import get_nsfw_model,get_aesthetic_model
+from rewards import get_nsfw_model,get_aesthetic_model
 from transformers import AutoTokenizer, CLIPTextModelWithProjection, CLIPVisionModelWithProjection, CLIPImageProcessor
 import torch
 import torch.nn.functional as F
