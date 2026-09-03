@@ -575,6 +575,18 @@ def run_regression(block:str,y_column:str,
                 "model_state_dict": unwrapped.state_dict(),
                 "e":e
             }, save_path)
+            
+    test_loss_list=[]
+    with torch.no_grad():
+        for b, batch in enumerate(test):
+            x=batch["indep"]
+            y=batch["dep"]
+            with accelerator.autocast():
+                predicted=linear(x)
+                loss=F.mse_loss(predicted,y)
+                test_loss_list.append(loss.cpu().detach().float().numpy())
+                
+    print("test loss ",np.mean(test_loss_list))       
     return save_path
         
 
