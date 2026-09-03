@@ -45,6 +45,7 @@ image_src_dir= "laion"
 
 
 def sparsify_embeddings(sparse_dest_dir:str="sparse_embeddings",embedding_src_dir:str="embeddings",mode:str="diff"):
+    print("sparsify embeddings")
     saes_dict:dict[str,SparseAutoencoder] = {}
     means_dict = {}
     for block in tqdm(block_list, desc="Loading SAEs"):

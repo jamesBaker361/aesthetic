@@ -90,6 +90,7 @@ parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
 
 
 def get_images(image_dest_dir:str,method:str,n_random:int,size:int,num_inference_steps:int,aesthetic_prompt:bool,nsfw_prompt:bool,random_prompt:bool):
+    print("get images")
     os.makedirs(image_dest_dir,exist_ok=True)
     
     prompt_list=[]

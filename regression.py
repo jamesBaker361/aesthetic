@@ -370,6 +370,7 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
                      stop_layer=15,
                      top_frac:float=0.1):
     #for each image find relevant patches and scores and save them
+    print("clip attributuon")
     os.makedirs(dest_dir,exist_ok=True)
     # get models
     nsfw_model=get_nsfw_model()
