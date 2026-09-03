@@ -27,7 +27,7 @@ from nltk.corpus import wordnet as wn
 from sdxl_extract import extract_vanilla
 from sparsify import sparsify_embeddings
 from regression import run_regression,clip_attribution,get_importance
-from d3po_rewards import get_aesthetic_model,get_nsfw_model
+from rewards import get_aesthetic_model,get_nsfw_model
 from transformers import CLIPVisionModelWithProjection,CLIPImageProcessor,CLIPProcessor,CLIPModel
 from peft import LoraConfig
 from accelerate import Accelerator
