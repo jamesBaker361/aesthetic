@@ -1,9 +1,6 @@
 [submodule "experiment_helpers"]
 	path = experiment_helpers
 	url = https://github.com/jamesBaker361/experiment_helpers.git
-[submodule "clip_surgery"]
-	path = clip_surgery
-	url = https://github.com/xmed-lab/CLIP_Surgery.git
 [submodule "improved-aesthetic-predictor"]
 	path = improved-aesthetic-predictor
 	url = https://github.com/christophschuhmann/improved-aesthetic-predictor.git
