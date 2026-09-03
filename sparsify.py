@@ -131,7 +131,8 @@ if __name__=="__main__":
         f"statistics/{block}/regression_{block}_aesthetic.pt" for block in block_list
         
     ]
-    for k,save_path in enumerate(save_path_list):
+    for k,block in enumerate(block_list):
+        save_path=f"statistics/{block}/regression_{block}_aesthetic.pt"
         big_img_list=[]
         print(save_path)
         weights_dict=torch.load(save_path)["model_state_dict"]
@@ -142,7 +143,7 @@ if __name__=="__main__":
         select_mask,indices=top_n_mask(sparse_filter,5)
         for n in indices:
             start=time.time()
-            img_list=get_top_k_images("down_blocks.2.attentions.1",n,limit=-1)
+            img_list=get_top_k_images(block,n,limit=-1)
             img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
             end=time.time()
             print(f"elpased {end-start}")
