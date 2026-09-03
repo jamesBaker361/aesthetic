@@ -1,3 +1,9 @@
+'''
+this is the script used to find the top k images for a particular sparse feature for a particular
+layer
+'''
+
+
 import torch
 from sdxl_unbox.SAE import SparseAutoencoder
 import os
