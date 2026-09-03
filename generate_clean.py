@@ -443,7 +443,8 @@ def main(args):
             print(len(weights_dict))
             print([k for k in weights_dict])
             sparse_filter=weights_dict[[k for k in weights_dict][0]]
-            select_mask,_=top_n_mask(sparse_filter,top_k)
+            select_mask,indices=top_n_mask(sparse_filter,top_k)
+            print(f"block {block}", indices)
             filter_dict[block]=select_mask
             zero_filter_dict[block]=1.0-select_mask
 
