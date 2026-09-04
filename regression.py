@@ -8,7 +8,6 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 from sklearn.metrics import r2_score
 from experiment_helpers.argprint import print_args
-from experiment_helpers.data_helpers import split_data
 from sklearn.linear_model import Ridge,LinearRegression,ElasticNet,Lasso
 from diffusers.image_processor import VaeImageProcessor
 from rewards import get_nsfw_model,get_aesthetic_model
@@ -20,7 +19,6 @@ import torchvision.transforms as transforms
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
 import matplotlib.pyplot as plt
 import cv2
-from accelerate import Accelerator
 
 def get_maps(pil_img: Image.Image,
              nsfw_model,
@@ -238,7 +236,7 @@ def get_importance(pil_img: Image.Image,
              aesthetic_model,
              device,
              processor,
-             clip_model)->tuple[list[torch.Tensor],list[torch.Tensor]]:
+             clip_model)->tuple[list[torch.Tensor],list[torch.Tensor],float,float]:
     og_w, og_h = pil_img.size  # NOTE: PIL = (W, H) supposedly...
     img_tensor = transforms.PILToTensor()(pil_img)  # [C,H,W]
 
@@ -301,13 +299,19 @@ def get_importance(pil_img: Image.Image,
     importance_nsfw=build_importance(nsfw_grads)
     importance_aesthetic=build_importance(aesthetic_grads)
 
-    return importance_aesthetic,importance_nsfw
+    # Whole-image scores (scalars), needed downstream as the regression target
+    # in run_regression - as opposed to the per-patch importance maps above.
+    return importance_aesthetic,importance_nsfw,float(aesthetic_score.detach().cpu()),float(nsfw_score.detach().cpu())
 
 def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
                      sparse_dir:str="sparse_embeddings",
                      start_layer=5,
                      stop_layer=15,):
-    #for each image find relevant patches and scores and save them
+    # Step 1 of the intended pipeline: rank each spatial patch by how much it
+    # drives the nsfw/aesthetic score (via get_importance's grad*activation maps),
+    # then convert that ranking to a [0,1] quantile per patch (see below). Also
+    # stash the whole-image scores themselves - run_regression needs both: the
+    # quantile to threshold/weight patches, the whole-image score as the target.
     print("clip attributuon")
     os.makedirs(dest_dir,exist_ok=True)
     # get models
@@ -329,15 +333,19 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
         
             # --- Load image ---
             pil_img = Image.open(os.path.join(image_src_dir, file)).convert("RGB")
-            importance_aesthetic,importance_nsfw=get_importance(pil_img,nsfw_model,aesthetic_model,device,processor,clip_model)
+            importance_aesthetic,importance_nsfw,aesthetic_score,nsfw_score=get_importance(pil_img,nsfw_model,aesthetic_model,device,processor,clip_model)
             importance_aesthetic=importance_aesthetic[start_layer:stop_layer]
             importance_nsfw=importance_nsfw[start_layer:stop_layer]
-            
+
             avg_aesthetic=torch.stack(importance_aesthetic).mean(dim=0)
             avg_nsfw=torch.stack(importance_nsfw).mean(dim=0)
-            
+
             with np.load(os.path.join(sparse_dir,npz_file)) as old_npz:
-                save_dict={}
+                # whole-image scores, constant across all patches/blocks of this image
+                save_dict={
+                    "image_aesthetic_score":aesthetic_score,
+                    "image_nsfw_score":nsfw_score,
+                }
                 for block in [
                     "down_blocks.2.attentions.1",
                     "mid_block.attentions.0",
@@ -375,174 +383,82 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
                         save_dict[f"{block}.{y_value}"]=quantile.cpu().numpy()
 
             np.savez(os.path.join(dest_dir,npz_file), **save_dict)
-                    
-                
-                
-                
-                
-        
-        
-        
-        
-        
-        
-import numpy as np
-import os
-import torch
 
-def compute_stats(file_list, block, y_column):
-    X_sum, X_sq_sum, count = None, None, 0
-    y_sum, y_sq_sum = None, None
-
-    print(f"computing stats len file list {len(file_list)}")
-
-    score_key = f"{block}.{y_column}"
-    for file in file_list:
-        with np.load(file) as data:
-            X = data[block].reshape(-1, data[block].shape[-1])
-            y = data[score_key].reshape(-1, 1)
-
-        if X_sum is None:
-            X_sum = X.sum(axis=0)
-            X_sq_sum = (X**2).sum(axis=0)
-            y_sum = y.sum(axis=0)
-            y_sq_sum = (y**2).sum(axis=0)
-        else:
-            X_sum += X.sum(axis=0)
-            X_sq_sum += (X**2).sum(axis=0)
-            y_sum += y.sum(axis=0)
-            y_sq_sum += (y**2).sum(axis=0)
-
-        count += X.shape[0]
-
-    print(f"X_sum, X_sq_sum, count {X_sum}, {X_sq_sum}, {count}")
-    print(f"y_sum, y_sq_sum  {y_sum}, {y_sq_sum}")
-
-    X_mean = X_sum / count
-    X_std = np.sqrt(X_sq_sum / count - X_mean**2) + 1e-6
-
-    y_mean = y_sum / count
-    y_std = np.sqrt(y_sq_sum / count - y_mean**2) + 1e-6
-
-    return X_mean, X_std, y_mean, y_std
-
-class RegressionDataset(torch.utils.data.Dataset):
-    def __init__(self, file_list, block, y_column, X_mean, X_std, y_mean, y_std):
-        self.file_list = file_list
-        self.block = block
-        self.y_column = y_column
-
-        self.X_mean = torch.tensor(X_mean, dtype=torch.float32)
-        self.X_std = torch.tensor(X_std, dtype=torch.float32)
-        self.y_mean = torch.tensor(y_mean, dtype=torch.float32)
-        self.y_std = torch.tensor(y_std, dtype=torch.float32)
-
-    def __len__(self):
-        return len(self.file_list)
-
-    def __getitem__(self, index):
-        with np.load(self.file_list[index]) as data:
-            X = torch.tensor(data[self.block], dtype=torch.float32)
-            y = torch.tensor(data[f"{self.block}.{self.y_column}"], dtype=torch.float32)
-
-        X = X.reshape(-1, X.shape[-1])
-        y = y.reshape(-1, 1)
-
-        X = (X - self.X_mean) / self.X_std
-        y = (y - self.y_mean) / self.y_std
-
-        return {"indep": X, "dep": y}
-        
-
+# For each of the `dim` SAE/UNet features in `block`, fit its OWN univariate
+# regression y=a*x+b (closed-form OLS, not gradient descent - there's no joint
+# model here, every feature gets an independent single-variable fit) against a
+# per-patch target, pooled over every patch (across every image) whose
+# clip_attribution importance quantile is >= threshold. weight_by_importance
+# picks the target: the whole image's y_column score, or that score scaled by
+# the patch's own importance quantile. Saves a, b, r2 and the signed Pearson
+# correlation r (= sign(a)*sqrt(r2), scale-invariant, used downstream in
+# generate_clean.py to rank features by correlation with y_column) per feature.
 def run_regression(block:str,y_column:str,
                    limit:int,clip_src_dir:str,
                    stats_dest_dir:str,
-                   mixed_precision:str,
-                   gradient_accumulation_steps:int,
-                   epochs:int):
-    for file in os.listdir(clip_src_dir):
-        if file.endswith("npz"):
-            try:
-                with np.load(os.path.join(clip_src_dir,file)) as data:
-                    embeds=data[block]
-            except Exception as e:
-                print(os.path.join(clip_src_dir,file))
-                with np.load(os.path.join(clip_src_dir,file)) as data:
-                    print(data.files)
-                raise e
-            dim=embeds.shape[-1]
-            break
-    
-    linear=torch.nn.Linear(dim,1)
-    optimizer=torch.optim.AdamW(linear.parameters())
-    file_list = [
-        os.path.join(clip_src_dir, f)
+                   threshold:float,
+                   weight_by_importance:bool):
+    score_key=f"{block}.{y_column}"
+    image_score_key=f"image_{y_column}_score"
+
+    file_list=[
+        os.path.join(clip_src_dir,f)
         for f in os.listdir(clip_src_dir)
         if f.endswith("npz")
     ]
+    if limit>=0:
+        file_list=file_list[:limit]
 
-    X_mean, X_std, y_mean, y_std = compute_stats(file_list, block, y_column)
+    # streamed first/second-moment accumulation (per feature) over every kept
+    # patch, so we never have to hold every image's patches in memory at once
+    x_sum=x_sq_sum=xy_sum=None
+    y_sum=y_sq_sum=0.0
+    count=0
+    for file in file_list:
+        with np.load(file) as data:
+            if block not in data or score_key not in data or image_score_key not in data:
+                continue
+            X=data[block].reshape(-1,data[block].shape[-1])   # [patches, dim]
+            quantile=data[score_key].reshape(-1)                # [patches], in [0,1]
+            image_score=float(data[image_score_key])
 
-    dataset = RegressionDataset(
-        file_list, block, y_column,
-        X_mean, X_std, y_mean, y_std
-    )
-    train,test,val=split_data(dataset,0.9,1)
-    
-    accelerator:Accelerator=Accelerator(mixed_precision=mixed_precision,gradient_accumulation_steps=gradient_accumulation_steps)
-    save_path=os.path.join(stats_dest_dir, f"regression_{block}_{y_column}.pt")
-    try:
-        checkpoint=torch.load(save_path,map_location="cpu")
-        linear.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        start_epoch=checkpoint["e"]+1
-    except (FileNotFoundError,KeyError):
-        start_epoch=0
-    
-    linear,optimizer,train,test,val=accelerator.prepare(linear,optimizer,train,test,val)
-    
-    
-    for e in range(start_epoch,epochs):
-        loss_list=[]
-        for b,batch in enumerate(train):
-            if b==limit:
-                break
-            x=batch["indep"]
-            y=batch["dep"]
-            if b==0 and e==start_epoch:
-                print("x size",x.size())
-                print("y size ",y.size())
-            with accelerator.accumulate(linear):
-                with accelerator.autocast():
-                    optimizer.zero_grad()
-                    predicted=linear(x)
-                    loss=F.mse_loss(predicted,y)
-                    accelerator.backward(loss)
-                    optimizer.step()
-                    loss_list.append(loss.cpu().detach().float().numpy())
-        print(e,np.mean(loss_list))
-        if accelerator.is_main_process:
-            os.makedirs(stats_dest_dir, exist_ok=True)
+        keep=quantile>=threshold
+        if not keep.any():
+            continue
+        X=X[keep]
+        y=np.full(X.shape[0],image_score,dtype=np.float64)
+        if weight_by_importance:
+            y=y*quantile[keep]
 
-            unwrapped = accelerator.unwrap_model(linear)
+        if x_sum is None:
+            dim=X.shape[-1]
+            x_sum=np.zeros(dim);x_sq_sum=np.zeros(dim);xy_sum=np.zeros(dim)
+        x_sum+=X.sum(axis=0)
+        x_sq_sum+=(X**2).sum(axis=0)
+        xy_sum+=(X*y[:,None]).sum(axis=0)
+        y_sum+=y.sum()
+        y_sq_sum+=(y**2).sum()
+        count+=X.shape[0]
 
-            accelerator.save({
-                "model_state_dict": unwrapped.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "e":e
-            }, save_path)
-            
-    test_loss_list=[]
-    with torch.no_grad():
-        for b, batch in enumerate(test):
-            x=batch["indep"]
-            y=batch["dep"]
-            with accelerator.autocast():
-                predicted=linear(x)
-                loss=F.mse_loss(predicted,y)
-                test_loss_list.append(loss.cpu().detach().float().numpy())
-                
-    print("test loss ",np.mean(test_loss_list))       
+    if count==0:
+        raise ValueError(f"no patches for block={block} passed threshold={threshold}")
+
+    x_mean=x_sum/count
+    x_var=x_sq_sum/count-x_mean**2
+    y_mean=y_sum/count
+    y_var=y_sq_sum/count-y_mean**2
+    cov=xy_sum/count-x_mean*y_mean
+
+    a=cov/(x_var+1e-12)
+    b=y_mean-a*x_mean
+    r2=(cov**2)/(x_var*y_var+1e-12)
+    r=np.sign(a)*np.sqrt(r2)
+
+    print(f"{block}/{y_column}: {count} patches kept (threshold={threshold}), mean r2={r2.mean():.4f} max r2={r2.max():.4f}")
+
+    os.makedirs(stats_dest_dir,exist_ok=True)
+    save_path=os.path.join(stats_dest_dir,f"regression_{block}_{y_column}.npz")
+    np.savez(save_path,a=a,b=b,r2=r2,r=r)
     return save_path
         
 
@@ -562,7 +478,7 @@ if __name__=="__main__":
     parser.add_argument("--block",type=str,default="down_blocks.2.attentions.1")
     parser.add_argument("--limit",type=int,default=-1)
     
-    clip_attribution("test_imgs","test_maps",-1,use_grad=True)
+    clip_attribution("test_imgs","test_maps",-1)
     
     exit(0)
     print_args(parser)

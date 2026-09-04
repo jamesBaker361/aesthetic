@@ -17,6 +17,7 @@ import re
 #this whole thing might be fucking useless if we're going to do SDXL extract to get good/bad features UNLESS we want to discover new prompts that might have good scores
 #except for aesthetic we're kinda shooting blanks
 
+# this is to actually score stuff idk why its called what it is thats dumb
 
 #now we need the aesthetic predictor and the NSFW predictor
 # https://github.com/christophschuhmann/improved-aesthetic-predictor

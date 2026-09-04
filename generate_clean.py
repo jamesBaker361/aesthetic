@@ -78,6 +78,8 @@ parser.add_argument("--end_step",type=int,default=5)
 parser.add_argument("--mode",type=str,default="out")
 parser.add_argument("--lora_batch_size",type=int,default=2)
 parser.add_argument("--lora_rank",type=int,default=4)
+parser.add_argument("--attribution_threshold",type=float,default=0.9) # only patches with clip_attribution quantile >= this feed run_regression
+parser.add_argument("--weight_by_importance",action="store_true") # regress on score*patch_importance instead of the raw whole-image score
 job_id=os.environ["SLURM_JOB_ID"]
 parser.add_argument("--err",type=str,default=f"slurm_chip/generic/{job_id}.err")
 parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
@@ -184,7 +186,7 @@ class LoraDataset(torch.utils.data.Dataset):
             return self._cache[index]
         pil_img=Image.open(self.path_list[index]).convert("RGB")
         pt_img=self.image_processor.preprocess(pil_img).to(self.device,dtype=self.vae.dtype)
-        importance_aesthetic,importance_nsfw=get_importance(pil_img,self.nsfw_model,self.aesthetic_model,self.device,self.processor,self.clip_model)
+        importance_aesthetic,importance_nsfw,_,_=get_importance(pil_img,self.nsfw_model,self.aesthetic_model,self.device,self.processor,self.clip_model)
         start_layer=5
         stop_layer=15
         importance_aesthetic=importance_aesthetic[start_layer:stop_layer]
@@ -410,6 +412,8 @@ def main(args):
     err:str=args.err
     lora_batch_size:int=args.lora_batch_size
     lora_rank:int=args.lora_rank
+    attribution_threshold:float=args.attribution_threshold
+    weight_by_importance:bool=args.weight_by_importance
     path_set=out.split("/")
     for n in range(1,len(path_set)-1):
         new_path=os.path.join(*out[:n])
@@ -441,13 +445,13 @@ def main(args):
     zero_filter_dict={}
     if not disable_run_regression:
         for block in block_list:
-            save_path=run_regression(block,y_column,regression_limit,clip_dir,os.path.join(stats_dir,block),"fp16",2,epochs) #use sparse dir for now; in the future only use clip_dir
+            save_path=run_regression(block,y_column,regression_limit,clip_dir,os.path.join(stats_dir,block),attribution_threshold,weight_by_importance)
             print(save_path)
-            weights_dict=torch.load(save_path)["model_state_dict"]
-            print(type(weights_dict))
-            print(len(weights_dict))
-            print([k for k in weights_dict])
-            sparse_filter=weights_dict["weight"]
+            # r is the per-feature signed Pearson correlation with y_column (see
+            # regression.py) - rank by it directly rather than the raw slope,
+            # since it's scale-invariant across features with different variances.
+            with np.load(save_path) as npz:
+                sparse_filter=torch.tensor(npz["r"])
             select_mask,indices=top_n_mask(sparse_filter,top_k)
             print(f"block {block}", indices)
             filter_dict[block]=select_mask
