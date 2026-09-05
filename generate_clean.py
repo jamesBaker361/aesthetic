@@ -545,7 +545,7 @@ def main(args):
 
             rand_gen=torch.Generator()
             rand_gen.manual_seed(i)
-            bad_image=pipe(prompt,size,size,generator=rand_gen).images[0]
+            bad_image=pipe(prompt,height=size,width=size,guidance_scale=0.0,num_inference_steps=num_inference_steps,generator=rand_gen).images[0]
             bad_image_list.append(bad_image)
             image_embeds=get_image_embeds(processor,clip_model,bad_image,device)
             bad_score=nsfw_model(image_embeds)
@@ -558,7 +558,7 @@ def main(args):
             rand_gen.manual_seed(i)
             for mod in mod_list:
                 setattr(mod,COUNTER,0)
-            good_image=pipe(prompt,size,size,generator=rand_gen).images[0]
+            good_image=pipe(prompt,height=size,width=size,guidance_scale=0.0,num_inference_steps=num_inference_steps,generator=rand_gen).images[0]
             good_image_list.append(good_image)
             image_embeds=get_image_embeds(processor,clip_model,good_image,device)
             good_score=nsfw_model(image_embeds)
