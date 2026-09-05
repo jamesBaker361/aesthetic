@@ -400,6 +400,10 @@ def run_regression(block:str,y_column:str,
                    weight_by_importance:bool):
     score_key=f"{block}.{y_column}"
     image_score_key=f"image_{y_column}_score"
+    os.makedirs(stats_dest_dir,exist_ok=True)
+    save_path=os.path.join(stats_dest_dir,f"regression_{block}_{y_column}.npz")
+    if os.path.exists(save_path):
+        return save_path
 
     file_list=[
         os.path.join(clip_src_dir,f)
@@ -456,8 +460,7 @@ def run_regression(block:str,y_column:str,
 
     print(f"{block}/{y_column}: {count} patches kept (threshold={threshold}), mean r2={r2.mean():.4f} max r2={r2.max():.4f}")
 
-    os.makedirs(stats_dest_dir,exist_ok=True)
-    save_path=os.path.join(stats_dest_dir,f"regression_{block}_{y_column}.npz")
+    
     np.savez(save_path,a=a,b=b,r2=r2,r=r)
     return save_path
         
