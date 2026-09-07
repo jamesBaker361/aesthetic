@@ -8,6 +8,7 @@ from experiment_helpers.argprint import print_args
 from diffusers import DiffusionPipeline,UNet2DConditionModel,AutoencoderKL
 from diffusers.image_processor import VaeImageProcessor
 from sdxl_unbox.SAE import SparseAutoencoder
+from diffusers import SanaSprintPipeline,Krea2Pipeline
 import torch
 import numpy as np
 import csv
@@ -117,7 +118,7 @@ def get_images(image_dest_dir:str,method:str,n_random:int,size:int,num_inference
         prompt_list+=word_list
     device="cuda" if torch.cuda.is_available() else "cpu"
     
-    base_pipe=DiffusionPipeline.from_pretrained("SimianLuo/LCM_Dreamshaper_v7").to(device)
+    base_pipe=Krea2Pipeline.from_pretrained("krea/Krea-2-Turbo", torch_dtype=torch.bfloat16).to(device)
     setattr(base_pipe,"safety_checker",None)
     if method==UNTRAINED:
         diff_pipe=base_pipe
