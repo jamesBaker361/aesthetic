@@ -9,6 +9,7 @@ from diffusers import DiffusionPipeline,UNet2DConditionModel,AutoencoderKL
 from diffusers.image_processor import VaeImageProcessor
 from sdxl_unbox.SAE import SparseAutoencoder
 from diffusers import SanaSprintPipeline,Krea2Pipeline
+from huggingface_hub import snapshot_download
 import torch
 import numpy as np
 import csv
@@ -46,6 +47,7 @@ UNTRAINED="untrained"
 
 parser.add_argument("--y_column",type=str,default="aesthetic") #column 0 = aesthetic column = 1 = p(unsafe)
 parser.add_argument("--num_inference_steps",type=int,default=8)
+parser.add_argument("--premade",action="store_true")
 parser.add_argument("--size",type=int,default=512)
 parser.add_argument("--method",type=str,default=UNTRAINED)
 parser.add_argument("--image_src_dir",type=str,default="laion")
@@ -92,9 +94,23 @@ parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
 # regress scores on activations
 # 
 
+def get_images_nsfw_premade(image_dest_dir:str):
+    return snapshot_download(
+    repo_id="wallstoneai/civitai-top-nsfw-images-with-metadata",
+    repo_type="dataset",
+    allow_patterns="images/*.jpg",
+    local_dir=image_dest_dir
+    )
+    
 
-
-def get_images(image_dest_dir:str,method:str,n_random:int,size:int,num_inference_steps:int,aesthetic_prompt:bool,nsfw_prompt:bool,random_prompt:bool):
+def get_images(image_dest_dir:str,
+               method:str,
+               n_random:int,
+               size:int,
+               num_inference_steps:
+                   int,aesthetic_prompt:bool,
+                   nsfw_prompt:bool,
+                   random_prompt:bool):
     print("get images")
     os.makedirs(image_dest_dir,exist_ok=True)
     
