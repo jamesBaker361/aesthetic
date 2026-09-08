@@ -427,6 +427,7 @@ def main(args):
     mode:str=args.mode
     out:str=args.out
     err:str=args.err
+    premade:bool  = args.premade
     lora_batch_size:int=args.lora_batch_size
     lora_rank:int=args.lora_rank
     attribution_threshold:float=args.attribution_threshold
@@ -446,6 +447,8 @@ def main(args):
          "up_blocks.0.attentions.1"
     ]
     if not disable_get_images:
+        if premade:
+            get_images_nsfw_premade(image_dest_dir)
         get_images(image_dest_dir,method,n_random,size,num_inference_steps,aesthetic_prompt,nsfw_prompt,random_prompt)
     if not disable_extract_vanilla:
         extract_vanilla(embedding_dir,image_dest_dir,limit,size,mixed_precision)
