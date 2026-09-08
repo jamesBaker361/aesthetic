@@ -95,10 +95,10 @@ parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
 # 
 
 def get_images_nsfw_premade(image_dest_dir:str):
+    print("get images ")
     return snapshot_download(
     repo_id="wallstoneai/civitai-top-nsfw-images-with-metadata",
     repo_type="dataset",
-    allow_patterns="images/*.jpeg",
     local_dir=image_dest_dir
     )
     
