@@ -98,7 +98,7 @@ def get_images_nsfw_premade(image_dest_dir:str):
     return snapshot_download(
     repo_id="wallstoneai/civitai-top-nsfw-images-with-metadata",
     repo_type="dataset",
-    allow_patterns="images/*.jpg",
+    allow_patterns="images/*.jpeg",
     local_dir=image_dest_dir
     )
     
