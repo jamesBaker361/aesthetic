@@ -112,7 +112,7 @@ def extract_vanilla(
     print("vae type ",type(vae))
     assert_no_nan(vae)
             
-    path_list=[f for f in os.listdir(src_dir) if f.endswith(".jpg")]
+    path_list=[f for f in os.listdir(src_dir) if f.endswith(".jpg") or f.endswith("jpeg")]
     count=len([p for p in os.listdir(save_dir) if p.endswith(".npz")])
     
     print(f"processed {count}/{len(path_list)} images")
