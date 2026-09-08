@@ -398,6 +398,7 @@ def run_regression(block:str,y_column:str,
                    stats_dest_dir:str,
                    threshold:float,
                    weight_by_importance:bool):
+    print("run regression")
     score_key=f"{block}.{y_column}"
     image_score_key=f"image_{y_column}_score"
     os.makedirs(stats_dest_dir,exist_ok=True)
@@ -410,9 +411,10 @@ def run_regression(block:str,y_column:str,
         for f in os.listdir(clip_src_dir)
         if f.endswith("npz")
     ]
+    
     if limit>=0:
         file_list=file_list[:limit]
-
+    print("len file list", len(file_list))
     # streamed first/second-moment accumulation (per feature) over every kept
     # patch, so we never have to hold every image's patches in memory at once
     x_sum=x_sq_sum=xy_sum=None
