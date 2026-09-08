@@ -94,13 +94,24 @@ parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
 # regress scores on activations
 # 
 
-def get_images_nsfw_premade(image_dest_dir:str):
-    print("get images ")
-    return snapshot_download(
-    repo_id="wallstoneai/civitai-top-nsfw-images-with-metadata",
-    repo_type="dataset",
-    local_dir=image_dest_dir
+def get_images_nsfw_premade(image_dest_dir: str):
+    print("get images")
+
+    snapshot_download(
+        repo_id="wallstoneai/civitai-top-nsfw-images-with-metadata",
+        repo_type="dataset",
+        local_dir=image_dest_dir
     )
+
+    subdir = os.path.join(image_dest_dir, "images")
+
+    for file in os.listdir(subdir):
+        if file.lower().endswith((".jpeg", ".jpg")):
+            src = os.path.join(subdir, file)
+            dst = os.path.join(image_dest_dir, file)
+            shutil.copy2(src, dst)
+
+    return image_dest_dir
     
 
 def get_images(image_dest_dir:str,
