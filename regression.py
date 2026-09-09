@@ -324,7 +324,7 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
     
     img_pro=VaeImageProcessor()
 
-    files=[f for f in os.listdir(image_src_dir) if f.endswith("jpg")]
+    files=[f for f in os.listdir(image_src_dir) if f.endswith("jpg") or f.endswith("jpeg")]
     if limit>=0:
         files=files[:limit]
     for n, file in enumerate(files):
