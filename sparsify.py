@@ -12,6 +12,7 @@ from tqdm import tqdm
 from PIL import Image
 import time
 import heapq
+import cv2
 from concurrent.futures import ThreadPoolExecutor
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
 from experiment_helpers.gpu_details import print_details
@@ -143,6 +144,71 @@ def get_top_k_images(block:str,
     heap.sort(reverse=True)
     return [Image.open(os.path.join(image_src_dir, f[1])).resize((256, 256)) for f in heap]
 
+def get_top_k_images_highlighted(block:str,
+                                 index:int,
+                                 k:int=10,
+                                 sparse_dest_dir:str="sparse_embeddings",
+                                 image_src_dir:str="artificial_nsfw",
+                                 extension:str="jpeg",
+                                 limit:int=1_000_000,
+                                 size:int=256)->list[Image.Image]:
+    '''
+    Same top-k selection as get_top_k_images, but each returned image has the
+    `index` feature's per-patch activation overlaid as a heatmap (same style as
+    the nsfw/aesthetic importance maps in regression.py's get_maps), so you can
+    see where in the image that feature fires, not just which images score highest.
+    '''
+    files = [f for f in os.listdir(image_src_dir) if f.endswith(extension)]
+    if limit>=0:
+        files=files[:limit]
+
+    def load_score(file):
+        npz_path = os.path.join(sparse_dest_dir, file.replace(extension, ".npz"))
+        if not os.path.exists(npz_path):
+            npz_path = os.path.join(sparse_dest_dir, file + ".npz")
+        if not os.path.exists(npz_path):
+            return None
+        npz_dict = np.load(npz_path)
+        sparse_embedding = npz_dict[block]  # (h, w, num_features)
+        return float(np.max(sparse_embedding[..., index])), file
+
+    heap = []  # min-heap of (score, file), size <= k
+    with ThreadPoolExecutor() as executor:
+        for result in tqdm(executor.map(load_score, files), total=len(files), desc="Scoring"):
+            if result is None:
+                continue
+            score, file = result
+            if len(heap) < k:
+                heapq.heappush(heap, (score, file))
+            elif score > heap[0][0]:
+                heapq.heapreplace(heap, (score, file))
+    heap.sort(reverse=True)
+
+    highlighted=[]
+    for score,file in heap:
+        img=Image.open(os.path.join(image_src_dir, file)).convert("RGB").resize((size, size))
+        img_np=np.array(img)
+
+        npz_path = os.path.join(sparse_dest_dir, file.replace(extension, ".npz"))
+        if not os.path.exists(npz_path):
+            npz_path = os.path.join(sparse_dest_dir, file + ".npz")
+        activation = np.load(npz_path)[block][..., index]  # (h, w)
+
+        # Normalize to [0,1] and upsample (nearest, since each cell is a whole
+        # patch) to the image size.
+        activation = activation - activation.min()
+        activation = activation / (activation.max() + 1e-8)
+        activation = cv2.resize(activation.astype(np.float32), (size, size), interpolation=cv2.INTER_NEAREST)
+
+        heatmap_uint8 = np.uint8(255 * np.clip(activation, 0, 1) ** 0.5)
+        heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_BONE)
+        heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+
+        overlay = cv2.addWeighted(img_np, 0.6, heatmap_color, 0.4, 0)
+        highlighted.append(Image.fromarray(np.uint8(255 - overlay)))
+
+    return highlighted
+
 if __name__=="__main__":
     print_details()
     """
@@ -181,9 +247,9 @@ block up_blocks.0.attentions.1 tensor([4052, 1888, 3397, 2837, 1861, 3653,  980,
     for k,(feature_list, block) in enumerate(zip(feature_list,block_list)):
         big_img_list=[]
         for f in feature_list:
-            img_list=get_top_k_images(block,f,5,limit=-1)
+            img_list=get_top_k_images_highlighted(block,f,5,limit=-1)
             img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
             big_img_list.append(img)
-        concat_images_vertically(big_img_list).save(f"sparse_{block}.png")
+        concat_images_vertically(big_img_list).save(f"highlighted_{block}.png")
     print('all done')
             
