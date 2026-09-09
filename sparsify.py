@@ -111,8 +111,8 @@ def get_top_k_images(block:str,
         if not os.path.exists(npz_path):
             return None
         npz_dict = np.load(npz_path)
-        sparse_embedding = npz_dict[block]
-        return float(np.max(sparse_embedding[:, index])), file
+        sparse_embedding = npz_dict[block]  # (h, w, num_features)
+        return float(np.max(sparse_embedding[..., index])), file
     
     print(f"found {len(files)} images in {image_src_dir}")
     file=files[0]
