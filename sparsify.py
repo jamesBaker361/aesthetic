@@ -91,15 +91,21 @@ def sparsify_embeddings(sparse_dest_dir:str="sparse_embeddings",embedding_src_di
         np.savez(new_path,**result)
         
         
-def get_top_k_images(block:str,index:int,k:int=10,image_src_dir:str= "laion",limit:int=1_000_000)->list[Image.Image]:
-    files = [f for f in os.listdir(image_src_dir) if f.endswith("jpg")]
+def get_top_k_images(block:str,
+                     index:int,
+                     k:int=10,
+                     sparse_dest_dir:str="sparse_embeddings",
+                     image_src_dir:str= "artificial_nsfw",
+                     extension:str="jpeg",
+                     limit:int=1_000_000)->list[Image.Image]:
+    files = [f for f in os.listdir(image_src_dir) if f.endswith(extension)]
     if limit>=0:
         files=files[:limit]
         
     print(f"found {len(files)} images in {image_src_dir}")
 
     def load_score(file):
-        npz_path = os.path.join(sparse_dest_dir, file.replace(".jpg", ".npz"))
+        npz_path = os.path.join(sparse_dest_dir, file.replace(extension, ".npz"))
         if not os.path.exists(npz_path):
             npz_path = os.path.join(sparse_dest_dir, file + ".npz")
         if not os.path.exists(npz_path):
@@ -110,7 +116,7 @@ def get_top_k_images(block:str,index:int,k:int=10,image_src_dir:str= "laion",lim
     
     print(f"found {len(files)} images in {image_src_dir}")
     file=files[0]
-    npz_path = os.path.join(sparse_dest_dir, file.replace(".jpg", ".npz"))
+    npz_path = os.path.join(sparse_dest_dir, file.replace(extension, ".npz"))
     if not os.path.exists(npz_path):
         npz_path = os.path.join(sparse_dest_dir, file + ".npz")
     print(f"{npz_path} might exist")
@@ -139,37 +145,45 @@ def get_top_k_images(block:str,index:int,k:int=10,image_src_dir:str= "laion",lim
 
 if __name__=="__main__":
     print_details()
+    """
+    down_blocks.2.attentions.1/nsfw: 169962 patches kept (threshold=0.9), mean r2=0.0000 max r2=0.0058
+statistics/down_blocks.2.attentions.1/regression_down_blocks.2.attentions.1_nsfw.npz
+block down_blocks.2.attentions.1 tensor([ 245, 4001, 4960, 1973, 2586, 3490, 1563, 1648, 2378, 5111])
+run regression
+len file list 6537
+mid_block.attentions.0/nsfw: 169962 patches kept (threshold=0.9), mean r2=0.0000 max r2=0.0007
+statistics/mid_block.attentions.0/regression_mid_block.attentions.0_nsfw.npz
+block mid_block.attentions.0 tensor([4589, 3454,  661, 2928,  242, 4528, 1127, 4338,  983, 4880])
+run regression
+len file list 6537
+up_blocks.0.attentions.0/nsfw: 169962 patches kept (threshold=0.9), mean r2=0.0000 max r2=0.0071
+statistics/up_blocks.0.attentions.0/regression_up_blocks.0.attentions.0_nsfw.npz
+block up_blocks.0.attentions.0 tensor([4856, 1991, 4398, 4746,  127, 3985,  572, 1744, 4751,  487])
+run regression
+len file list 6537
+up_blocks.0.attentions.1/nsfw: 169962 patches kept (threshold=0.9), mean r2=0.0000 max r2=0.0044
+statistics/up_blocks.0.attentions.1/regression_up_blocks.0.attentions.1_nsfw.npz
+block up_blocks.0.attentions.1 tensor([4052, 1888, 3397, 2837, 1861, 3653,  980,  825, 3347, 5106])
+    """
+    
     
     block_list=[
         "mid_block.attentions.0","down_blocks.2.attentions.1",
         "up_blocks.0.attentions.0","up_blocks.0.attentions.1"
     ]
-    
-    save_path_list=[
-        f"statistics/{block}/regression_{block}_aesthetic.pt" for block in block_list
-        
+    feature_list=[
+        [4589, 3454,  661, 2928,  242, 4528],
+        [ 245, 4001, 4960, 1973, 2586,3490],
+        [4856, 1991, 4398, 4746,  127, 3985],
+        [4052, 1888, 3397, 2837, 1861, 3653]
     ]
-    for k,block in enumerate(block_list):
-        save_path=f"statistics/{block}/regression_{block}_aesthetic.pt"
+    
+    for k,(feature_list, block) in enumerate(zip(feature_list,block_list)):
         big_img_list=[]
-        print(save_path)
-        try:
-            weights_dict=torch.load(save_path)["model_state_dict"]
-        except RuntimeError:
-            weights_dict=torch.load(save_path, map_location=torch.device('cpu'))["model_state_dict"]
-        print(type(weights_dict))
-        print(len(weights_dict))
-        print([k for k in weights_dict])
-        sparse_filter=weights_dict[[k for k in weights_dict][0]]
-        select_mask,indices=top_n_mask(sparse_filter,5)
-        for n in indices:
-            start=time.time()
-            img_list=get_top_k_images(block,n,limit=-1)
+        for f in feature_list:
+            img_list=get_top_k_images(block,f,5,limit=-1)
             img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
-            end=time.time()
-            print(f"elpased {end-start}")
             big_img_list.append(img)
-        
-        concat_images_vertically(big_img_list).save(f"sparse_{k}.png")
+        concat_images_vertically(big_img_list).save(f"sparse_{block}.png")
     print('all done')
             
