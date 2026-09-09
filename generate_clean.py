@@ -512,9 +512,9 @@ def main(args):
     pipe = HookedStableDiffusionXLWithUNetPipeline.from_pretrained(
             'stabilityai/sdxl-turbo',
             torch_dtype=dtype,
-            device_map="balanced",
+            #device_map="balanced",
             variant=("fp16" if dtype==torch.float16 else None)
-        )
+        ).to(device)
     
     
     #generate images and edit them somehow (SAEURON just negates bad concepts)
@@ -549,7 +549,7 @@ def main(args):
                     if mode=="diff":
                         out=out-inp
                     sae:SparseAutoencoder=getattr(module,SAE_PRETRAINED)
-                    out=sae_forward_filtered(sae,out,getattr(module,WEIGHT_FILTER))
+                    out=sae_forward_filtered(sae,out,getattr(module,WEIGHT_FILTER)).to(device)
                     output = (out, *output[1:]) if isinstance(output,tuple) else out
                 setattr(module,COUNTER,step+1)
                 return output
