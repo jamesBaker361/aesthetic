@@ -128,8 +128,8 @@ def get_maps(pil_img: Image.Image,
         #importance = torch.abs(importance).sum(dim=-1)            # [N] should we sum? 
         importance=importance.norm(dim=-1)'''
         
-        #second importance this time for dot product with cls thing
-        
+        #second importance this time for dot product with cls thing- its dogshit
+        continue
         cls=target_hidden_state[0,0, :]
         acts  = target_hidden_state[0, 1:, :]
         importance = torch.stack([torch.dot(cls, a) for a in acts])
@@ -223,7 +223,7 @@ def get_maps(pil_img: Image.Image,
     
     concat2=concat_images_horizontally([avg_pil,max_pil])
 
-    return img,concat2
+    return img,concat2,score
 
 def get_importance(pil_img: Image.Image,
              nsfw_model,
@@ -467,7 +467,8 @@ def run_regression(block:str,y_column:str,
 
 
 if __name__=="__main__":
-    n=10
+    n=20
+    os.makedirs("maps",exist_ok=True)
     nsfw_model=get_nsfw_model()
     aesthetic_model=get_aesthetic_model()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -478,12 +479,12 @@ if __name__=="__main__":
         path=os.path.join("artificial_nsfw", file)
         print(k)
         img=Image.open(path)
-        concat,_=get_maps(img,nsfw_model,
+        concat,_,score=get_maps(img,nsfw_model,
                         aesthetic_model,
                         device,
                         processor,
                         clip_model)
         img_list.append(concat)
-        concat.save(f"heat_{k}.png")
+        concat.save(f"maps/heat_{k}.png")
 
         print("all done!")
