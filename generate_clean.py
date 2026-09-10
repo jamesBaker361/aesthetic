@@ -31,7 +31,7 @@ import nltk
 from nltk.corpus import wordnet as wn
 from sdxl_extract import extract_vanilla
 from sparsify import sparsify_embeddings, top_n_mask
-from regression import run_regression,clip_attribution,get_importance
+from regression import run_regression,clip_attribution,get_importance,run_top_k_features_popularity_contest
 from rewards import get_aesthetic_model,get_nsfw_model
 from transformers import CLIPVisionModelWithProjection,CLIPImageProcessor,CLIPProcessor,CLIPModel
 from peft import LoraConfig
@@ -68,6 +68,7 @@ parser.add_argument("--disable_sparsify_embeddings",action="store_true")
 parser.add_argument("--disable_clip_attribution",action="store_true")
 parser.add_argument("--disable_run_regression",action="store_true")
 parser.add_argument("--disable_train_lora",action="store_true")
+parser.add_argument("--disable_top_k_popularity_contest",action="store_true")
 parser.add_argument("--lora_dir",type=str,default="lora")
 parser.add_argument("--top_k",type=int,default=10)
 parser.add_argument("--aesthetic_prompt",action="store_true")
@@ -114,6 +115,8 @@ def get_images_nsfw_premade(image_dest_dir: str):
                 shutil.copy2(src, dst)
 
     return image_dest_dir
+
+
     
 
 def get_images(image_dest_dir:str,
@@ -426,6 +429,7 @@ def main(args):
     disable_clip_attribution:bool=args.disable_clip_attribution
     disable_run_regression:bool=args.disable_run_regression
     disable_train_lora:bool=args.disable_train_lora
+    disable_top_k_popularity_contest:bool=args.disable_top_k_popularity_contest
     aesthetic_prompt:bool=args.aesthetic_prompt
     nsfw_prompt:bool=args.nsfw_prompt
     random_prompt:bool=args.random_prompt
@@ -471,6 +475,13 @@ def main(args):
     if not disable_clip_attribution:
         clip_attribution(image_dest_dir,clip_dir,clip_limit)
     
+    sae_checkpoints="./sdxl_unbox/checkpoints/"
+    sae_dict:dict[str,SparseAutoencoder]={}
+    for block in block_list:
+        sae_dict[block]=SparseAutoencoder.load_from_disk(
+            os.path.join(sae_checkpoints,f"unet.{block}_k10_hidden5120_auxk256_bs4096_lr0.0001","final"),
+        )
+
     # filter_dict: 1.0 at the top_k features most correlated with y_column, 0.0 elsewhere.
     #   Used by train_lora to target exactly those features in its suppression loss.
     # zero_filter_dict: the inverse (0.0 at the top_k features, 1.0 elsewhere).
@@ -490,13 +501,17 @@ def main(args):
             print(f"block {block}", indices)
             filter_dict[block]=select_mask
             zero_filter_dict[block]=1.0-select_mask
-
-    sae_checkpoints="./sdxl_unbox/checkpoints/"
-    sae_dict:dict[str,SparseAutoencoder]={}
-    for block in block_list:
-        sae_dict[block]=SparseAutoencoder.load_from_disk(
-            os.path.join(sae_checkpoints,f"unet.{block}_k10_hidden5120_auxk256_bs4096_lr0.0001","final"),
-        )
+            
+    if not disable_top_k_popularity_contest:
+        for block in block_list:
+            sorted_dict=run_top_k_features_popularity_contest(block,y_column,clip_dir,)
+            indices=list(sorted_dict.keys())[:top_k]
+            print(f"block {block}", indices)
+            dim=sae_dict[block].n_dirs_local
+            select_mask=torch.zeros(dim)
+            select_mask[indices]=1.0
+            filter_dict[block]=select_mask
+            zero_filter_dict[block]=1.0-select_mask
 
     if not disable_train_lora:
         train_lora(lora_dir,lora_rank,device,lora_epochs,image_dest_dir,lora_batch_size,accelerator,0.0001,filter_dict,sae_dict,lora_use_mask,lora_use_filter,lora_use_noise,size,mode)

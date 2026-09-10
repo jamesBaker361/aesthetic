@@ -463,7 +463,7 @@ def run_regression(block:str,y_column:str,
     np.savez(save_path,a=a,b=b,r2=r2,r=r)
     return save_path
         
-def run_top_k_features(block:str,y_column:str,
+def run_top_k_features_popularity_contest(block:str,y_column:str,
                          clip_src_dir:str,
                          limit:int=-1,
                          k:int=10):
@@ -498,7 +498,7 @@ def run_top_k_features(block:str,y_column:str,
             for index in indices:
                 count_dict[index]+=1
 
-    return sorted(count_dict.items(), key=lambda x: x[1],reverse=True)
+    return dict(sorted(count_dict.items(), key=lambda x: x[1],reverse=True))
             
             
 
