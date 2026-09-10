@@ -110,7 +110,8 @@ def get_images_nsfw_premade(image_dest_dir: str):
         if file.lower().endswith((".jpeg", ".jpg")):
             src = os.path.join(subdir, file)
             dst = os.path.join(image_dest_dir, file)
-            shutil.copy2(src, dst)
+            if not os.path.exists(dst):
+                shutil.copy2(src, dst)
 
     return image_dest_dir
     
