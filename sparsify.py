@@ -234,14 +234,16 @@ block up_blocks.0.attentions.1 tensor([4052, 1888, 3397, 2837, 1861, 3653,  980,
     
     
     block_list=[
-        "mid_block.attentions.0","down_blocks.2.attentions.1",
-        "up_blocks.0.attentions.0","up_blocks.0.attentions.1"
+        "down_blocks.2.attentions.1",
+        "mid_block.attentions.0",
+        "up_blocks.0.attentions.0",
+        "up_blocks.0.attentions.1"
     ]
     feature_list=[
-        [4589, 3454,  661, 2928,  242, 4528],
-        [ 245, 4001, 4960, 1973, 2586,3490],
-        [4856, 1991, 4398, 4746,  127, 3985],
-        [4052, 1888, 3397, 2837, 1861, 3653]
+        [4843, 3701, 433, 4781, 2940, 4030, 2611, 4017, 1237, 2991],
+        [ 4589, 3454,  661, 2928,  242, 4528, 1127, 4338,  983, 4880],
+        [4856, 1991, 4398, 4746,  127, 3985,  572, 1744, 4751,  487],
+        [4052, 1888, 3397, 2837, 1861, 3653,  980,  825, 3347, 5106]
     ]
     
     for k,(feature_list, block) in enumerate(zip(feature_list,block_list)):
