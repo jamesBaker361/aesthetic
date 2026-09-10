@@ -48,14 +48,6 @@ def get_maps(pil_img: Image.Image,
         score=-nsfw_model(image_embeds)
         score.backward()
     img_list=[]
-    try:
-        pass
-        npz_dict=dict(np.load(os.path.join(sparse_dir, file.replace("jpg","npz"))))
-        npz_dict["aesthetic"]=score.cpu().detach().numpy()
-        npz_dict["nsfw"]=0.
-        np.savez(os.path.join(dest_dir,file.replace("jpg","npz")), ** npz_dict)
-    except (FileNotFoundError,NameError):
-        pass
     clip_grad_maps=[]
     for layer_idx,target_hidden_state in enumerate(hidden_states): # so the middle 4 layers seem to be the only not totally dogshit- maybe we should pool
         #if use_grad:
@@ -483,7 +475,7 @@ if __name__=="__main__":
     for file in [f for f in os.listdir("artificial_nsfw") if f.endswith("jpeg")][:n]:
        path=os.path.join("artificial_nsfw", file)
        img=Image.open(path)
-       _,concat=get_maps(img,nsfw_model,
+       concat,_=get_maps(img,nsfw_model,
                     aesthetic_model,
                     device,
                     processor,
@@ -492,3 +484,4 @@ if __name__=="__main__":
        
     vertical=concat_images_vertically(img_list)
     vertical.save("heat.png")
+    print("all done!")
