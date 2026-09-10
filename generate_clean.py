@@ -481,6 +481,8 @@ def main(args):
         sae_dict[block]=SparseAutoencoder.load_from_disk(
             os.path.join(sae_checkpoints,f"unet.{block}_k10_hidden5120_auxk256_bs4096_lr0.0001","final"),
         )
+        
+    print("loaded saes")
 
     # filter_dict: 1.0 at the top_k features most correlated with y_column, 0.0 elsewhere.
     #   Used by train_lora to target exactly those features in its suppression loss.
