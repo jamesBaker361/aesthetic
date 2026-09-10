@@ -467,6 +467,7 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
                          clip_src_dir:str,
                          limit:int=-1,
                          k:int=10):
+    print("run_top_k_features_popularity_contest")
     score_key=f"{block}.{y_column}"
     image_score_key=f"image_{y_column}_score"
     
