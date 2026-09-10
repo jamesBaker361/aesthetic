@@ -509,6 +509,7 @@ def main(args):
             sorted_dict=run_top_k_features_popularity_contest(block,y_column,clip_dir,)
             indices=list(sorted_dict.keys())[:top_k]
             print(f"block {block}", indices)
+            print("values ",list(sorted_dict.values())[:top_k])
             dim=sae_dict[block].n_dirs_local
             select_mask=torch.zeros(dim)
             select_mask[indices]=1.0

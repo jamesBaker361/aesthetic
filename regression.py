@@ -522,8 +522,17 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
 
     nsfw_count_dict={key:value/nsfw_count for key,value in nsfw_count_dict.items()}
     sfw_count_dict={key:value/sfw_count for key,value in sfw_count_dict.items()}
+    
+    
+    relative_dict={}
+    
+    for key,value in nsfw_count_dict.items():
+        denominator=1e-8
+        if key in sfw_count_dict:
+            denominator=sfw_count_dict[key]
+        relative_dict[key]=value/denominator
 
-    return dict(sorted(nsfw_count_dict.items(), key=lambda x: x[1],reverse=True))
+    return dict(sorted(relative_dict.items(), key=lambda x: x[1],reverse=True))
             
             
 
