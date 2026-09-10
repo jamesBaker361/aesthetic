@@ -128,6 +128,8 @@ def get_maps(pil_img: Image.Image,
         #importance = torch.abs(importance).sum(dim=-1)            # [N] should we sum? 
         importance=importance.norm(dim=-1)'''
         
+        #second importance this time for dot product with cls thing
+        
         cls=target_hidden_state[0,0, :]
         acts  = target_hidden_state[0, 1:, :]
         importance = torch.stack([torch.dot(cls, a) for a in acts])
@@ -481,7 +483,6 @@ if __name__=="__main__":
                     processor,
                     clip_model)
        img_list.append(concat)
-       
-    vertical=concat_images_vertically(img_list)
-    vertical.save("heat.png")
+       concat.save(f"heat_{n}.png")
+
     print("all done!")
