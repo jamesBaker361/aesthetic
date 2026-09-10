@@ -112,6 +112,8 @@ def get_maps(pil_img: Image.Image,
         
         big_img=concat_images_vertically([pil_img,heat_map_pil])
         
+        img_list.append(big_img)
+        
         #img_list.append(pil_img)
         
         #second importance
