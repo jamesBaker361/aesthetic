@@ -473,100 +473,22 @@ def run_regression(block:str,y_column:str,
 
 
 if __name__=="__main__":
-    info_path="laion/info.csv"
-    sparse_dir="sparse_embeddings"
-    dest_dir="statistics"
-
-    os.makedirs(dest_dir,exist_ok=True)
-    parser=argparse.ArgumentParser()
-    parser.add_argument("--y_column",type=str,default="aesthetic") #column 0 = aesthetic column = 1 = p(unsafe)
-    parser.add_argument("--block",type=str,default="down_blocks.2.attentions.1")
-    parser.add_argument("--limit",type=int,default=-1)
-    
-    clip_attribution("test_imgs","test_maps",-1)
-    
-    exit(0)
-    print_args(parser)
-    args=parser.parse_args()
-    print(args)
-    indep_chunks=[]
-    dependent=[]
-    with open(info_path,"r") as file:
-        for l,line in enumerate(tqdm(file)):
-            if l==args.limit:
-                break
-            [imgpath,aesthetic,punsafe]=line.strip().split(",")
-            imgpath=imgpath.split("/")[1]
-            aesthetic=float(aesthetic)
-            punsafe=float(punsafe)
-            target={
-                "aesthetic":aesthetic,
-                "punsafe":punsafe
-            }[args.y_column]
-            if l<10:
-                print(target)
-            npz_file=os.path.join(sparse_dir,imgpath+".npz")
-            if os.path.exists(npz_file):
-                features=np.load(npz_file)[args.block]
-                if l<10:
-                    print(features.shape)
-                mask=np.isfinite(features).all(axis=1)
-                features=features[mask]
-                if len(features):
-                    indep_chunks.append(features)
-                    dependent.extend([target]*len(features))
-            elif l<10:
-                print(npz_file,"doesnt exists")
-
-    print(" len samples",len(dependent))
-
-    independent=np.vstack(indep_chunks)
-    del indep_chunks
-    dependent=np.array(dependent)
-
-    indep_mean = independent.mean(axis=0)
-    indep_std = independent.std(axis=0)
-    indep_std[indep_std == 0] = 1
-    independent = (independent - indep_mean) / indep_std
-    
-    t0=time.time()
-    covariance=np.cov(independent,rowvar=False)
-    print(f"covariance: {time.time()-t0:.2f}s")
-    
-    independent = np.hstack([independent, np.ones((independent.shape[0], 1))])
-
-    dep_mean = dependent.mean()
-    dep_std = dependent.std()
-    dependent = (dependent - dep_mean) / dep_std
-
-    indep_train, indep_test, dep_train, dep_test = train_test_split(
-        independent, dependent, test_size=0.05, random_state=42)
-
-    for var,name in zip([indep_train, indep_test, dep_train, dep_test,independent,dependent],
-                        ["indep_train", "indep_test", "dep_train", "dep_test","independent","dependent"]):
-        print(name,var.shape)
-
-    npz_dict={}
-    for solver_class,name in zip(
-            [LinearRegression,ElasticNet,Ridge,Lasso],
-            ["LinearRegression","ElasticNet","Ridge","Lasso"]):
-        model=solver_class()
-        t0=time.time()
-        model.fit(indep_train,dep_train)
-        preds=model.predict(indep_test)
-        mse=mean_squared_error(dep_test,preds)
-        r2=r2_score(dep_test,preds)
-        print(f"{name} {time.time()-t0:.2f}s  mse={mse:.4f}  r2={r2:.4f}")
-        npz_dict[f"{name}_coef"]=model.coef_
-        for key,value in model.get_params().items():
-            npz_dict[f"{name}_{key}"]=value
-
-    save_dir=os.path.join(dest_dir,args.block)
-    os.makedirs(save_dir,exist_ok=True)
-    np.savez(os.path.join(save_dir,args.y_column),
-             covar=covariance,
-             indep_mean=indep_mean,
-             dep_mean=dep_mean,
-             indep_std=indep_std,
-             dep_std=dep_std,**npz_dict)
-    
+    n=10
+    nsfw_model=get_nsfw_model()
+    aesthetic_model=get_aesthetic_model()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    img_list=[]
+    clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").to(device)
+    processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
+    for file in [f for f in os.listdir("artificial_nsfw") if f.endswith("jpeg")][:n]:
+       path=os.path.join("artificial_nsfw", file)
+       img=Image.open(path)
+       _,concat=get_maps(img,nsfw_model,
+                    aesthetic_model,
+                    device,
+                    processor,
+                    clip_model)
+       img_list.append(concat)
+       
+    vertical=concat_images_vertically(img_list)
+    vertical.save("heat.png")
