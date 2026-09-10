@@ -477,13 +477,13 @@ if __name__=="__main__":
     processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
     for k,file in enumerate([f for f in os.listdir("artificial_nsfw") if f.endswith("jpeg")][:n]):
         path=os.path.join("artificial_nsfw", file)
-        print(k)
         img=Image.open(path)
         concat,_,score=get_maps(img,nsfw_model,
                         aesthetic_model,
                         device,
                         processor,
                         clip_model)
+        print(k,score)
         img_list.append(concat)
         concat.save(f"maps/heat_{k}.png")
 
