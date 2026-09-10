@@ -338,6 +338,8 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
             avg_nsfw=torch.stack(importance_nsfw).mean(dim=0)
             dest_path=os.path.join(dest_dir,npz_file)
             with np.load(os.path.join(sparse_dir,npz_file)) as old_npz:
+                if os.path.exists(dest_path):
+                    continue
                 # whole-image scores, constant across all patches/blocks of this image
                 save_dict={
                     "image_aesthetic_score":aesthetic_score,
