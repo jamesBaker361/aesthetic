@@ -468,6 +468,7 @@ def run_regression(block:str,y_column:str,
 def run_top_k_features_popularity_contest(block:str,y_column:str,
                          clip_src_dir:str,
                          limit:int=-1,
+                         quantile_threshold: float=0.9,
                          k:int=10):
     print("run_top_k_features_popularity_contest")
     score_key=f"{block}.{y_column}"
@@ -483,25 +484,46 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
         file_list=file_list[:limit]
     print("len file list", len(file_list))
     
-    count_dict=defaultdict(lambda: 0)
+    nsfw_count_dict=defaultdict(lambda: 0)
+    sfw_count_dict=defaultdict(lambda: 0)
+    
+    nsfw_count =0
+    sfw_count=0
     
     for file in file_list:
         with np.load(file) as data:
             if block not in data or score_key not in data or image_score_key not in data:
                 continue
             score=data[image_score_key]
-            if score <0.9:
-                continue
+            if score >0.9:
+                nsfw_count+=1
 
-            # top k feature indices for this image, ranked by each feature's
-            # max activation over all patches (same per-feature max used by
-            # get_top_k_images in sparsify.py)
-            feature_max=data[block].reshape(-1,data[block].shape[-1]).max(axis=0)
-            indices=np.argsort(feature_max)[::-1][:k]
-            for index in indices:
-                count_dict[index]+=1
+                # only take the patches whose per-patch importance quantile is
+                # in the top quantile_threshold (quantile in [0,1], see
+                # get_maps), then rank those kept patches' features by max
+                # activation - mirrors the sfw branch below but restricted to
+                # the most important patches instead of every patch
+                quantiles=data[score_key].reshape(-1)
+                keep=quantiles>=quantile_threshold
+                if keep.any():
+                    kept_features=data[block].reshape(-1,data[block].shape[-1])[keep]
+                    feature_max=kept_features.max(axis=0)
+                    indices=np.argsort(feature_max)[::-1][:k]
+                    for index in indices:
+                        nsfw_count_dict[index]+=1
+            
+            if score < 0.5:
+                sfw_count+=1
+                
+                feature_max=data[block].reshape(-1,data[block].shape[-1]).max(axis=0)
+                indices=np.argsort(feature_max)[::-1][:k]
+                for index in indices:
+                    sfw_count_dict[index]+=1
 
-    return dict(sorted(count_dict.items(), key=lambda x: x[1],reverse=True))
+    nsfw_count_dict={key:value/nsfw_count for key,value in nsfw_count_dict.items()}
+    sfw_count_dict={key:value/sfw_count for key,value in sfw_count_dict.items()}
+
+    return dict(sorted(nsfw_count_dict.items(), key=lambda x: x[1],reverse=True))
             
             
 
