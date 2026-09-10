@@ -336,7 +336,7 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
 
             avg_aesthetic=torch.stack(importance_aesthetic).mean(dim=0)
             avg_nsfw=torch.stack(importance_nsfw).mean(dim=0)
-
+            dest_path=os.path.join(dest_dir,npz_file)
             with np.load(os.path.join(sparse_dir,npz_file)) as old_npz:
                 # whole-image scores, constant across all patches/blocks of this image
                 save_dict={
@@ -379,7 +379,7 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
                         quantile = (ranks / max(flat.numel() - 1, 1)).reshape(h, w)
                         save_dict[f"{block}.{y_value}"]=quantile.cpu().numpy()
 
-            np.savez(os.path.join(dest_dir,npz_file), **save_dict)
+            np.savez(dest_path, **save_dict)
 
 # For each of the `dim` SAE/UNet features in `block`, fit its OWN univariate
 # regression y=a*x+b (closed-form OLS, not gradient descent - there's no joint
