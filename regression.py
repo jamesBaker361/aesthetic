@@ -475,14 +475,15 @@ if __name__=="__main__":
     clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").to(device)
     processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
     for k,file in enumerate([f for f in os.listdir("artificial_nsfw") if f.endswith("jpeg")][:n]):
-       path=os.path.join("artificial_nsfw", file)
-       img=Image.open(path)
-       concat,_=get_maps(img,nsfw_model,
-                    aesthetic_model,
-                    device,
-                    processor,
-                    clip_model)
-       img_list.append(concat)
-       concat.save(f"heat_{k}.png")
+        path=os.path.join("artificial_nsfw", file)
+        print(k)
+        img=Image.open(path)
+        concat,_=get_maps(img,nsfw_model,
+                        aesthetic_model,
+                        device,
+                        processor,
+                        clip_model)
+        img_list.append(concat)
+        concat.save(f"heat_{k}.png")
 
-    print("all done!")
+        print("all done!")
