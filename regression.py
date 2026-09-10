@@ -15,6 +15,7 @@ from transformers import AutoTokenizer, CLIPTextModelWithProjection, CLIPVisionM
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from collections import defaultdict
 import torchvision.transforms as transforms
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
 import matplotlib.pyplot as plt
@@ -462,8 +463,44 @@ def run_regression(block:str,y_column:str,
     np.savez(save_path,a=a,b=b,r2=r2,r=r)
     return save_path
         
+def run_top_k_features(block:str,y_column:str,
+                         clip_src_dir:str,
+                         limit:int=-1,
+                         k:int=10):
+    score_key=f"{block}.{y_column}"
+    image_score_key=f"image_{y_column}_score"
+    
+    file_list=[
+        os.path.join(clip_src_dir,f)
+        for f in os.listdir(clip_src_dir)
+        if f.endswith("npz")
+    ]
+    
+    if limit>=0:
+        file_list=file_list[:limit]
+    print("len file list", len(file_list))
+    
+    count_dict=defaultdict(lambda: 0)
+    
+    for file in file_list:
+        with np.load(file) as data:
+            if block not in data or score_key not in data or image_score_key not in data:
+                continue
+            score=data[image_score_key]
+            if score <0.9:
+                continue
 
+            # top k feature indices for this image, ranked by each feature's
+            # max activation over all patches (same per-feature max used by
+            # get_top_k_images in sparsify.py)
+            feature_max=data[block].reshape(-1,data[block].shape[-1]).max(axis=0)
+            indices=np.argsort(feature_max)[::-1][:k]
+            for index in indices:
+                count_dict[index]+=1
 
+    return sorted(count_dict.items(), key=lambda x: x[1],reverse=True)
+            
+            
 
 
 
