@@ -104,9 +104,12 @@ def run_regression(block:str,y_column:str,
         
 def run_top_k_features_popularity_contest(block:str,y_column:str,
                          clip_src_dir:str,
+                         image_test_dir:str,
                          image_src_dir:str="artificial_images",
+                         
                          limit:int=-1,
                          quantile_threshold: float=0.95,
+                         
                          k:int=10):
     print("run_top_k_features_popularity_contest")
     score_key=f"{block}.{y_column}"
@@ -125,7 +128,7 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
     nsfw_count_dict=defaultdict(lambda: 0)
     sfw_count_dict=defaultdict(lambda: 0)
 
-    os.makedirs("gradient",exist_ok=True)
+    os.makedirs(f"{image_test_dir}/gradient",exist_ok=True)
     n_grad_to_save=10
     grad_saved=0
 
@@ -177,7 +180,7 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
 
                         overlay=cv2.addWeighted(img_np,0.6,heatmap_color,0.4,0)
                         Image.fromarray(np.uint8(255-overlay)).save(
-                            os.path.join("gradient",f"{block}_{y_column}_{orig_filename}")
+                            os.path.join(image_test_dir,"gradient",f"{block}_{y_column}_{orig_filename}")
                         )
 
                         # same overlay, but zero out every patch below
@@ -192,7 +195,7 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
 
                         overlay=cv2.addWeighted(img_np,0.6,heatmap_color,0.4,0)
                         Image.fromarray(np.uint8(255-overlay)).save(
-                            os.path.join("gradient",f"{block}_{y_column}_thresholded_{orig_filename}")
+                            os.path.join(image_test_dir,"gradient",f"{block}_{y_column}_thresholded_{orig_filename}")
                         )
 
                         grad_saved+=1

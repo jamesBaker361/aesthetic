@@ -54,7 +54,7 @@ parser.add_argument("--premade",action="store_true")
 parser.add_argument("--size",type=int,default=512)
 parser.add_argument("--method",type=str,default=UNTRAINED)
 parser.add_argument("--image_src_dir",type=str,default="laion")
-parser.add_argument("--image_dest_dir",type=str,default="artificial_images")
+parser.add_argument("--image_src_dir",type=str,default="artificial_images")
 parser.add_argument("--n_random",type=int,default=50)
 parser.add_argument("--embedding_dir",type=str,default="embeddings")
 parser.add_argument("--sparse_embedding_dir",type=str,default="sparse_embeddings")
@@ -88,6 +88,7 @@ parser.add_argument("--lora_rank",type=int,default=4)
 parser.add_argument("--attribution_threshold",type=float,default=0.9) # only patches with clip_attribution quantile >= this feed run_regression
 parser.add_argument("--weight_by_importance",action="store_true") # regress on score*patch_importance instead of the raw whole-image score
 parser.add_argument("--clip_attribution_method",type=str,default="grad_cam")
+parser.add_argument("--image_testing_dir",type=str,default="testing")
 job_id=os.environ["SLURM_JOB_ID"]
 parser.add_argument("--err",type=str,default=f"slurm_chip/generic/{job_id}.err")
 parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
@@ -99,30 +100,30 @@ parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
 # regress scores on activations
 # 
 
-def get_images_nsfw_premade(image_dest_dir: str):
+def get_images_nsfw_premade(image_src_dir: str):
     print("get images")
 
     snapshot_download(
         repo_id="wallstoneai/civitai-top-nsfw-images-with-metadata",
         repo_type="dataset",
-        local_dir=image_dest_dir
+        local_dir=image_src_dir
     )
 
-    subdir = os.path.join(image_dest_dir, "images")
+    subdir = os.path.join(image_src_dir, "images")
 
     for file in os.listdir(subdir):
         if file.lower().endswith((".jpeg", ".jpg")):
             src = os.path.join(subdir, file)
-            dst = os.path.join(image_dest_dir, file)
+            dst = os.path.join(image_src_dir, file)
             if not os.path.exists(dst):
                 shutil.copy2(src, dst)
 
-    return image_dest_dir
+    return image_src_dir
 
 
     
 
-def get_images(image_dest_dir:str,
+def get_images(image_src_dir:str,
                method:str,
                n_random:int,
                size:int,
@@ -131,7 +132,7 @@ def get_images(image_dest_dir:str,
                    nsfw_prompt:bool,
                    random_prompt:bool):
     print("get images")
-    os.makedirs(image_dest_dir,exist_ok=True)
+    os.makedirs(image_src_dir,exist_ok=True)
     
     prompt_list=[]
     if nsfw_prompt:
@@ -160,7 +161,7 @@ def get_images(image_dest_dir:str,
     else:
         raise NotImplementedError(f"method={method} not implemented")
     for p,prompt in enumerate(prompt_list):
-        base_path=f"{image_dest_dir}/base_{p}.jpg"
+        base_path=f"{image_src_dir}/base_{p}.jpg"
         if os.path.exists(base_path):
             continue
         generator=torch.Generator()
@@ -172,7 +173,7 @@ def get_images(image_dest_dir:str,
         base_image.save(base_path)
         if method!=UNTRAINED:
             diff_image=diff_pipe(prompt,height=size,width=size,generator=generator,num_inference_steps=num_inference_steps).images[0]
-            diff_path=f"{image_dest_dir}/diff_{p}.jpg"
+            diff_path=f"{image_src_dir}/diff_{p}.jpg"
             diff_image.save(diff_path)
 
 def get_image_embeds(processor:CLIPImageProcessor,clip_model:CLIPModel,img:Image.Image,device):
@@ -415,8 +416,7 @@ def main(args):
     num_inference_steps : int = args.num_inference_steps
     size : int = args.size
     method : str = args.method
-    image_src_dir : str = args.image_src_dir
-    image_dest_dir:str=args.image_dest_dir
+    image_src_dir:str=args.image_src_dir
     n_random : int = args.n_random
     embedding_dir : str = args.embedding_dir
     sparse_embedding_dir : str = args.sparse_embedding_dir
@@ -447,6 +447,7 @@ def main(args):
     mode:str=args.mode
     out:str=args.out
     err:str=args.err
+    image_testing_dir:str=args.image_testing_dir
     clip_attribution_method:str=args.clip_attribution_method
     premade:bool  = args.premade
     lora_batch_size:int=args.lora_batch_size
@@ -469,20 +470,20 @@ def main(args):
     ]
     if not disable_get_images:
         if premade:
-            get_images_nsfw_premade(image_dest_dir)
+            get_images_nsfw_premade(image_src_dir)
         else:
-            get_images(image_dest_dir,method,n_random,size,num_inference_steps,aesthetic_prompt,nsfw_prompt,random_prompt)
+            get_images(image_src_dir,method,n_random,size,num_inference_steps,aesthetic_prompt,nsfw_prompt,random_prompt)
     if not disable_extract_vanilla:
-        extract_vanilla(embedding_dir,image_dest_dir,limit,size,mixed_precision)
+        extract_vanilla(embedding_dir,image_src_dir,limit,size,mixed_precision)
     if not disable_sparsify_embeddings:
         sparsify_embeddings(sparse_embedding_dir,embedding_dir,mode)
     if not disable_clip_attribution:
         if clip_attribution_method=="grad_cam":
-            clip_attribution(image_dest_dir,clip_dir,clip_limit,sparse_embedding_dir,start_layer,stop_layer)
+            clip_attribution(image_src_dir,clip_dir,clip_limit,sparse_embedding_dir,start_layer,stop_layer)
         elif clip_attribution_method=="integrated":
-            clip_attribution_integrated_gradients(image_dest_dir,clip_dir,clip_limit,sparse_embedding_dir)
+            clip_attribution_integrated_gradients(image_src_dir,clip_dir,clip_limit,sparse_embedding_dir)
         elif clip_attribution_method=="smooth":
-            clip_attribution_smoothgrad(image_dest_dir,clip_dir,clip_limit,sparse_embedding_dir,start_layer,stop_layer)
+            clip_attribution_smoothgrad(image_src_dir,clip_dir,clip_limit,sparse_embedding_dir,start_layer,stop_layer)
     
     sae_checkpoints="./sdxl_unbox/checkpoints/"
     sae_dict:dict[str,SparseAutoencoder]={}
@@ -514,17 +515,18 @@ def main(args):
             zero_filter_dict[block]=1.0-select_mask
             
     if not disable_top_k_popularity_contest:
+        os.makedirs(image_testing_dir,exist_ok=True)
         for block in block_list:
-            sorted_dict,sfw_dict=run_top_k_features_popularity_contest(block,y_column,clip_dir,image_dest_dir)
+            sorted_dict,sfw_dict=run_top_k_features_popularity_contest(block,y_column,clip_dir,image_test_dir=image_testing_dir,image_src_dir= image_src_dir)
             indices=list(sorted_dict.keys())[:top_k]
             print(f"block {block}", indices)
             print("values ",list(sorted_dict.values())[:top_k])
             big_img_list=[]
             for f in indices:
-                img_list=get_top_k_images_highlighted(block,f,5,limit=-1)
+                img_list=get_top_k_images_highlighted(block,f,5,limit=-1,image_src_dir=image_src_dir)
                 img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
                 big_img_list.append(img)
-            concat_images_vertically(big_img_list).save(f"highlighted_{block}.png")
+            concat_images_vertically(big_img_list).save(f"{image_testing_dir}/highlighted_{block}.png")
             
             print("sfw")
             indices=list(sfw_dict.keys())[:top_k]
@@ -532,10 +534,10 @@ def main(args):
             print("safe values ",list(sfw_dict.values())[:top_k])
             big_img_list=[]
             for f in indices:
-                img_list=get_top_k_images_highlighted(block,f,5,limit=-1)
+                img_list=get_top_k_images_highlighted(block,f,5,limit=-1,image_src_dir=image_src_dir)
                 img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
                 big_img_list.append(img)
-            concat_images_vertically(big_img_list).save(f"safe_highlighted_{block}.png")
+            concat_images_vertically(big_img_list).save(f"{image_testing_dir}/safe_highlighted_{block}.png")
             
             dim=sae_dict[block].n_dirs_local
             select_mask=torch.zeros(dim)
@@ -544,7 +546,7 @@ def main(args):
             zero_filter_dict[block]=1.0-select_mask
 
     if not disable_train_lora:
-        train_lora(lora_dir,lora_rank,device,lora_epochs,image_dest_dir,lora_batch_size,accelerator,0.0001,filter_dict,sae_dict,lora_use_mask,lora_use_filter,lora_use_noise,size,mode)
+        train_lora(lora_dir,lora_rank,device,lora_epochs,image_src_dir,lora_batch_size,accelerator,0.0001,filter_dict,sae_dict,lora_use_mask,lora_use_filter,lora_use_noise,size,mode)
 
         #run_regression(block,y_column,regression_limit,clip_dir,stats_dir)
     #load regression means, covariance matrix for each layer
