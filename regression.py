@@ -469,7 +469,7 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
                          clip_src_dir:str,
                          image_src_dir:str="artificial_images",
                          limit:int=-1,
-                         quantile_threshold: float=0.9,
+                         quantile_threshold: float=0.95,
                          k:int=10):
     print("run_top_k_features_popularity_contest")
     score_key=f"{block}.{y_column}"
@@ -501,7 +501,7 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
                 continue
 
             score=data[image_score_key]
-            if score >0.9:
+            if score >0.8:
                 
 
                 # only take the patches whose per-patch importance quantile is
