@@ -292,9 +292,11 @@ def train_lora(lora_dir:str,rank:int,device,epochs:int,image_dir:str,batch_size:
                 out = output[0] if isinstance(output,tuple) else output
                 inp = input[0]  # forward-hook input is always a tuple
                 if mode=="diff":
-                    setattr(module,CACHE,out-inp)
-                else:
-                    setattr(module,CACHE,out)
+                    out=out-inp
+                # cache channel-last (..., d_model) - sae.encode (called on
+                # this cache below) expects that layout, not the hook's raw
+                # channel-first (B,C,H,W)
+                setattr(module,CACHE,out.permute(0,2,3,1))
                 return output
             return hook_fn
         for key in filter_dict:
@@ -599,7 +601,11 @@ def main(args):
                     if mode=="diff":
                         out=out-inp
                     sae:SparseAutoencoder=getattr(module,SAE_PRETRAINED)
-                    out=sae_forward_filtered(sae,out,getattr(module,WEIGHT_FILTER)).to(device)
+                    # the hook's out is channel-first (B,C,H,W); the SAE (like
+                    # everywhere else it's called, e.g. sparsify.py) expects
+                    # channel-last (..., d_model)
+                    out=sae_forward_filtered(sae,out.permute(0,2,3,1),getattr(module,WEIGHT_FILTER))
+                    out=out.permute(0,3,1,2).to(device)
                     output = (out, *output[1:]) if isinstance(output,tuple) else out
                 setattr(module,COUNTER,step+1)
                 return output
