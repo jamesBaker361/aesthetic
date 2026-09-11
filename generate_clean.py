@@ -529,16 +529,19 @@ def main(args):
             concat_images_vertically(big_img_list).save(f"{image_testing_dir}/highlighted_{block}.png")
             
             print("sfw")
-            indices=list(sfw_dict.keys())[:top_k]
-            print(f"safe block {block}", indices)
+            sfw_indices=list(sfw_dict.keys())[:top_k]
+            print(f"safe block {block}", sfw_indices)
             print("safe values ",list(sfw_dict.values())[:top_k])
             big_img_list=[]
-            for f in indices:
+            for f in sfw_indices:
                 img_list=get_top_k_images_highlighted(block,f,5,limit=-1,image_src_dir=image_src_dir)
                 img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
                 big_img_list.append(img)
             concat_images_vertically(big_img_list).save(f"{image_testing_dir}/safe_highlighted_{block}.png")
-            
+
+            # filter/zero_filter target the nsfw-relative top features
+            # (`indices`, from sorted_dict above) - NOT sfw_indices, since
+            # these masks drive train_lora's suppression loss
             dim=sae_dict[block].n_dirs_local
             select_mask=torch.zeros(dim)
             select_mask[indices]=1.0
