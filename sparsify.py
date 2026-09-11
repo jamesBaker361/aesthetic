@@ -93,7 +93,7 @@ def sparsify_embeddings(sparse_dest_dir:str="sparse_embeddings",embedding_src_di
         np.savez(new_path,**result)
         
         
-def _get_top_k_heap(block:str,
+def get_top_k_heap(block:str,
                     index:int,
                     k:int,
                     sparse_dest_dir:str,
@@ -156,7 +156,7 @@ def get_top_k_images(block:str,
                      cache_dir:str="feature_cache",
                      extension:str="jpeg",
                      limit:int=1_000_000)->list[Image.Image]:
-    heap=_get_top_k_heap(block,index,k,sparse_dest_dir,image_src_dir,cache_dir,extension,limit)
+    heap=get_top_k_heap(block,index,k,sparse_dest_dir,image_src_dir,cache_dir,extension,limit)
     return [Image.open(os.path.join(image_src_dir, f[1])).resize((256, 256)) for f in heap]
 
 def get_top_k_images_highlighted(block:str,
@@ -174,7 +174,7 @@ def get_top_k_images_highlighted(block:str,
     the nsfw/aesthetic importance maps in regression.py's get_maps), so you can
     see where in the image that feature fires, not just which images score highest.
     '''
-    heap=_get_top_k_heap(block,index,k,sparse_dest_dir,image_src_dir,cache_dir,extension,limit)
+    heap=get_top_k_heap(block,index,k,sparse_dest_dir,image_src_dir,cache_dir,extension,limit)
 
     highlighted=[]
     for score,file in heap:
