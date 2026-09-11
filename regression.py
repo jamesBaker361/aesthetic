@@ -545,7 +545,7 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
                         grad_saved+=1
                     nsfw_count+=1
             
-            if score < 0.5:
+            if score < 0.75:
                 sfw_count+=1
                 
                 all_features=data[block].reshape(-1,data[block].shape[-1])
@@ -553,6 +553,12 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
                     indices=np.argsort(feature)[::-1][:k]
                     for index in indices:
                         sfw_count_dict[index]+=1
+
+    print(sorted(nsfw_count_dict.items(), key=lambda x: x[1],reverse=True)[:10])
+    print(sorted(sfw_count_dict.items(), key=lambda x: x[1],reverse=True)[:10])
+    
+    print("nsfw count",nsfw_count,nsfw_count/len(file_list))
+    print("sfw count", sfw_count,sfw_count/len(file_list))
 
     nsfw_count_dict={key:value/nsfw_count for key,value in nsfw_count_dict.items()}
     sfw_count_dict={key:value/sfw_count for key,value in sfw_count_dict.items()}
