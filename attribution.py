@@ -19,9 +19,16 @@ from PIL import Image
 from diffusers.image_processor import VaeImageProcessor
 from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 
+from nudenet import NudeDetector
+
 from rewards import get_nsfw_model, get_aesthetic_model
 from experiment_helpers.image_helpers import concat_images_horizontally, concat_images_vertically
 import cv2
+
+# NudeNet classes that don't help localize "explicit content" for
+# clip_attribution_nudenet's purposes - faces, and body regions that are
+# common but not themselves nsfw-specific.
+NUDENET_EXCLUDE_CLASSES = {"FACE_FEMALE", "FACE_MALE", "BELLY_COVERED","BELLY_EXPOSED","ARMPITS_EXPOSED","FEET_EXPOSED","FEET_COVERED"}
 
 
 def get_maps(pil_img: Image.Image,
@@ -378,6 +385,61 @@ def get_importance_integrated_gradients(pil_img: Image.Image,
     return importance_aesthetic,importance_nsfw,float(aesthetic_score.detach().cpu()),float(nsfw_score.detach().cpu())
 
 
+def _save_attribution_npz(dest_path, sparse_npz_path, importance_aesthetic, importance_nsfw, aesthetic_score, nsfw_score):
+    '''
+    Shared by every clip_attribution* variant (gradient-based or NudeNet-
+    based): given a single (H, W) importance map per score, already at the
+    original image resolution, resizes it down to each SAE block's own patch
+    grid and saves the per-patch [0,1] quantile (rank-normalized, not the raw
+    importance value) alongside that block's sparse features and the
+    whole-image scores. See run_regression for how these quantiles get
+    thresholded.
+    '''
+    with np.load(sparse_npz_path) as old_npz:
+        # whole-image scores, constant across all patches/blocks of this image
+        save_dict={
+            "image_aesthetic_score":aesthetic_score,
+            "image_nsfw_score":nsfw_score,
+        }
+        for block in [
+            "down_blocks.2.attentions.1",
+            "mid_block.attentions.0",
+            "up_blocks.0.attentions.0",
+            "up_blocks.0.attentions.1"
+        ]:
+            features=torch.tensor(old_npz[block])
+            (h,w,c)=features.size()
+            save_dict[block]=features.cpu().numpy()
+            for y_value,importance in zip(
+                ["nsfw","aesthetic"],
+                [importance_nsfw,importance_aesthetic]
+            ):
+                # Resize the importance map to match the spatial dimensions (h, w).
+                # Two dimensions are added first to represent batch and channel dimensions,
+                # which F.interpolate expects: [H, W] -> [1, 1, H, W].
+                resized = F.interpolate(
+                    importance.unsqueeze(0).unsqueeze(0),
+                    size=(h, w)
+                )[0, 0]  # Remove the batch and channel dimensions: [1, 1, h, w] -> [h, w]
+
+                # Flatten the 2D importance map into a 1D vector so all pixels can be ranked.
+                flat = resized.flatten()
+
+                # Compute the rank of every value.
+                # flat.argsort() gives the indices that would sort the values.
+                # Applying argsort() again converts those sorted indices into each
+                # element's rank, ranging from 0 (smallest) to N-1 (largest).
+                ranks = flat.argsort().argsort().float()
+
+                # Normalize ranks to the range [0, 1], producing the percentile/quantile
+                # of each pixel rather than using its raw importance value.
+                # max(..., 1) avoids division by zero if there is only one element.
+                quantile = (ranks / max(flat.numel() - 1, 1)).reshape(h, w)
+                save_dict[f"{block}.{y_value}"]=quantile.cpu().numpy()
+
+    np.savez(dest_path, **save_dict)
+
+
 def _clip_attribution_core(image_src_dir:str,dest_dir:str,limit:int,
                      sparse_dir:str,
                      start_layer:int,
@@ -386,9 +448,9 @@ def _clip_attribution_core(image_src_dir:str,dest_dir:str,limit:int,
     # Step 1 of the intended pipeline: rank each spatial patch by how much it
     # drives the nsfw/aesthetic score (via importance_fn's grad*activation
     # maps), then convert that ranking to a [0,1] quantile per patch (see
-    # below). Also stash the whole-image scores themselves - run_regression
-    # needs both: the quantile to threshold/weight patches, the whole-image
-    # score as the target. Shared by clip_attribution and its
+    # _save_attribution_npz). Also stash the whole-image scores themselves -
+    # run_regression needs both: the quantile to threshold/weight patches, the
+    # whole-image score as the target. Shared by clip_attribution and its
     # smoothgrad/integrated-gradients variants - they only differ in
     # importance_fn (which grad they feed the same CAM/quantile pipeline).
     print("clip attributuon")
@@ -404,64 +466,24 @@ def _clip_attribution_core(image_src_dir:str,dest_dir:str,limit:int,
     files=[f for f in os.listdir(image_src_dir) if f.endswith("jpg") or f.endswith("jpeg")]
     if limit>=0:
         files=files[:limit]
-    for n, file in enumerate(files):
+    for file in files:
         npz_file=file+".npz"
-        if os.path.exists(os.path.join(sparse_dir,npz_file)):
+        sparse_path=os.path.join(sparse_dir,npz_file)
+        if not os.path.exists(sparse_path):
+            continue
+        dest_path=os.path.join(dest_dir,npz_file)
+        if os.path.exists(dest_path):
+            continue
 
-            # --- Load image ---
-            pil_img = Image.open(os.path.join(image_src_dir, file)).convert("RGB")
-            importance_aesthetic,importance_nsfw,aesthetic_score,nsfw_score=importance_fn(pil_img,nsfw_model,aesthetic_model,device,processor,clip_model)
-            importance_aesthetic=importance_aesthetic[start_layer:stop_layer]
-            importance_nsfw=importance_nsfw[start_layer:stop_layer]
+        # --- Load image ---
+        pil_img = Image.open(os.path.join(image_src_dir, file)).convert("RGB")
+        importance_aesthetic,importance_nsfw,aesthetic_score,nsfw_score=importance_fn(pil_img,nsfw_model,aesthetic_model,device,processor,clip_model)
+        importance_aesthetic=importance_aesthetic[start_layer:stop_layer]
+        importance_nsfw=importance_nsfw[start_layer:stop_layer]
 
-            avg_aesthetic=torch.stack(importance_aesthetic).mean(dim=0)
-            avg_nsfw=torch.stack(importance_nsfw).mean(dim=0)
-            dest_path=os.path.join(dest_dir,npz_file)
-            with np.load(os.path.join(sparse_dir,npz_file)) as old_npz:
-                if os.path.exists(dest_path):
-                    continue
-                # whole-image scores, constant across all patches/blocks of this image
-                save_dict={
-                    "image_aesthetic_score":aesthetic_score,
-                    "image_nsfw_score":nsfw_score,
-                }
-                for block in [
-                    "down_blocks.2.attentions.1",
-                    "mid_block.attentions.0",
-                    "up_blocks.0.attentions.0",
-                    "up_blocks.0.attentions.1"
-                ]:
-                    features=torch.tensor(old_npz[block])
-                    (h,w,c)=features.size()
-                    save_dict[block]=features.cpu().numpy()
-                    for y_value,importance in zip(
-                        ["nsfw","aesthetic"],
-                        [avg_nsfw,avg_aesthetic]
-                    ):
-                        # Resize the importance map to match the spatial dimensions (h, w).
-                        # Two dimensions are added first to represent batch and channel dimensions,
-                        # which F.interpolate expects: [H, W] -> [1, 1, H, W].
-                        resized = F.interpolate(
-                            importance.unsqueeze(0).unsqueeze(0),
-                            size=(h, w)
-                        )[0, 0]  # Remove the batch and channel dimensions: [1, 1, h, w] -> [h, w]
-
-                        # Flatten the 2D importance map into a 1D vector so all pixels can be ranked.
-                        flat = resized.flatten()
-
-                        # Compute the rank of every value.
-                        # flat.argsort() gives the indices that would sort the values.
-                        # Applying argsort() again converts those sorted indices into each
-                        # element's rank, ranging from 0 (smallest) to N-1 (largest).
-                        ranks = flat.argsort().argsort().float()
-
-                        # Normalize ranks to the range [0, 1], producing the percentile/quantile
-                        # of each pixel rather than using its raw importance value.
-                        # max(..., 1) avoids division by zero if there is only one element.
-                        quantile = (ranks / max(flat.numel() - 1, 1)).reshape(h, w)
-                        save_dict[f"{block}.{y_value}"]=quantile.cpu().numpy()
-
-            np.savez(dest_path, **save_dict)
+        avg_aesthetic=torch.stack(importance_aesthetic).mean(dim=0)
+        avg_nsfw=torch.stack(importance_nsfw).mean(dim=0)
+        _save_attribution_npz(dest_path,sparse_path,avg_aesthetic,avg_nsfw,aesthetic_score,nsfw_score)
 
 
 def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
@@ -488,3 +510,74 @@ def clip_attribution_integrated_gradients(image_src_dir:str,dest_dir:str,limit:i
     # get_importance_integrated_gradients returns a single-element list (no
     # per-layer maps to slice), so always take layer 0
     return _clip_attribution_core(image_src_dir,dest_dir,limit,sparse_dir,0,1,importance_fn)
+
+
+def nudenet_importance_map(detections, h_img, w_img, exclude_classes):
+    '''(H, W) map: 0 everywhere except inside a detected box whose class isn't
+    in exclude_classes, filled with that detection's score (max where boxes overlap).'''
+    map_np = np.zeros((h_img, w_img), dtype=np.float32)
+    for d in detections:
+        if d["class"] in exclude_classes:
+            continue
+        x, y, w, h = d["box"]
+        x0, y0 = max(0, int(x)), max(0, int(y))
+        x1, y1 = min(w_img, int(x + w)), min(h_img, int(y + h))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        map_np[y0:y1, x0:x1] = np.maximum(map_np[y0:y1, x0:x1], d["score"])
+    return map_np
+
+
+def clip_attribution_nudenet(image_src_dir:str,dest_dir:str,limit:int,
+                     sparse_dir:str="sparse_embeddings",
+                     exclude_classes=NUDENET_EXCLUDE_CLASSES):
+    '''
+    Same output format/pipeline as clip_attribution, but the per-patch
+    importance comes directly from NudeDetector's boxes instead of a CLIP
+    gradient: any detected box whose class isn't in exclude_classes is filled
+    with its detection score (max where boxes overlap), everything else is 0
+    (see nudenet_importance_map). No forward/backward CAM needed for the
+    importance itself - nsfw_model/aesthetic_model/clip_model/processor are
+    only used for the whole-image scores run_regression needs as its target;
+    NudeDetector does the actual localization.
+    '''
+    print("clip attribution (nudenet)")
+    os.makedirs(dest_dir,exist_ok=True)
+    nsfw_model=get_nsfw_model()
+    aesthetic_model=get_aesthetic_model()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").to(device)
+    processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
+    detector = NudeDetector()
+
+    files=[f for f in os.listdir(image_src_dir) if f.endswith("jpg") or f.endswith("jpeg")]
+    if limit>=0:
+        files=files[:limit]
+    for file in files:
+        npz_file=file+".npz"
+        sparse_path=os.path.join(sparse_dir,npz_file)
+        if not os.path.exists(sparse_path):
+            continue
+        dest_path=os.path.join(dest_dir,npz_file)
+        if os.path.exists(dest_path):
+            continue
+
+        path=os.path.join(image_src_dir,file)
+        pil_img=Image.open(path).convert("RGB")
+        w_img,h_img=pil_img.size
+
+        with torch.no_grad():
+            inputs = {k: v.to(device) for k, v in processor(images=pil_img, return_tensors="pt").items()}
+            outputs = clip_model(**inputs)
+            image_embeds = F.normalize(outputs.image_embeds, dim=-1)
+            nsfw_score=nsfw_model(image_embeds)
+            aesthetic_score=aesthetic_model(image_embeds)
+
+        detections=detector.detect(path)
+        importance=torch.tensor(nudenet_importance_map(detections,h_img,w_img,exclude_classes))
+
+        # NudeNet doesn't distinguish "important for nsfw" vs "important for
+        # aesthetic" - the same box-derived map is used for both targets
+        _save_attribution_npz(dest_path,sparse_path,importance,importance,
+                               float(aesthetic_score.detach().cpu()),float(nsfw_score.detach().cpu()))

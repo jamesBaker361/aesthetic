@@ -33,7 +33,7 @@ from nltk.corpus import wordnet as wn
 from sdxl_extract import extract_vanilla
 from sparsify import sparsify_embeddings, top_n_mask, get_top_k_images_highlighted
 from regression import run_regression,run_top_k_features_popularity_contest
-from attribution import clip_attribution,get_importance,clip_attribution_smoothgrad,clip_attribution_integrated_gradients
+from attribution import clip_attribution,get_importance,clip_attribution_smoothgrad,clip_attribution_integrated_gradients,clip_attribution_nudenet
 from rewards import get_aesthetic_model,get_nsfw_model
 from transformers import CLIPVisionModelWithProjection,CLIPImageProcessor,CLIPProcessor,CLIPModel
 from peft import LoraConfig
@@ -485,6 +485,8 @@ def main(args):
             clip_attribution_integrated_gradients(image_src_dir,clip_dir,clip_limit,sparse_embedding_dir)
         elif clip_attribution_method=="smooth":
             clip_attribution_smoothgrad(image_src_dir,clip_dir,clip_limit,sparse_embedding_dir,start_layer,stop_layer)
+        elif clip_attribution_method=="nudenet":
+            clip_attribution_nudenet(image_src_dir,clip_dir,clip_limit,sparse_embedding_dir)
     
     sae_checkpoints="./sdxl_unbox/checkpoints/"
     sae_dict:dict[str,SparseAutoencoder]={}
