@@ -164,7 +164,8 @@ def get_images(image_src_dir:str,
         prompt_list+=word_list
     device="cuda" if torch.cuda.is_available() else "cpu"
     
-    base_pipe=Krea2Pipeline.from_pretrained("krea/Krea-2-Turbo", torch_dtype=torch.bfloat16).to(device)
+    #base_pipe=Krea2Pipeline.from_pretrained("krea/Krea-2-Turbo", torch_dtype=torch.bfloat16).to(device)
+    base_pipe=DiffusionPipeline.from_pretrained("SimianLuo/LCM_Dreamshaper_v7", torch_dtype=torch.bfloat16).to(device)
     setattr(base_pipe,"safety_checker",None)
     if method==UNTRAINED:
         diff_pipe=base_pipe
