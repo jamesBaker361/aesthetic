@@ -32,7 +32,8 @@ import nltk
 from nltk.corpus import wordnet as wn
 from sdxl_extract import extract_vanilla
 from sparsify import sparsify_embeddings, top_n_mask, get_top_k_images_highlighted
-from regression import run_regression,clip_attribution,get_importance,run_top_k_features_popularity_contest
+from regression import run_regression,run_top_k_features_popularity_contest
+from attribution import clip_attribution,get_importance,clip_attribution_smoothgrad,clip_attribution_integrated_gradients
 from rewards import get_aesthetic_model,get_nsfw_model
 from transformers import CLIPVisionModelWithProjection,CLIPImageProcessor,CLIPProcessor,CLIPModel
 from peft import LoraConfig
@@ -86,6 +87,7 @@ parser.add_argument("--lora_batch_size",type=int,default=2)
 parser.add_argument("--lora_rank",type=int,default=4)
 parser.add_argument("--attribution_threshold",type=float,default=0.9) # only patches with clip_attribution quantile >= this feed run_regression
 parser.add_argument("--weight_by_importance",action="store_true") # regress on score*patch_importance instead of the raw whole-image score
+parser.add_argument("--clip_attribution_method",type=str,default="grad_cam")
 job_id=os.environ["SLURM_JOB_ID"]
 parser.add_argument("--err",type=str,default=f"slurm_chip/generic/{job_id}.err")
 parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
@@ -445,6 +447,7 @@ def main(args):
     mode:str=args.mode
     out:str=args.out
     err:str=args.err
+    clip_attribution_method:str=args.clip_attribution_method
     premade:bool  = args.premade
     lora_batch_size:int=args.lora_batch_size
     lora_rank:int=args.lora_rank
@@ -474,7 +477,12 @@ def main(args):
     if not disable_sparsify_embeddings:
         sparsify_embeddings(sparse_embedding_dir,embedding_dir,mode)
     if not disable_clip_attribution:
-        clip_attribution(image_dest_dir,clip_dir,clip_limit)
+        if clip_attribution_method=="grad_cam":
+            clip_attribution(image_dest_dir,clip_dir,clip_limit,sparse_embedding_dir,start_layer,stop_layer)
+        elif clip_attribution_method=="integrated":
+            clip_attribution_integrated_gradients(image_dest_dir,clip_dir,clip_limit,sparse_embedding_dir)
+        elif clip_attribution_method=="smooth":
+            clip_attribution_smoothgrad(image_dest_dir,clip_dir,clip_limit,sparse_embedding_dir,start_layer,stop_layer)
     
     sae_checkpoints="./sdxl_unbox/checkpoints/"
     sae_dict:dict[str,SparseAutoencoder]={}
