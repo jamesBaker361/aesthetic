@@ -467,36 +467,42 @@ def run_regression(block:str,y_column:str,
         
 def run_top_k_features_popularity_contest(block:str,y_column:str,
                          clip_src_dir:str,
+                         image_src_dir:str="artificial_images",
                          limit:int=-1,
                          quantile_threshold: float=0.9,
                          k:int=10):
     print("run_top_k_features_popularity_contest")
     score_key=f"{block}.{y_column}"
     image_score_key=f"image_{y_column}_score"
-    
+
     file_list=[
         os.path.join(clip_src_dir,f)
         for f in os.listdir(clip_src_dir)
         if f.endswith("npz")
     ]
-    
+
     if limit>=0:
         file_list=file_list[:limit]
     print("len file list", len(file_list))
-    
+
     nsfw_count_dict=defaultdict(lambda: 0)
     sfw_count_dict=defaultdict(lambda: 0)
-    
+
+    os.makedirs("gradient",exist_ok=True)
+    n_grad_to_save=10
+    grad_saved=0
+
     nsfw_count =0
     sfw_count=0
-    
+
     for file in file_list:
         with np.load(file) as data:
             if block not in data or score_key not in data or image_score_key not in data:
                 continue
+
             score=data[image_score_key]
             if score >0.9:
-                nsfw_count+=1
+                
 
                 # only take the patches whose per-patch importance quantile is
                 # in the top quantile_threshold (quantile in [0,1], see
@@ -511,6 +517,33 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
                     indices=np.argsort(feature_max)[::-1][:k]
                     for index in indices:
                         nsfw_count_dict[index]+=1
+                        
+                if grad_saved<n_grad_to_save:
+                    # overlay this image's per-patch quantile map (already in
+                    # [0,1], see clip_attribution) on the original image, same
+                    # nearest-neighbor upsample + COLORMAP_BONE style used
+                    # elsewhere in this file/sparsify.py, so the ranking used
+                    # below can be sanity-checked visually
+                    orig_filename=os.path.basename(file)
+                    if orig_filename.endswith(".npz"):
+                        orig_filename=orig_filename[:-len(".npz")]
+                    orig_path=os.path.join(image_src_dir,orig_filename)
+                    if os.path.exists(orig_path):
+                        img_np=np.array(Image.open(orig_path).convert("RGB"))
+                        img_h,img_w=img_np.shape[:2]
+
+                        heatmap=cv2.resize(data[score_key].astype(np.float32),(img_w,img_h),interpolation=cv2.INTER_NEAREST)
+                        heatmap=np.clip(heatmap,0,1)**0.5
+                        heatmap_uint8=np.uint8(255*heatmap)
+                        heatmap_color=cv2.applyColorMap(heatmap_uint8,cv2.COLORMAP_BONE)
+                        heatmap_color=cv2.cvtColor(heatmap_color,cv2.COLOR_BGR2RGB)
+
+                        overlay=cv2.addWeighted(img_np,0.6,heatmap_color,0.4,0)
+                        Image.fromarray(np.uint8(255-overlay)).save(
+                            os.path.join("gradient",f"{block}_{y_column}_{orig_filename}")
+                        )
+                        grad_saved+=1
+                    nsfw_count+=1
             
             if score < 0.5:
                 sfw_count+=1
