@@ -515,10 +515,11 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
             if score < 0.5:
                 sfw_count+=1
                 
-                feature_max=data[block].reshape(-1,data[block].shape[-1]).max(axis=0)
-                indices=np.argsort(feature_max)[::-1][:k]
-                for index in indices:
-                    sfw_count_dict[index]+=1
+                all_features=data[block].reshape(-1,data[block].shape[-1])
+                for feature in all_features:
+                    indices=np.argsort(feature)[::-1][:k]
+                    for index in indices:
+                        sfw_count_dict[index]+=1
 
     nsfw_count_dict={key:value/nsfw_count for key,value in nsfw_count_dict.items()}
     sfw_count_dict={key:value/sfw_count for key,value in sfw_count_dict.items()}
