@@ -130,7 +130,8 @@ def get_images(image_src_dir:str,
                num_inference_steps:
                    int,aesthetic_prompt:bool,
                    nsfw_prompt:bool,
-                   random_prompt:bool):
+                   random_prompt:bool,
+                   fruit_prompt:bool):
     print("get images")
     os.makedirs(image_src_dir,exist_ok=True)
     
@@ -138,8 +139,13 @@ def get_images(image_src_dir:str,
     if nsfw_prompt:
         prompt_list+=[row["prompt"] for row in load_dataset("AIML-TUDA/i2p", split="train")]
     if aesthetic_prompt:
-        prompt+=[row["prompt"] for row in load_dataset("moonworks/lunara-aesthetic", split="train")]
-        
+        prompt_list+=[row["prompt"] for row in load_dataset("moonworks/lunara-aesthetic", split="train")]
+    if fruit_prompt:
+        fruits=["banana","orange","apple"]
+        locations=["in space", "on a table", "upside down", "on a plate", "outside", "at the beach", " "]
+        for f in fruits:
+            for l in locations:
+                prompt_list.append(f"{f} {l}")
     if random_prompt:
         nltk.download("wordnet")
 
