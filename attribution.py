@@ -166,7 +166,7 @@ def _patch_grid_importance(target_hidden_state, grad, og_h, og_w):
     grads = torch.nn.ReLU()(grads)
     acts = target_hidden_state[0, 1:, :]  # [N, D]
 
-    importance = grads * acts   # [N, D]
+    importance = grads * acts   # [N, D] #Possibility: do normalized acts
     importance = importance.norm(dim=-1)
 
     num_patches = importance.shape[0]
