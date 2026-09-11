@@ -5,6 +5,7 @@ import argparse
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.saving_helpers import save_and_load_functions
 from experiment_helpers.argprint import print_args
+from experiment_helpers.image_helpers import concat_images_horizontally, concat_images_vertically
 from diffusers import DiffusionPipeline,UNet2DConditionModel,AutoencoderKL
 from diffusers.image_processor import VaeImageProcessor
 from sdxl_unbox.SAE import SparseAutoencoder
@@ -30,7 +31,7 @@ import random
 import nltk
 from nltk.corpus import wordnet as wn
 from sdxl_extract import extract_vanilla
-from sparsify import sparsify_embeddings, top_n_mask
+from sparsify import sparsify_embeddings, top_n_mask, get_top_k_images_highlighted
 from regression import run_regression,clip_attribution,get_importance,run_top_k_features_popularity_contest
 from rewards import get_aesthetic_model,get_nsfw_model
 from transformers import CLIPVisionModelWithProjection,CLIPImageProcessor,CLIPProcessor,CLIPModel
@@ -510,6 +511,12 @@ def main(args):
             indices=list(sorted_dict.keys())[:top_k]
             print(f"block {block}", indices)
             print("values ",list(sorted_dict.values())[:top_k])
+            big_img_list=[]
+            for f in indices:
+                img_list=get_top_k_images_highlighted(block,f,5,limit=-1)
+                img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
+                big_img_list.append(img)
+            concat_images_vertically(big_img_list).save(f"highlighted_{block}.png")
             dim=sae_dict[block].n_dirs_local
             select_mask=torch.zeros(dim)
             select_mask[indices]=1.0
