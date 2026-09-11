@@ -566,12 +566,18 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
     
     relative_dict={}
     
+    never_present=[]
+    
     for key,value in nsfw_count_dict.items():
         denominator=1e-8
         if key in sfw_count_dict:
             denominator=sfw_count_dict[key]
+        else:
+            never_present.append(key)
         relative_dict[key]=value/denominator
 
+    print("never present ",never_present)
+    
     return dict(sorted(relative_dict.items(), key=lambda x: x[1],reverse=True)),sfw_count_dict
             
             
