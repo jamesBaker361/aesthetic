@@ -24,6 +24,7 @@ it's explaining doesn't live there.
 import os
 import csv
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -31,13 +32,16 @@ from PIL import Image
 from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 from nudenet import NudeDetector
 
-from rewards import get_nsfw_model
+from rewards import get_nsfw_model, get_aesthetic_model
+from attribution import get_importance
 
 image_src_dir = "artificial_nsfw"
 extension = "jpeg"
 limit = 50
 face_padding = 0.2  # extra margin around the detected face box, as a fraction of its size
 out_dir = "face_bias_check"
+start_layer = 5
+stop_layer = 15
 
 FACE_CLASSES = {"FACE_FEMALE", "FACE_MALE"}
 
@@ -60,11 +64,37 @@ def score_pil(pil_img, nsfw_model, processor, clip_model, device):
     return float(score.detach().cpu())
 
 
+def gradient_importance_map(pil_img, nsfw_model, aesthetic_model, device, processor, clip_model):
+    '''nsfw grad*activation importance map (H, W), same layers clip_attribution averages.'''
+    _, importance_nsfw, _, _ = get_importance(pil_img, nsfw_model, aesthetic_model, device, processor, clip_model)
+    importance_nsfw = importance_nsfw[start_layer:stop_layer]
+    return torch.stack(importance_nsfw).mean(dim=0).detach().cpu().numpy()
+
+
+def overlay_heatmap(pil_img, map_np):
+    '''Same COLORMAP_BONE/sqrt-sharpen/invert style used elsewhere in this repo (see get_maps in attribution.py).'''
+    img_np = np.array(pil_img.convert("RGB"))
+    h_img, w_img = img_np.shape[:2]
+
+    heatmap = cv2.resize(map_np.astype(np.float32), (w_img, h_img), interpolation=cv2.INTER_NEAREST)
+    heatmap = heatmap - heatmap.min()
+    heatmap = heatmap / (heatmap.max() + 1e-8)
+    heatmap = np.clip(heatmap, 0, 1) ** 0.5
+
+    heatmap_uint8 = np.uint8(255 * heatmap)
+    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_BONE)
+    heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+
+    overlay = cv2.addWeighted(img_np, 0.6, heatmap_color, 0.4, 0)
+    return Image.fromarray(np.uint8(255 - overlay))
+
+
 def main():
     os.makedirs(out_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     nsfw_model = get_nsfw_model()
+    aesthetic_model = get_aesthetic_model()
     clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").to(device)
     processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
     detector = NudeDetector()
@@ -94,6 +124,13 @@ def main():
         blacked_out_np[y0:y1, x0:x1] = 0
         face_blacked_out = Image.fromarray(blacked_out_np)
 
+        # gradient importance map with the face region zeroed out, so you can
+        # see what the attribution looks like once the face can't dominate it
+        importance_map = gradient_importance_map(pil_img, nsfw_model, aesthetic_model, device, processor, clip_model)
+        importance_minus_face = importance_map.copy()
+        importance_minus_face[y0:y1, x0:x1] = 0
+        importance_minus_face_overlay = overlay_heatmap(pil_img, importance_minus_face)
+
         original_score = score_pil(pil_img, nsfw_model, processor, clip_model, device)
         face_only_score = score_pil(face_only, nsfw_model, processor, clip_model, device)
         face_blacked_out_score = score_pil(face_blacked_out, nsfw_model, processor, clip_model, device)
@@ -109,6 +146,7 @@ def main():
         if n < 10:
             face_only.save(os.path.join(out_dir, f"{n}_face_only_{file}"))
             face_blacked_out.save(os.path.join(out_dir, f"{n}_face_blacked_out_{file}"))
+            importance_minus_face_overlay.save(os.path.join(out_dir, f"{n}_importance_minus_face_{file}"))
 
     if not rows:
         print("no faces detected in any image - can't run this check")
