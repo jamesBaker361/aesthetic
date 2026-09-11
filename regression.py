@@ -62,8 +62,7 @@ def get_maps(pil_img: Image.Image,
         
 
 
-        importance = grads #* acts                       # [N, D]
-        #importance = torch.abs(importance).sum(dim=-1)            # [N] should we sum? 
+        importance = grads * acts                       # [N, D]
         importance=importance.norm(dim=-1)
 
         # --- Reshape to patch grid ---
@@ -464,6 +463,7 @@ def run_regression(block:str,y_column:str,
     
     np.savez(save_path,a=a,b=b,r2=r2,r=r)
     return save_path
+
         
 def run_top_k_features_popularity_contest(block:str,y_column:str,
                          clip_src_dir:str,

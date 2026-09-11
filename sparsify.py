@@ -12,6 +12,7 @@ from tqdm import tqdm
 from PIL import Image
 import time
 import heapq
+import json
 import cv2
 from concurrent.futures import ThreadPoolExecutor
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
@@ -92,17 +93,31 @@ def sparsify_embeddings(sparse_dest_dir:str="sparse_embeddings",embedding_src_di
         np.savez(new_path,**result)
         
         
-def get_top_k_images(block:str,
-                     index:int,
-                     k:int=10,
-                     sparse_dest_dir:str="sparse_embeddings",
-                     image_src_dir:str= "artificial_nsfw",
-                     extension:str="jpeg",
-                     limit:int=1_000_000)->list[Image.Image]:
+def _get_top_k_heap(block:str,
+                    index:int,
+                    k:int,
+                    sparse_dest_dir:str,
+                    image_src_dir:str,
+                    cache_dir:str,
+                    extension:str,
+                    limit:int)->list[tuple[float,str]]:
+    '''
+    Scores every image in image_src_dir on feature `index` of `block` and
+    returns the top-k (score, file) pairs, sorted descending. Cached to disk
+    under cache_dir since the scoring pass (loading every npz in
+    sparse_dest_dir) is the expensive part and is identical for
+    get_top_k_images and get_top_k_images_highlighted.
+    '''
+    os.makedirs(cache_dir,exist_ok=True)
+    cache_path=os.path.join(cache_dir,f"{block}.{index}.k{k}.limit{limit}.json")
+    if os.path.exists(cache_path):
+        with open(cache_path) as f:
+            return [tuple(pair) for pair in json.load(f)]
+
     files = [f for f in os.listdir(image_src_dir) if f.endswith(extension)]
     if limit>=0:
         files=files[:limit]
-        
+
     print(f"found {len(files)} images in {image_src_dir}")
 
     def load_score(file):
@@ -114,21 +129,6 @@ def get_top_k_images(block:str,
         npz_dict = np.load(npz_path)
         sparse_embedding = npz_dict[block]  # (h, w, num_features)
         return float(np.max(sparse_embedding[..., index])), file
-    
-    print(f"found {len(files)} images in {image_src_dir}")
-    file=files[0]
-    npz_path = os.path.join(sparse_dest_dir, file.replace(extension, ".npz"))
-    if not os.path.exists(npz_path):
-        npz_path = os.path.join(sparse_dest_dir, file + ".npz")
-    print(f"{npz_path} might exist")
-    if not os.path.exists(npz_path):
-        print(f"{npz_path} does not exist")
-    else:
-        print(f"{npz_path} definitelty exists")
-        npz_dict = np.load(npz_path)
-        sparse_embedding = npz_dict[block]
-        print("sparae embedding shape ",sparse_embedding.shape)
-    
 
     heap = []  # min-heap of (score, file), size <= k
     with ThreadPoolExecutor() as executor:
@@ -142,6 +142,21 @@ def get_top_k_images(block:str,
                 heapq.heapreplace(heap, (score, file))
 
     heap.sort(reverse=True)
+
+    with open(cache_path,"w") as f:
+        json.dump(heap,f)
+
+    return heap
+
+def get_top_k_images(block:str,
+                     index:int,
+                     k:int=10,
+                     sparse_dest_dir:str="sparse_embeddings",
+                     image_src_dir:str= "artificial_nsfw",
+                     cache_dir:str="feature_cache",
+                     extension:str="jpeg",
+                     limit:int=1_000_000)->list[Image.Image]:
+    heap=_get_top_k_heap(block,index,k,sparse_dest_dir,image_src_dir,cache_dir,extension,limit)
     return [Image.open(os.path.join(image_src_dir, f[1])).resize((256, 256)) for f in heap]
 
 def get_top_k_images_highlighted(block:str,
@@ -149,6 +164,7 @@ def get_top_k_images_highlighted(block:str,
                                  k:int=10,
                                  sparse_dest_dir:str="sparse_embeddings",
                                  image_src_dir:str="artificial_nsfw",
+                                 cache_dir:str="feature_cache",
                                  extension:str="jpeg",
                                  limit:int=1_000_000,
                                  size:int=256)->list[Image.Image]:
@@ -158,31 +174,7 @@ def get_top_k_images_highlighted(block:str,
     the nsfw/aesthetic importance maps in regression.py's get_maps), so you can
     see where in the image that feature fires, not just which images score highest.
     '''
-    files = [f for f in os.listdir(image_src_dir) if f.endswith(extension)]
-    if limit>=0:
-        files=files[:limit]
-
-    def load_score(file):
-        npz_path = os.path.join(sparse_dest_dir, file.replace(extension, ".npz"))
-        if not os.path.exists(npz_path):
-            npz_path = os.path.join(sparse_dest_dir, file + ".npz")
-        if not os.path.exists(npz_path):
-            return None
-        npz_dict = np.load(npz_path)
-        sparse_embedding = npz_dict[block]  # (h, w, num_features)
-        return float(np.max(sparse_embedding[..., index])), file
-
-    heap = []  # min-heap of (score, file), size <= k
-    with ThreadPoolExecutor() as executor:
-        for result in tqdm(executor.map(load_score, files), total=len(files), desc="Scoring"):
-            if result is None:
-                continue
-            score, file = result
-            if len(heap) < k:
-                heapq.heappush(heap, (score, file))
-            elif score > heap[0][0]:
-                heapq.heapreplace(heap, (score, file))
-    heap.sort(reverse=True)
+    heap=_get_top_k_heap(block,index,k,sparse_dest_dir,image_src_dir,cache_dir,extension,limit)
 
     highlighted=[]
     for score,file in heap:
