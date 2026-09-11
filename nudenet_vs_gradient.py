@@ -4,6 +4,13 @@ For n images: builds an "importance map" from NudeNet's detected boxes
 and compares it side by side with the grad*activation attribution map from
 attribution.get_importance. Saves [original | nudenet boxes | gradient] concatenated
 horizontally per image, so the two can be eyeballed directly against each other.
+
+Also saves a second image per input: at each threshold in THRESHOLDS, the
+overlap between the gradient map's top-quantile patches (quantile >=
+threshold, same rank-based quantile clip_attribution computes) and any
+NudeNet box that isn't a face - i.e. where the two methods actually agree,
+with the face excluded so it can't dominate the overlap the way it dominates
+the raw gradient map on its own.
 '''
 
 import os
@@ -26,6 +33,9 @@ start_layer = 5
 stop_layer = 15
 out_dir = "nudenet_vs_gradient"
 
+FACE_CLASSES = {"FACE_FEMALE", "FACE_MALE"}
+THRESHOLDS = [0.95, 0.9, 0.75, 0.5]
+
 
 def nudenet_importance_map(detections, h_img, w_img):
     map_np = np.zeros((h_img, w_img), dtype=np.float32)
@@ -37,6 +47,29 @@ def nudenet_importance_map(detections, h_img, w_img):
             continue
         map_np[y0:y1, x0:x1] = np.maximum(map_np[y0:y1, x0:x1], d["score"])
     return map_np
+
+
+def nudenet_box_mask(detections, h_img, w_img, exclude_classes):
+    '''Binary (H, W) mask, 1 inside any box whose class isn't in exclude_classes.'''
+    mask = np.zeros((h_img, w_img), dtype=np.float32)
+    for d in detections:
+        if d["class"] in exclude_classes:
+            continue
+        x, y, w, h = d["box"]
+        x0, y0 = max(0, int(x)), max(0, int(y))
+        x1, y1 = min(w_img, int(x + w)), min(h_img, int(y + h))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        mask[y0:y1, x0:x1] = 1.0
+    return mask
+
+
+def quantile_map(map_np):
+    '''Per-pixel rank, normalized to [0,1] - same construction clip_attribution uses.'''
+    flat = map_np.flatten()
+    ranks = flat.argsort().argsort().astype(np.float64)
+    quantile = ranks / max(flat.size - 1, 1)
+    return quantile.reshape(map_np.shape)
 
 
 def gradient_importance_map(pil_img, nsfw_model, aesthetic_model, device, processor, clip_model):
@@ -89,6 +122,15 @@ def main():
 
         concat = concat_images_horizontally([pil_img, nudenet_overlay, gradient_overlay])
         concat.save(os.path.join(out_dir, f"{i}_{file}"))
+
+        box_mask = nudenet_box_mask(detections, h_img, w_img, FACE_CLASSES)
+        quantile = quantile_map(gradient_map)
+        overlap_panels = [
+            overlay_heatmap(pil_img, ((quantile >= t) & (box_mask > 0)).astype(np.float32))
+            for t in THRESHOLDS
+        ]
+        concat_images_horizontally(overlap_panels).save(os.path.join(out_dir, f"{i}_overlap_{file}"))
+
         print(f"{i}: {file} -> {len(detections)} nudenet detections")
 
 
