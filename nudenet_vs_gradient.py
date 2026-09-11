@@ -34,7 +34,7 @@ start_layer = 5
 stop_layer = 15
 out_dir = "nudenet_vs_gradient"
 
-FACE_CLASSES = {"FACE_FEMALE", "FACE_MALE"}
+FACE_CLASSES = {"FACE_FEMALE", "FACE_MALE", "BELLY_COVERED","BELLY_EXPOSED","ARMPITS_EXPOSED","FEET_EXPOSED","FEET_COVERED"}
 THRESHOLDS = [0.95, 0.9, 0.75, 0.5]
 
 
