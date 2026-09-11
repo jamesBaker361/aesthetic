@@ -5,12 +5,13 @@ and compares it side by side with the grad*activation attribution map from
 attribution.get_importance. Saves [original | nudenet boxes | gradient] concatenated
 horizontally per image, so the two can be eyeballed directly against each other.
 
-Also saves a second image per input: at each threshold in THRESHOLDS, the
-overlap between the gradient map's top-quantile patches (quantile >=
-threshold, same rank-based quantile clip_attribution computes) and any
-NudeNet box that isn't a face - i.e. where the two methods actually agree,
-with the face excluded so it can't dominate the overlap the way it dominates
-the raw gradient map on its own.
+Also saves a second image per input: at each threshold in THRESHOLDS, every
+NudeNet box (excluding face boxes) that has ANY pixel in the gradient map's
+top-quantile patches (quantile >= threshold, same rank-based quantile
+clip_attribution computes) is drawn in FULL - not just the intersecting
+pixels - and boxes with no overlap at all are dropped entirely. So this
+shows "which whole regions the two methods agree matter," not a pixel-level
+intersection mask.
 '''
 
 import os
@@ -49,8 +50,13 @@ def nudenet_importance_map(detections, h_img, w_img):
     return map_np
 
 
-def nudenet_box_mask(detections, h_img, w_img, exclude_classes):
-    '''Binary (H, W) mask, 1 inside any box whose class isn't in exclude_classes.'''
+def full_box_overlap_mask(detections, quantile, threshold, exclude_classes):
+    '''
+    Binary (H, W) mask: for each box whose class isn't in exclude_classes, if
+    ANY pixel inside it has quantile >= threshold, the WHOLE box is set to 1;
+    otherwise the box contributes nothing (not even its overlapping pixels).
+    '''
+    h_img, w_img = quantile.shape
     mask = np.zeros((h_img, w_img), dtype=np.float32)
     for d in detections:
         if d["class"] in exclude_classes:
@@ -60,7 +66,8 @@ def nudenet_box_mask(detections, h_img, w_img, exclude_classes):
         x1, y1 = min(w_img, int(x + w)), min(h_img, int(y + h))
         if x1 <= x0 or y1 <= y0:
             continue
-        mask[y0:y1, x0:x1] = 1.0
+        if (quantile[y0:y1, x0:x1] >= threshold).any():
+            mask[y0:y1, x0:x1] = 1.0
     return mask
 
 
@@ -123,10 +130,9 @@ def main():
         concat = concat_images_horizontally([pil_img, nudenet_overlay, gradient_overlay])
         concat.save(os.path.join(out_dir, f"{i}_{file}"))
 
-        box_mask = nudenet_box_mask(detections, h_img, w_img, FACE_CLASSES)
         quantile = quantile_map(gradient_map)
         overlap_panels = [
-            overlay_heatmap(pil_img, ((quantile >= t) & (box_mask > 0)).astype(np.float32))
+            overlay_heatmap(pil_img, full_box_overlap_mask(detections, quantile, t, FACE_CLASSES))
             for t in THRESHOLDS
         ]
         concat_images_horizontally(overlap_panels).save(os.path.join(out_dir, f"{i}_overlap_{file}"))
