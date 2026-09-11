@@ -53,11 +53,14 @@ parser.add_argument("--num_inference_steps",type=int,default=8)
 parser.add_argument("--premade",action="store_true")
 parser.add_argument("--size",type=int,default=512)
 parser.add_argument("--method",type=str,default=UNTRAINED)
-parser.add_argument("--image_src_dir",type=str,default="artificial_images")
 parser.add_argument("--n_random",type=int,default=50)
+
+parser.add_argument("--image_src_dir",type=str,default="artificial_images")
 parser.add_argument("--embedding_dir",type=str,default="embeddings")
 parser.add_argument("--sparse_embedding_dir",type=str,default="sparse_embeddings")
 parser.add_argument("--clip_dir",type=str,default="clip_sparse_embeddings")
+parser.add_argument("--cache_dir",type=str,default="feature_cache")
+
 parser.add_argument("--clip_limit",type=int,default=-1)
 parser.add_argument("--regression_limit",type=int,default=-1)
 parser.add_argument("--stats_dir",type=str,default="statistics")
@@ -75,6 +78,7 @@ parser.add_argument("--top_k",type=int,default=10)
 parser.add_argument("--aesthetic_prompt",action="store_true")
 parser.add_argument("--nsfw_prompt",action="store_true")
 parser.add_argument("--random_prompt",action="store_true")
+parser.add_argument("--fruit_prompt",action="store_true")
 parser.add_argument("--lora_epochs",type=int,default=5)
 parser.add_argument("--lora_use_mask",action="store_true")
 parser.add_argument("--lora_use_filter",action="store_true")
@@ -428,6 +432,7 @@ def main(args):
     n_random : int = args.n_random
     embedding_dir : str = args.embedding_dir
     sparse_embedding_dir : str = args.sparse_embedding_dir
+    cache_dir:str=args.cache_dir
     clip_dir : str = args.clip_dir
     clip_limit : int = args.clip_limit
     regression_limit : int = args.regression_limit
@@ -444,6 +449,7 @@ def main(args):
     aesthetic_prompt:bool=args.aesthetic_prompt
     nsfw_prompt:bool=args.nsfw_prompt
     random_prompt:bool=args.random_prompt
+    fruit_prompt:bool=args.fruit_prompt
     lora_epochs:int=args.lora_epochs
     lora_use_mask:bool=args.lora_use_mask
     lora_use_filter:bool=args.lora_use_filter
@@ -481,7 +487,7 @@ def main(args):
         if premade:
             get_images_nsfw_premade(image_src_dir)
         else:
-            get_images(image_src_dir,method,n_random,size,num_inference_steps,aesthetic_prompt,nsfw_prompt,random_prompt)
+            get_images(image_src_dir,method,n_random,size,num_inference_steps,aesthetic_prompt,nsfw_prompt,random_prompt,fruit_prompt)
     if not disable_extract_vanilla:
         extract_vanilla(embedding_dir,image_src_dir,limit,size,mixed_precision)
     if not disable_sparsify_embeddings:
@@ -534,7 +540,7 @@ def main(args):
             print("values ",list(sorted_dict.values())[:top_k])
             big_img_list=[]
             for f in indices:
-                img_list=get_top_k_images_highlighted(block,f,5,limit=-1,image_src_dir=image_src_dir)
+                img_list=get_top_k_images_highlighted(block,f,5,limit=-1,image_src_dir=image_src_dir,sparse_dest_dir=sparse_embedding_dir,cache_dir=cache_dir)
                 img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
                 big_img_list.append(img)
             concat_images_vertically(big_img_list).save(f"{image_testing_dir}/highlighted_{block}.png")
@@ -545,7 +551,7 @@ def main(args):
             print("safe values ",list(sfw_dict.values())[:top_k])
             big_img_list=[]
             for f in sfw_indices:
-                img_list=get_top_k_images_highlighted(block,f,5,limit=-1,image_src_dir=image_src_dir)
+                img_list=get_top_k_images_highlighted(block,f,5,limit=-1,image_src_dir=image_src_dir,sparse_dest_dir=sparse_embedding_dir,cache_dir=cache_dir)
                 img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
                 big_img_list.append(img)
             concat_images_vertically(big_img_list).save(f"{image_testing_dir}/safe_highlighted_{block}.png")
