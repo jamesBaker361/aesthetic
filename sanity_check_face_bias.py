@@ -3,6 +3,9 @@ Sanity check for the "attribution keeps highlighting the face, not the
 explicit content" problem: since we don't have a genitalia/body-part
 detector, the closest thing we can build without one is a face-only crop vs.
 the same image with the face region blacked out ("everything but the face").
+Face boxes come from NudeNet (FACE_MALE/FACE_FEMALE) rather than an OpenCV
+Haar cascade, since cv2 installs on some clusters are missing the objdetect
+bindings (CascadeClassifier) even when the rest of cv2 works fine.
 
 For each image with a detected face, scores three variants with the same
 nsfw_model used everywhere else in this repo (rewards.get_nsfw_model):
@@ -21,12 +24,12 @@ it's explaining doesn't live there.
 import os
 import csv
 
-import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
 from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
+from nudenet import NudeDetector
 
 from rewards import get_nsfw_model
 
@@ -36,16 +39,16 @@ limit = 50
 face_padding = 0.2  # extra margin around the detected face box, as a fraction of its size
 out_dir = "face_bias_check"
 
+FACE_CLASSES = {"FACE_FEMALE", "FACE_MALE"}
 
-def get_face_box(img_np_bgr):
-    '''Largest detected face (x, y, w, h) in pixel coords, or None.'''
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    detector = cv2.CascadeClassifier(cascade_path)
-    gray = cv2.cvtColor(img_np_bgr, cv2.COLOR_BGR2GRAY)
-    faces = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
-    if len(faces) == 0:
+
+def get_face_box(detector, path):
+    '''Highest-confidence face box (x, y, w, h) in pixel coords, or None.'''
+    detections = detector.detect(path)
+    candidates = [d for d in detections if d["class"] in FACE_CLASSES]
+    if not candidates:
         return None
-    return max(faces, key=lambda f: f[2] * f[3])  # largest by area
+    return max(candidates, key=lambda d: d["score"])["box"]
 
 
 def score_pil(pil_img, nsfw_model, processor, clip_model, device):
@@ -64,22 +67,23 @@ def main():
     nsfw_model = get_nsfw_model()
     clip_model = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").to(device)
     processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
+    detector = NudeDetector()
 
     files = [f for f in os.listdir(image_src_dir) if f.endswith(extension)]
     files = files[:limit] if limit >= 0 else files
 
     rows = []
     for n, file in enumerate(files):
-        pil_img = Image.open(os.path.join(image_src_dir, file)).convert("RGB")
+        path = os.path.join(image_src_dir, file)
+        pil_img = Image.open(path).convert("RGB")
         img_np_rgb = np.array(pil_img)
-        img_np_bgr = cv2.cvtColor(img_np_rgb, cv2.COLOR_RGB2BGR)
 
-        face_box = get_face_box(img_np_bgr)
+        face_box = get_face_box(detector, path)
         if face_box is None:
             continue
 
         h_img, w_img = img_np_rgb.shape[:2]
-        x, y, w, h = face_box
+        x, y, w, h = [int(v) for v in face_box]
         pad_x, pad_y = int(w * face_padding), int(h * face_padding)
         x0, y0 = max(0, x - pad_x), max(0, y - pad_y)
         x1, y1 = min(w_img, x + w + pad_x), min(h_img, y + h + pad_y)
