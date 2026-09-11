@@ -34,7 +34,7 @@ from sdxl_extract import extract_vanilla
 from sparsify import sparsify_embeddings, top_n_mask, get_top_k_images_highlighted
 from regression import run_regression,run_top_k_features_popularity_contest
 from attribution import clip_attribution,get_importance,clip_attribution_smoothgrad,clip_attribution_integrated_gradients,clip_attribution_nudenet
-from rewards import get_aesthetic_model,get_nsfw_model
+from rewards import get_aesthetic_model,get_nsfw_model,get_nsfw_model_text
 from transformers import CLIPVisionModelWithProjection,CLIPImageProcessor,CLIPProcessor,CLIPModel
 from peft import LoraConfig
 from accelerate import Accelerator
@@ -88,6 +88,7 @@ parser.add_argument("--attribution_threshold",type=float,default=0.9) # only pat
 parser.add_argument("--weight_by_importance",action="store_true") # regress on score*patch_importance instead of the raw whole-image score
 parser.add_argument("--clip_attribution_method",type=str,default="grad_cam")
 parser.add_argument("--image_testing_dir",type=str,default="testing")
+parser.add_argument("--banned_words",nargs="*",default=[])
 job_id=os.environ["SLURM_JOB_ID"]
 parser.add_argument("--err",type=str,default=f"slurm_chip/generic/{job_id}.err")
 parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
@@ -448,6 +449,7 @@ def main(args):
     mode:str=args.mode
     out:str=args.out
     err:str=args.err
+    banned_words:list=args.banned_words
     image_testing_dir:str=args.image_testing_dir
     clip_attribution_method:str=args.clip_attribution_method
     premade:bool  = args.premade
@@ -480,13 +482,13 @@ def main(args):
         sparsify_embeddings(sparse_embedding_dir,embedding_dir,mode)
     if not disable_clip_attribution:
         if clip_attribution_method=="grad_cam":
-            clip_attribution(image_src_dir,clip_dir,clip_limit,sparse_embedding_dir,start_layer,stop_layer)
+            clip_attribution(image_src_dir,clip_dir,clip_limit,sparse_dir=sparse_embedding_dir,start_layer=start_layer,stop_layer=stop_layer,banned_words=banned_words)
         elif clip_attribution_method=="integrated":
-            clip_attribution_integrated_gradients(image_src_dir,clip_dir,clip_limit,sparse_embedding_dir)
+            clip_attribution_integrated_gradients(image_src_dir,clip_dir,clip_limit,sparse_dir=sparse_embedding_dir,banned_words=banned_words)
         elif clip_attribution_method=="smooth":
-            clip_attribution_smoothgrad(image_src_dir,clip_dir,clip_limit,sparse_embedding_dir,start_layer,stop_layer)
+            clip_attribution_smoothgrad(image_src_dir,clip_dir,clip_limit,sparse_dir=sparse_embedding_dir,start_layer=start_layer,stop_layer=stop_layer,banned_words=banned_words)
         elif clip_attribution_method=="nudenet":
-            clip_attribution_nudenet(image_src_dir,clip_dir,clip_limit,sparse_embedding_dir)
+            clip_attribution_nudenet(image_src_dir,clip_dir,clip_limit,sparse_dir=sparse_embedding_dir,banned_words=banned_words)
     
     sae_checkpoints="./sdxl_unbox/checkpoints/"
     sae_dict:dict[str,SparseAutoencoder]={}
