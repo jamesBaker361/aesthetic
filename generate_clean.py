@@ -507,7 +507,7 @@ def main(args):
             
     if not disable_top_k_popularity_contest:
         for block in block_list:
-            sorted_dict=run_top_k_features_popularity_contest(block,y_column,clip_dir,)
+            sorted_dict=run_top_k_features_popularity_contest(block,y_column,clip_dir,image_dest_dir)
             indices=list(sorted_dict.keys())[:top_k]
             print(f"block {block}", indices)
             print("values ",list(sorted_dict.values())[:top_k])
