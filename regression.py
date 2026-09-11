@@ -542,6 +542,22 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
                         Image.fromarray(np.uint8(255-overlay)).save(
                             os.path.join("gradient",f"{block}_{y_column}_{orig_filename}")
                         )
+
+                        # same overlay, but zero out every patch below
+                        # quantile_threshold first, so only the patches that
+                        # would actually pass the keep filter above show up
+                        thresholded=np.where(data[score_key]>=quantile_threshold,data[score_key],0.0)
+                        heatmap=cv2.resize(thresholded.astype(np.float32),(img_w,img_h),interpolation=cv2.INTER_NEAREST)
+                        heatmap=np.clip(heatmap,0,1)**0.5
+                        heatmap_uint8=np.uint8(255*heatmap)
+                        heatmap_color=cv2.applyColorMap(heatmap_uint8,cv2.COLORMAP_BONE)
+                        heatmap_color=cv2.cvtColor(heatmap_color,cv2.COLOR_BGR2RGB)
+
+                        overlay=cv2.addWeighted(img_np,0.6,heatmap_color,0.4,0)
+                        Image.fromarray(np.uint8(255-overlay)).save(
+                            os.path.join("gradient",f"{block}_{y_column}_thresholded_{orig_filename}")
+                        )
+
                         grad_saved+=1
                     nsfw_count+=1
             
