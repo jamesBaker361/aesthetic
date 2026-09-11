@@ -572,7 +572,7 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
             denominator=sfw_count_dict[key]
         relative_dict[key]=value/denominator
 
-    return dict(sorted(relative_dict.items(), key=lambda x: x[1],reverse=True))
+    return dict(sorted(relative_dict.items(), key=lambda x: x[1],reverse=True)),sfw_count_dict
             
             
 

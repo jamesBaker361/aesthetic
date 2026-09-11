@@ -507,7 +507,7 @@ def main(args):
             
     if not disable_top_k_popularity_contest:
         for block in block_list:
-            sorted_dict=run_top_k_features_popularity_contest(block,y_column,clip_dir,image_dest_dir)
+            sorted_dict,sfw_dict=run_top_k_features_popularity_contest(block,y_column,clip_dir,image_dest_dir)
             indices=list(sorted_dict.keys())[:top_k]
             print(f"block {block}", indices)
             print("values ",list(sorted_dict.values())[:top_k])
@@ -517,6 +517,18 @@ def main(args):
                 img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
                 big_img_list.append(img)
             concat_images_vertically(big_img_list).save(f"highlighted_{block}.png")
+            
+            print("sfw")
+            indices=list(sfw_dict.keys())[:top_k]
+            print(f"safe block {block}", indices)
+            print("safe values ",list(sfw_dict.values())[:top_k])
+            big_img_list=[]
+            for f in indices:
+                img_list=get_top_k_images_highlighted(block,f,5,limit=-1)
+                img=concat_images_horizontally([i.resize((256,256)) for i in img_list ])
+                big_img_list.append(img)
+            concat_images_vertically(big_img_list).save(f"safe_highlighted_{block}.png")
+            
             dim=sae_dict[block].n_dirs_local
             select_mask=torch.zeros(dim)
             select_mask[indices]=1.0
