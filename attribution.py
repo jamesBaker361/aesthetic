@@ -30,6 +30,18 @@ import cv2
 # common but not themselves nsfw-specific.
 NUDENET_EXCLUDE_CLASSES = {"FACE_FEMALE", "FACE_MALE", "BELLY_COVERED","BELLY_EXPOSED","ARMPITS_EXPOSED","FEET_EXPOSED","FEET_COVERED"}
 
+# The 4 UNet cross-attention blocks every clip_attribution* variant builds a
+# quantile map for by default. Pass a different block_list (e.g. with
+# vlm_sae.VLM_BLOCK_NAME added) to also cover a block whose sparse features
+# came from a different source (see vlm_sae.sparsify_vlm_embeddings) - the
+# only requirement is that sparse_dir's npz files already have that block key.
+DEFAULT_BLOCK_LIST = [
+    "down_blocks.2.attentions.1",
+    "mid_block.attentions.0",
+    "up_blocks.0.attentions.0",
+    "up_blocks.0.attentions.1",
+]
+
 
 def get_maps(pil_img: Image.Image,
              nsfw_model,
@@ -385,7 +397,7 @@ def get_importance_integrated_gradients(pil_img: Image.Image,
     return importance_aesthetic,importance_nsfw,float(aesthetic_score.detach().cpu()),float(nsfw_score.detach().cpu())
 
 
-def _save_attribution_npz(dest_path, sparse_npz_path, importance_aesthetic, importance_nsfw, aesthetic_score, nsfw_score):
+def _save_attribution_npz(dest_path, sparse_npz_path, importance_aesthetic, importance_nsfw, aesthetic_score, nsfw_score, block_list=None):
     '''
     Shared by every clip_attribution* variant (gradient-based or NudeNet-
     based): given a single (H, W) importance map per score, already at the
@@ -395,18 +407,16 @@ def _save_attribution_npz(dest_path, sparse_npz_path, importance_aesthetic, impo
     whole-image scores. See run_regression for how these quantiles get
     thresholded.
     '''
+    block_list = block_list or DEFAULT_BLOCK_LIST
     with np.load(sparse_npz_path) as old_npz:
         # whole-image scores, constant across all patches/blocks of this image
         save_dict={
             "image_aesthetic_score":aesthetic_score,
             "image_nsfw_score":nsfw_score,
         }
-        for block in [
-            "down_blocks.2.attentions.1",
-            "mid_block.attentions.0",
-            "up_blocks.0.attentions.0",
-            "up_blocks.0.attentions.1"
-        ]:
+        for block in block_list:
+            if block not in old_npz:
+                continue
             features=torch.tensor(old_npz[block])
             (h,w,c)=features.size()
             save_dict[block]=features.cpu().numpy()
@@ -457,7 +467,8 @@ def _clip_attribution_core(image_src_dir:str,dest_dir:str,limit:int,
                      start_layer:int,
                      stop_layer:int,
                      importance_fn,
-                     banned_words:list=None):
+                     banned_words:list=None,
+                     block_list:list=None):
     # Step 1 of the intended pipeline: rank each spatial patch by how much it
     # drives the nsfw/aesthetic score (via importance_fn's grad*activation
     # maps), then convert that ranking to a [0,1] quantile per patch (see
@@ -496,7 +507,7 @@ def _clip_attribution_core(image_src_dir:str,dest_dir:str,limit:int,
 
         avg_aesthetic=torch.stack(importance_aesthetic).mean(dim=0)
         avg_nsfw=torch.stack(importance_nsfw).mean(dim=0)
-        _save_attribution_npz(dest_path,sparse_path,avg_aesthetic,avg_nsfw,aesthetic_score,nsfw_score)
+        _save_attribution_npz(dest_path,sparse_path,avg_aesthetic,avg_nsfw,aesthetic_score,nsfw_score,block_list)
 
 
 def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
@@ -504,8 +515,9 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
                      start_layer=5,
                      stop_layer=15,
                      banned_words:list=None,
+                     block_list:list=None,
                      ):
-    return _clip_attribution_core(image_src_dir,dest_dir,limit,sparse_dir,start_layer,stop_layer,get_importance,banned_words)
+    return _clip_attribution_core(image_src_dir,dest_dir,limit,sparse_dir,start_layer,stop_layer,get_importance,banned_words,block_list)
 
 
 def clip_attribution_smoothgrad(image_src_dir:str,dest_dir:str,limit:int,
@@ -514,19 +526,21 @@ def clip_attribution_smoothgrad(image_src_dir:str,dest_dir:str,limit:int,
                      stop_layer=15,
                      n_samples:int=15,
                      noise_std:float=0.15,
-                     banned_words:list=None):
+                     banned_words:list=None,
+                     block_list:list=None):
     importance_fn=functools.partial(get_importance_smoothgrad,n_samples=n_samples,noise_std=noise_std)
-    return _clip_attribution_core(image_src_dir,dest_dir,limit,sparse_dir,start_layer,stop_layer,importance_fn,banned_words)
+    return _clip_attribution_core(image_src_dir,dest_dir,limit,sparse_dir,start_layer,stop_layer,importance_fn,banned_words,block_list)
 
 
 def clip_attribution_integrated_gradients(image_src_dir:str,dest_dir:str,limit:int,
                      sparse_dir:str="sparse_embeddings",
                      n_steps:int=20,
-                     banned_words:list=None):
+                     banned_words:list=None,
+                     block_list:list=None):
     importance_fn=functools.partial(get_importance_integrated_gradients,n_steps=n_steps)
     # get_importance_integrated_gradients returns a single-element list (no
     # per-layer maps to slice), so always take layer 0
-    return _clip_attribution_core(image_src_dir,dest_dir,limit,sparse_dir,0,1,importance_fn,banned_words)
+    return _clip_attribution_core(image_src_dir,dest_dir,limit,sparse_dir,0,1,importance_fn,banned_words,block_list)
 
 
 def nudenet_importance_map(detections, h_img, w_img, exclude_classes):
@@ -548,7 +562,8 @@ def nudenet_importance_map(detections, h_img, w_img, exclude_classes):
 def clip_attribution_nudenet(image_src_dir:str,dest_dir:str,limit:int,
                      sparse_dir:str="sparse_embeddings",
                      exclude_classes=NUDENET_EXCLUDE_CLASSES,
-                     banned_words:list=None):
+                     banned_words:list=None,
+                     block_list:list=None):
     '''
     Same output format/pipeline as clip_attribution, but the per-patch
     importance comes directly from NudeDetector's boxes instead of a CLIP
@@ -600,4 +615,4 @@ def clip_attribution_nudenet(image_src_dir:str,dest_dir:str,limit:int,
         # NudeNet doesn't distinguish "important for nsfw" vs "important for
         # aesthetic" - the same box-derived map is used for both targets
         _save_attribution_npz(dest_path,sparse_path,importance,importance,
-                               float(aesthetic_score.detach().cpu()),float(nsfw_score.detach().cpu()))
+                               float(aesthetic_score.detach().cpu()),float(nsfw_score.detach().cpu()),block_list)
