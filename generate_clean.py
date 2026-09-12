@@ -244,6 +244,7 @@ def main(args):
     cache_dir:str=args.cache_dir
     clip_dir : str = args.clip_dir
     stats_dir : str = args.stats_dir
+    image_testing_dir:str=args.image_testing_dir
     
     for d in [image_src_dir,embedding_dir,sparse_embedding_dir,cache_dir,image_testing_dir,clip_dir,stats_dir]:
         os.makedirs(d,exist_ok=True)
@@ -276,7 +277,7 @@ def main(args):
     out:str=args.out
     err:str=args.err
     banned_words:list=args.banned_words
-    image_testing_dir:str=args.image_testing_dir
+    
     clip_attribution_method:str=args.clip_attribution_method
     premade:bool  = args.premade
     lora_batch_size:int=args.lora_batch_size
