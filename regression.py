@@ -149,6 +149,7 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
                 continue
 
             score=data[image_score_key]
+            print(score,file)
             if score >upper_threshold:
                 
 
