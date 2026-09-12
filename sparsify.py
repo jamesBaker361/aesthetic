@@ -181,7 +181,11 @@ def get_top_k_images_highlighted(block:str,
         img=Image.open(os.path.join(image_src_dir, file)).convert("RGB").resize((size, size))
         img_np=np.array(img)
 
-        npz_path = os.path.join(sparse_dest_dir, file.replace(extension, ".npz"))
+        npz_path = os.path.join(sparse_dest_dir, file.replace(".jpeg", ".npz"))
+        if not os.path.exists(npz_path):
+            npz_path = os.path.join(sparse_dest_dir, file + ".npz")
+        if not os.path.exists(npz_path):    
+            npz_path = os.path.join(sparse_dest_dir, file.replace(".jpg", ".npz"))
         if not os.path.exists(npz_path):
             npz_path = os.path.join(sparse_dest_dir, file + ".npz")
         activation = np.load(npz_path)[block][..., index]  # (h, w)
