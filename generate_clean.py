@@ -171,10 +171,6 @@ def get_images(image_src_dir:str,
     #base_pipe=Krea2Pipeline.from_pretrained("krea/Krea-2-Turbo", torch_dtype=torch.bfloat16).to(device)
     base_pipe=DiffusionPipeline.from_pretrained("SimianLuo/LCM_Dreamshaper_v7", torch_dtype=torch.bfloat16).to(device)
     setattr(base_pipe,"safety_checker",None)
-    if method==UNTRAINED:
-        diff_pipe=base_pipe
-    else:
-        raise NotImplementedError(f"method={method} not implemented")
     for p,prompt in enumerate(prompt_list):
         base_path=f"{image_src_dir}/base_{p}.jpg"
         if os.path.exists(base_path):
@@ -182,14 +178,8 @@ def get_images(image_src_dir:str,
         generator=torch.Generator()
         generator.manual_seed(p)
         base_prompt=prompt
-        if method=="untrained":
-            base_prompt=""
         base_image=base_pipe(base_prompt,height=size,width=size,generator=generator,num_inference_steps=num_inference_steps).images[0]
         base_image.save(base_path)
-        if method!=UNTRAINED:
-            diff_image=diff_pipe(prompt,height=size,width=size,generator=generator,num_inference_steps=num_inference_steps).images[0]
-            diff_path=f"{image_src_dir}/diff_{p}.jpg"
-            diff_image.save(diff_path)
 
 def get_image_embeds(processor:CLIPImageProcessor,clip_model:CLIPModel,img:Image.Image,device):
     inputs = {k: v.to(device) for k, v in processor(images=img, return_tensors="pt").items()}
