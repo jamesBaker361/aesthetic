@@ -236,15 +236,21 @@ def main(args):
     num_inference_steps : int = args.num_inference_steps
     size : int = args.size
     method : str = args.method
-    image_src_dir:str=args.image_src_dir
     n_random : int = args.n_random
+    
+    image_src_dir:str=args.image_src_dir
     embedding_dir : str = args.embedding_dir
     sparse_embedding_dir : str = args.sparse_embedding_dir
     cache_dir:str=args.cache_dir
     clip_dir : str = args.clip_dir
+    stats_dir : str = args.stats_dir
+    
+    for d in [image_src_dir,embedding_dir,sparse_embedding_dir,cache_dir,image_testing_dir,clip_dir,stats_dir]:
+        os.makedirs(d,exist_ok=True)
+    
     clip_limit : int = args.clip_limit
     regression_limit : int = args.regression_limit
-    stats_dir : str = args.stats_dir
+    
     start_layer:int=args.start_layer
     stop_layer:int=args.stop_layer
     disable_get_images:bool=args.disable_get_images
