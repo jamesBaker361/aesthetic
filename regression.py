@@ -137,7 +137,13 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
 
     for file in file_list:
         with np.load(file) as data:
-            if block not in data or score_key not in data or image_score_key not in data:
+            if block not in data:
+                print(f"block {block} not in data") 
+                continue
+            elif score_key not in data:
+                print(f"score_key {score_key} not in data")
+            elif image_score_key not in data:
+                print(f"image score key {image_score_key} not in data")
                 continue
 
             score=data[image_score_key]
