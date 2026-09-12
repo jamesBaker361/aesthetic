@@ -76,6 +76,8 @@ parser.add_argument("--disable_train_lora",action="store_true")
 parser.add_argument("--disable_top_k_popularity_contest",action="store_true")
 parser.add_argument("--lora_dir",type=str,default="lora")
 parser.add_argument("--top_k",type=int,default=10)
+parser.add_argument("--popularity_upper_threshold",type=float,default=0.8) # run_top_k_features_popularity_contest: image_{y_column}_score above this counts as "nsfw"
+parser.add_argument("--popularity_lower_threshold",type=float,default=0.75) # ... below this counts as "sfw" (scores between the two count as neither)
 parser.add_argument("--aesthetic_prompt",action="store_true")
 parser.add_argument("--nsfw_prompt",action="store_true")
 parser.add_argument("--random_prompt",action="store_true")
@@ -267,6 +269,8 @@ def main(args):
     start_step:int=args.start_step
     end_step:int=args.end_step
     top_k:int=args.top_k
+    popularity_upper_threshold:float=args.popularity_upper_threshold
+    popularity_lower_threshold:float=args.popularity_lower_threshold
     mode:str=args.mode
     out:str=args.out
     err:str=args.err
@@ -354,7 +358,7 @@ def main(args):
     if not disable_top_k_popularity_contest:
         os.makedirs(image_testing_dir,exist_ok=True)
         for block in block_list:
-            sorted_dict,sfw_dict=run_top_k_features_popularity_contest(block,y_column,clip_dir,image_test_dir=image_testing_dir,image_src_dir= image_src_dir)
+            sorted_dict,sfw_dict=run_top_k_features_popularity_contest(block,y_column,clip_dir,image_test_dir=image_testing_dir,image_src_dir=image_src_dir,upper_threshold=popularity_upper_threshold,lower_threshold=popularity_lower_threshold)
             indices=list(sorted_dict.keys())[:top_k]
             print(f"block {block}", indices)
             print("values ",list(sorted_dict.values())[:top_k])

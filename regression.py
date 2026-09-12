@@ -106,10 +106,12 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
                          clip_src_dir:str,
                          image_test_dir:str,
                          image_src_dir:str="artificial_images",
-                         
+
                          limit:int=-1,
                          quantile_threshold: float=0.95,
-                         
+                         upper_threshold: float=0.8,
+                         lower_threshold: float=0.75,
+
                          k:int=10):
     print("run_top_k_features_popularity_contest")
     score_key=f"{block}.{y_column}"
@@ -147,7 +149,7 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
                 continue
 
             score=data[image_score_key]
-            if score >0.8:
+            if score >upper_threshold:
                 
 
                 # only take the patches whose per-patch importance quantile is
@@ -207,7 +209,7 @@ def run_top_k_features_popularity_contest(block:str,y_column:str,
                         grad_saved+=1
                     nsfw_count+=1
             
-            if score < 0.75:
+            if score < lower_threshold:
                 sfw_count+=1
                 
                 all_features=data[block].reshape(-1,data[block].shape[-1])
