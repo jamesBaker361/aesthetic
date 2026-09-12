@@ -114,14 +114,18 @@ def get_top_k_heap(block:str,
         with open(cache_path) as f:
             return [tuple(pair) for pair in json.load(f)]
 
-    files = [f for f in os.listdir(image_src_dir) if f.endswith(extension)]
+    files = [f for f in os.listdir(image_src_dir) if f.endswith("jpeg","jpg")]
     if limit>=0:
         files=files[:limit]
 
     print(f"found {len(files)} images in {image_src_dir}")
 
     def load_score(file):
-        npz_path = os.path.join(sparse_dest_dir, file.replace(extension, ".npz"))
+        npz_path = os.path.join(sparse_dest_dir, file.replace("jpg", ".npz"))
+        if not os.path.exists(npz_path):
+            npz_path = os.path.join(sparse_dest_dir, file + ".npz")
+        if not os.path.exists(npz_path):
+            npz_path = os.path.join(sparse_dest_dir, file.replace("jpeg", ".npz"))
         if not os.path.exists(npz_path):
             npz_path = os.path.join(sparse_dest_dir, file + ".npz")
         if not os.path.exists(npz_path):
