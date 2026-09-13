@@ -17,7 +17,7 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 from PIL import Image
 from diffusers.image_processor import VaeImageProcessor
-from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
+from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor, CLIPTokenizer, CLIPTextModelWithProjection
 
 from nudenet import NudeDetector
 
@@ -397,6 +397,103 @@ def get_importance_integrated_gradients(pil_img: Image.Image,
     return importance_aesthetic,importance_nsfw,float(aesthetic_score.detach().cpu()),float(nsfw_score.detach().cpu())
 
 
+@functools.cache
+def get_sam2_mask_generator(model_id: str = "facebook/sam2-hiera-large", device: str = None):
+    '''
+    Loads (and caches, since the checkpoint download/build is expensive) a
+    SAM2AutomaticMaskGenerator - "segment anything": no point/box/text prompt,
+    it just proposes every object-like segment it finds in the image. Text
+    conditioning happens downstream in _sam2_word_importance_map, which scores
+    each proposed segment against target_words in CLIP space.
+    '''
+    from sam2.sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    return SAM2AutomaticMaskGenerator.from_pretrained(model_id, device=device)
+
+
+def _sam2_word_importance_map(pil_img, target_words, mask_generator, clip_model, processor, device, similarity_threshold=0.2):
+    '''
+    "Segment anything" + text conditioning: mask_generator.generate proposes
+    every candidate segment in pil_img with no notion of target_words, then
+    each segment's bounding-box crop is CLIP-image-embedded and compared
+    against the CLIP text embeddings of target_words (same cosine-similarity
+    scoring as rewards.WordSimilarityModel, just applied per-segment instead
+    of whole-image). A segment is kept - its pixels marked important - iff its
+    best similarity to any target word clears similarity_threshold; segments
+    are unioned where they overlap. Everything SAM2 didn't segment, or
+    segmented but didn't match a target word, stays 0.
+    '''
+    w_img, h_img = pil_img.size
+    img_np = np.array(pil_img)
+
+    masks = mask_generator.generate(img_np)
+    importance_map = np.zeros((h_img, w_img), dtype=np.float32)
+    if not masks:
+        return torch.from_numpy(importance_map)
+
+    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+    text_model = CLIPTextModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").to(device)
+
+    with torch.no_grad():
+        text_inputs = {k: v.to(device) for k, v in tokenizer(target_words, padding=True, return_tensors="pt").items()}
+        text_embeds = F.normalize(text_model(**text_inputs).text_embeds, dim=-1)  # [num_words, D]
+
+        for m in masks:
+            x, y, w, h = m["bbox"]
+            x0, y0 = max(0, int(x)), max(0, int(y))
+            x1, y1 = min(w_img, int(x + w)), min(h_img, int(y + h))
+            if x1 <= x0 or y1 <= y0:
+                continue
+
+            crop = pil_img.crop((x0, y0, x1, y1))
+            inputs = {k: v.to(device) for k, v in processor(images=crop, return_tensors="pt").items()}
+            crop_embed = F.normalize(clip_model(**inputs).image_embeds, dim=-1)  # [1, D]
+            similarity = (crop_embed @ text_embeds.T).max().item()
+
+            if similarity >= similarity_threshold:
+                importance_map = np.maximum(importance_map, m["segmentation"].astype(np.float32))
+
+    return torch.from_numpy(importance_map)
+
+
+def get_importance_sam2(pil_img: Image.Image,
+             nsfw_model,
+             aesthetic_model,
+             device,
+             processor,
+             clip_model,
+             target_words: list,
+             mask_generator=None,
+             similarity_threshold: float = 0.2)->tuple[list[torch.Tensor],list[torch.Tensor],float,float]:
+    '''
+    SAM2 drop-in for get_importance: the per-patch importance doesn't come
+    from a CLIP gradient CAM at all, it comes from Segment Anything - every
+    segment SAM2 proposes for pil_img is kept (importance=1 over its pixels)
+    iff its content is close enough in CLIP space to one of target_words,
+    otherwise discarded (importance=0), via _sam2_word_importance_map. Same
+    convention as get_importance_integrated_gradients/clip_attribution_nudenet:
+    there's no per-layer map to slice, so each returned list has one element,
+    and (like clip_attribution_nudenet) nsfw/aesthetic share the identical
+    map since SAM2's segmentation isn't score-dependent. nsfw_model/
+    aesthetic_model are only used for the whole-image scores run_regression
+    needs as its target, exactly like clip_attribution_nudenet.
+    '''
+    mask_generator = mask_generator or get_sam2_mask_generator(device=device)
+
+    with torch.no_grad():
+        inputs = {k: v.to(device) for k, v in processor(images=pil_img, return_tensors="pt").items()}
+        outputs = clip_model(**inputs)
+        image_embeds = F.normalize(outputs.image_embeds, dim=-1)
+        nsfw_score = nsfw_model(image_embeds)
+        aesthetic_score = aesthetic_model(image_embeds)
+
+    importance = _sam2_word_importance_map(
+        pil_img, target_words, mask_generator, clip_model, processor, device, similarity_threshold
+    ).to(device)
+
+    return [importance], [importance], float(aesthetic_score.detach().cpu()), float(nsfw_score.detach().cpu())
+
+
 def _save_attribution_npz(dest_path, sparse_npz_path, importance_aesthetic, importance_nsfw, aesthetic_score, nsfw_score, block_list=None):
     '''
     Shared by every clip_attribution* variant (gradient-based or NudeNet-
@@ -541,6 +638,34 @@ def clip_attribution_integrated_gradients(image_src_dir:str,dest_dir:str,limit:i
     # get_importance_integrated_gradients returns a single-element list (no
     # per-layer maps to slice), so always take layer 0
     return _clip_attribution_core(image_src_dir,dest_dir,limit,sparse_dir,0,1,importance_fn,banned_words,block_list)
+
+
+def clip_attribution_sam2(image_src_dir:str,dest_dir:str,limit:int,
+                     target_words:list,
+                     sparse_dir:str="sparse_embeddings",
+                     similarity_threshold:float=0.2,
+                     sam2_model_id:str="facebook/sam2-hiera-large",
+                     block_list:list=None):
+    '''
+    Same output format/pipeline as clip_attribution, but the per-patch
+    importance comes from get_importance_sam2 (SAM2's "segment anything"
+    proposals, kept where they match target_words in CLIP space) instead of a
+    CLIP gradient CAM - the SAM2 analogue of clip_attribution_nudenet, which
+    similarly swaps in a non-gradient localization source.
+    '''
+    print("clip attribution (sam2)")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    mask_generator = get_sam2_mask_generator(sam2_model_id, device=device)
+    importance_fn = functools.partial(
+        get_importance_sam2,
+        target_words=target_words,
+        mask_generator=mask_generator,
+        similarity_threshold=similarity_threshold,
+    )
+    # get_importance_sam2 returns a single-element list (no per-layer maps to
+    # slice), so always take layer 0 - same convention as
+    # clip_attribution_integrated_gradients.
+    return _clip_attribution_core(image_src_dir,dest_dir,limit,sparse_dir,0,1,importance_fn,target_words,block_list)
 
 
 def nudenet_importance_map(detections, h_img, w_img, exclude_classes):

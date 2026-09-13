@@ -33,7 +33,7 @@ from nltk.corpus import wordnet as wn
 from sdxl_extract import extract_vanilla
 from sparsify import sparsify_embeddings, top_n_mask, get_top_k_images_highlighted
 from regression import run_regression,run_top_k_features_popularity_contest
-from attribution import clip_attribution,get_importance,clip_attribution_smoothgrad,clip_attribution_integrated_gradients,clip_attribution_nudenet,DEFAULT_BLOCK_LIST
+from attribution import clip_attribution,get_importance,clip_attribution_smoothgrad,clip_attribution_integrated_gradients,clip_attribution_nudenet,DEFAULT_BLOCK_LIST,clip_attribution_sam2
 import vlm_sae
 from rewards import get_aesthetic_model,get_nsfw_model,get_nsfw_model_text
 from transformers import CLIPVisionModelWithProjection,CLIPImageProcessor,CLIPProcessor,CLIPModel
@@ -95,10 +95,15 @@ parser.add_argument("--attribution_threshold",type=float,default=0.9) # only pat
 parser.add_argument("--weight_by_importance",action="store_true") # regress on score*patch_importance instead of the raw whole-image score
 parser.add_argument("--clip_attribution_method",type=str,default="grad_cam")
 parser.add_argument("--image_testing_dir",type=str,default="testing")
-parser.add_argument("--banned_words",nargs="*",default=[])
+parser.add_argument("--target_words",nargs="*",default=[])
 parser.add_argument("--use_vlm_sae",action="store_true") # add a block whose sparse features come from the pretrained mateuszpach/sae-for-vlm CLIP-ViT SAE (see vlm_sae.py) instead of an SDXL UNet SAE - covers sparsify/regression/popularity-contest/clip_attribution, NOT train_lora's suppression hooks (those hook UNet modules by name; a CLIP ViT layer was never part of the UNet forward pass)
+
 parser.add_argument("--vlm_layer",type=int,default=vlm_sae.VLM_LAYER) # one of 11,17,22,23 for clip-vit-large-patch14-336
 parser.add_argument("--vlm_sae_variant",type=str,default=vlm_sae.VLM_SAE_VARIANT) # batch_top_k_20_x{1,2,4,8,16,64} or matroyshka_batch_top_k_20_x{...}
+
+parser.add_argument("--similarity_threshold",type=float,default=0.2)
+
+
 job_id=os.environ["SLURM_JOB_ID"]
 parser.add_argument("--err",type=str,default=f"slurm_chip/generic/{job_id}.err")
 parser.add_argument("--out",type=str,default=f"slurm_chip/generic/{job_id}.out")
@@ -274,12 +279,16 @@ def main(args):
     mode:str=args.mode
     out:str=args.out
     err:str=args.err
-    banned_words:list=args.banned_words
+    target_words:list=args.target_words
+    
     use_vlm_sae:bool=args.use_vlm_sae
     vlm_layer:int=args.vlm_layer
     vlm_sae_variant:str=args.vlm_sae_variant
 
     clip_attribution_method:str=args.clip_attribution_method
+    
+    similarity_threshold:float=args.similarity_threshold
+    
     premade:bool  = args.premade
     lora_batch_size:int=args.lora_batch_size
     lora_rank:int=args.lora_rank
@@ -310,13 +319,15 @@ def main(args):
             vlm_sae.sparsify_vlm_embeddings(image_src_dir,sparse_embedding_dir,layer=vlm_layer,sae_variant=vlm_sae_variant,block_name=vlm_block_name)
     if not disable_clip_attribution:
         if clip_attribution_method=="grad_cam":
-            clip_attribution(image_src_dir,clip_dir,clip_limit,sparse_dir=sparse_embedding_dir,start_layer=start_layer,stop_layer=stop_layer,banned_words=banned_words,block_list=block_list)
+            clip_attribution(image_src_dir,clip_dir,clip_limit,sparse_dir=sparse_embedding_dir,start_layer=start_layer,stop_layer=stop_layer,target_words=target_words,block_list=block_list)
         elif clip_attribution_method=="integrated":
-            clip_attribution_integrated_gradients(image_src_dir,clip_dir,clip_limit,sparse_dir=sparse_embedding_dir,banned_words=banned_words,block_list=block_list)
+            clip_attribution_integrated_gradients(image_src_dir,clip_dir,clip_limit,sparse_dir=sparse_embedding_dir,target_words=target_words,block_list=block_list)
         elif clip_attribution_method=="smooth":
-            clip_attribution_smoothgrad(image_src_dir,clip_dir,clip_limit,sparse_dir=sparse_embedding_dir,start_layer=start_layer,stop_layer=stop_layer,banned_words=banned_words,block_list=block_list)
+            clip_attribution_smoothgrad(image_src_dir,clip_dir,clip_limit,sparse_dir=sparse_embedding_dir,start_layer=start_layer,stop_layer=stop_layer,target_words=target_words,block_list=block_list)
         elif clip_attribution_method=="nudenet":
-            clip_attribution_nudenet(image_src_dir,clip_dir,clip_limit,sparse_dir=sparse_embedding_dir,banned_words=banned_words,block_list=block_list)
+            clip_attribution_nudenet(image_src_dir,clip_dir,clip_limit,sparse_dir=sparse_embedding_dir,target_words=target_words,block_list=block_list)
+        elif clip_attribution_method=="sam2":
+            clip_attribution_sam2(image_src_dir,clip_dir,clip_limit,target_words,sparse_embedding_dir,)
     
     sae_checkpoints="./sdxl_unbox/checkpoints/"
     sae_dict:dict[str,SparseAutoencoder]={}
