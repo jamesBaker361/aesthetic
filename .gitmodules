@@ -14,5 +14,5 @@
 	path = CLIP_Surgery
 	url = https://github.com/xmed-lab/CLIP_Surgery.git
 [submodule "sam2"]
-	path = sam2
+	path = sam2_repo
 	url = https://github.com/facebookresearch/sam2.git

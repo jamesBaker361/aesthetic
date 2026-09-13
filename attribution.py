@@ -406,7 +406,7 @@ def get_sam2_mask_generator(model_id: str = "facebook/sam2-hiera-large", device:
     conditioning happens downstream in _sam2_word_importance_map, which scores
     each proposed segment against target_words in CLIP space.
     '''
-    from sam2.sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+    from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     return SAM2AutomaticMaskGenerator.from_pretrained(model_id, device=device)
 
