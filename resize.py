@@ -1,6 +1,7 @@
 import os
 from diffusers.image_processor import VaeImageProcessor
 from PIL import Image
+import tqdm
 
 image_processor=VaeImageProcessor()
 
@@ -8,7 +9,7 @@ src_dir="artificial_nsfw"
 
 size=512
 
-for file in os.listdir(src_dir):
+for file in tqdm.tqdm(os.listdir(src_dir)):
     img=Image.open(f"{src_dir}/{file}")
     (h,w)=img.size
     if h!=size or w!=size:
