@@ -224,6 +224,8 @@ def extract_vanilla(
                     scale=image_pt.size()[-1]//value.size()[-1]
                     small_h,small_w=(h//scale,w//scale)
                     value=value[:,:,:small_h,:small_w]
+                    if started:
+                        print(f"{key}.{name}  size ",value.size())
                     result_dict[f"{key}.{name}"]=value.cpu().detach().numpy()
             
             np.savez(npz_path,**result_dict) #no saving while debugging

@@ -547,15 +547,15 @@ def _save_attribution_npz(dest_path, sparse_npz_path, importance_aesthetic, impo
     np.savez(dest_path, **save_dict)
 
 
-def _select_nsfw_model(banned_words:list):
+def _select_nsfw_model(target_words:list):
     '''
     get_nsfw_model()'s NSFWScorer by default, or a WordSimilarityModel over
-    banned_words when given - both are callable as model(image_embeds) and
+    target_words when given - both are callable as model(image_embeds) and
     both backprop, so every clip_attribution* variant can use either
     interchangeably.
     '''
-    if banned_words:
-        return get_nsfw_model_text(banned_words)
+    if target_words:
+        return get_nsfw_model_text(target_words)
     return get_nsfw_model()
 
 
@@ -564,7 +564,7 @@ def _clip_attribution_core(image_src_dir:str,dest_dir:str,limit:int,
                      start_layer:int,
                      stop_layer:int,
                      importance_fn,
-                     banned_words:list=None,
+                     target_words:list=None,
                      block_list:list=None):
     # Step 1 of the intended pipeline: rank each spatial patch by how much it
     # drives the nsfw/aesthetic score (via importance_fn's grad*activation
@@ -577,7 +577,7 @@ def _clip_attribution_core(image_src_dir:str,dest_dir:str,limit:int,
     print("clip attributuon")
     os.makedirs(dest_dir,exist_ok=True)
     # get models
-    nsfw_model=_select_nsfw_model(banned_words)
+    nsfw_model=_select_nsfw_model(target_words)
     aesthetic_model=get_aesthetic_model()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -611,10 +611,10 @@ def clip_attribution(image_src_dir:str,dest_dir:str,limit:int,
                      sparse_dir:str="sparse_embeddings",
                      start_layer=5,
                      stop_layer=15,
-                     banned_words:list=None,
+                     target_words:list=None,
                      block_list:list=None,
                      ):
-    return _clip_attribution_core(image_src_dir,dest_dir,limit,sparse_dir,start_layer,stop_layer,get_importance,banned_words,block_list)
+    return _clip_attribution_core(image_src_dir,dest_dir,limit,sparse_dir,start_layer,stop_layer,get_importance,target_words,block_list)
 
 
 def clip_attribution_smoothgrad(image_src_dir:str,dest_dir:str,limit:int,
@@ -623,21 +623,21 @@ def clip_attribution_smoothgrad(image_src_dir:str,dest_dir:str,limit:int,
                      stop_layer=15,
                      n_samples:int=15,
                      noise_std:float=0.15,
-                     banned_words:list=None,
+                     target_words:list=None,
                      block_list:list=None):
     importance_fn=functools.partial(get_importance_smoothgrad,n_samples=n_samples,noise_std=noise_std)
-    return _clip_attribution_core(image_src_dir,dest_dir,limit,sparse_dir,start_layer,stop_layer,importance_fn,banned_words,block_list)
+    return _clip_attribution_core(image_src_dir,dest_dir,limit,sparse_dir,start_layer,stop_layer,importance_fn,target_words,block_list)
 
 
 def clip_attribution_integrated_gradients(image_src_dir:str,dest_dir:str,limit:int,
                      sparse_dir:str="sparse_embeddings",
                      n_steps:int=20,
-                     banned_words:list=None,
+                     target_words:list=None,
                      block_list:list=None):
     importance_fn=functools.partial(get_importance_integrated_gradients,n_steps=n_steps)
     # get_importance_integrated_gradients returns a single-element list (no
     # per-layer maps to slice), so always take layer 0
-    return _clip_attribution_core(image_src_dir,dest_dir,limit,sparse_dir,0,1,importance_fn,banned_words,block_list)
+    return _clip_attribution_core(image_src_dir,dest_dir,limit,sparse_dir,0,1,importance_fn,target_words,block_list)
 
 
 def clip_attribution_sam2(image_src_dir:str,dest_dir:str,limit:int,
@@ -687,7 +687,7 @@ def nudenet_importance_map(detections, h_img, w_img, exclude_classes):
 def clip_attribution_nudenet(image_src_dir:str,dest_dir:str,limit:int,
                      sparse_dir:str="sparse_embeddings",
                      exclude_classes=NUDENET_EXCLUDE_CLASSES,
-                     banned_words:list=None,
+                     target_words:list=None,
                      block_list:list=None):
     '''
     Same output format/pipeline as clip_attribution, but the per-patch
@@ -697,13 +697,13 @@ def clip_attribution_nudenet(image_src_dir:str,dest_dir:str,limit:int,
     (see nudenet_importance_map). No forward/backward CAM needed for the
     importance itself - nsfw_model/aesthetic_model/clip_model/processor are
     only used for the whole-image scores run_regression needs as its target
-    (nsfw_model swaps to a WordSimilarityModel over banned_words when given,
+    (nsfw_model swaps to a WordSimilarityModel over target_words when given,
     same as every other clip_attribution* variant); NudeDetector does the
     actual localization.
     '''
     print("clip attribution (nudenet)")
     os.makedirs(dest_dir,exist_ok=True)
-    nsfw_model=_select_nsfw_model(banned_words)
+    nsfw_model=_select_nsfw_model(target_words)
     aesthetic_model=get_aesthetic_model()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
