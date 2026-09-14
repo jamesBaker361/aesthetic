@@ -11,6 +11,7 @@ from diffusers import DiffusionPipeline, AutoencoderKL
 import torch
 from PIL import Image
 import numpy as np
+import torch.nn.functional as F
 
 import time
 from tqdm import tqdm
@@ -112,33 +113,41 @@ def extract_vanilla(
     print("vae type ",type(vae))
     assert_no_nan(vae)
             
-    path_list=[f for f in os.listdir(src_dir) if f.endswith(".jpg") or f.endswith("jpeg")]
+    path_list=[f for f in os.listdir(src_dir) if f.lower().endswith((".jpg",".jpeg"))]
     count=len([p for p in os.listdir(save_dir) if p.endswith(".npz")])
-    
+
     print(f"processed {count}/{len(path_list)} images")
-    
+
     session_count=0
     started=True
-    
+
     for r,jpg_path in enumerate(tqdm(path_list)):
-        if r==limit:
+        if limit >= 0 and session_count == limit:
             break
 
         npz_path=os.path.join(save_dir,jpg_path+".npz")
         if os.path.exists(npz_path):
             continue
-        
+
         image=Image.open(os.path.join(src_dir,jpg_path)).convert("RGB")
         (h,w)=image.size
         if h<4 or w<4:
             print("hella small ",jpg_path)
             continue
+        if h>size or w>size:
+            scale = size/float(max(h,w))
+            image = image.resize((int(scale*h),int(scale*w)))
+        real_sizes=[]
         with torch.no_grad():
-            
+            real_sizes.append(image.size)
             result_dict={}
-            image_pt=image_processor.preprocess(image,size,size).to(device=device,dtype=dtype) #all images have to be the same size so we can do batching
+            image_pt=image_processor.preprocess(image).to(device=device,dtype=dtype) #all images have to be the same size so we can do batching
+            _, _, h, w = image_pt.shape
+            pad_h, pad_w = max(0, size - h), max(0, size - w)
+            image_pt = F.pad(image_pt, (0, pad_w, 0, pad_h))  # pad only right/bottom, keep original anchored top-left
+
             if started:
-                print("image size ",image_pt.size())
+                print("image size ",image_pt.size(),image.size)
             if torch.isnan(image_pt).any():
                 print("nann image")
                 
@@ -205,12 +214,16 @@ def extract_vanilla(
             for name,block in block_dict.items():
                 for key in ["saved_output","saved_input"]:
                     value=getattr(block,key)
+                    
                     if type(value)==tuple:
                         value=value[0]
                     if torch.isnan(value).any():
                         print(npz_path,"nan value ",key)
                     if started:
                         print(f"{key}.{name}  size ",value.size())
+                    scale=image_pt.size()[-1]//value.size()[-1]
+                    small_h,small_w=(h//scale,w//scale)
+                    value=value[:,:,:small_h,:small_w]
                     result_dict[f"{key}.{name}"]=value.cpu().detach().numpy()
             
             np.savez(npz_path,**result_dict) #no saving while debugging
