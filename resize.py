@@ -21,5 +21,5 @@ for file in tqdm.tqdm(os.listdir(src_dir)):
 
         new_image=image_processor.postprocess(image_pt)[0]
         new_image.save(f"{src_dir}/{file}")
-    except UnidentifiedImageError:
+    except:
         pass
