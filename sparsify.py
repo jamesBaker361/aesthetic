@@ -114,7 +114,7 @@ def get_top_k_heap(block:str,
         with open(cache_path) as f:
             return [tuple(pair) for pair in json.load(f)]
 
-    files = [f for f in os.listdir(image_src_dir) if f.endswith("jpeg","jpg")]
+    files = [f for f in os.listdir(image_src_dir) if f.endswith(("jpeg","jpg"))]
     if limit>=0:
         files=files[:limit]
 
