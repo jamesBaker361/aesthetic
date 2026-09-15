@@ -16,3 +16,6 @@
 [submodule "sam2"]
 	path = sam2_repo
 	url = https://github.com/facebookresearch/sam2.git
+[submodule "sam3_repo"]
+	path = sam3_repo
+	url = https://github.com/facebookresearch/sam3.git
