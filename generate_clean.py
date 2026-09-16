@@ -327,7 +327,7 @@ def main(args):
         elif clip_attribution_method=="nudenet":
             clip_attribution_nudenet(image_src_dir,clip_dir,clip_limit,sparse_dir=sparse_embedding_dir,target_words=target_words,block_list=block_list)
         elif clip_attribution_method=="sam2":
-            clip_attribution_sam2(image_src_dir,clip_dir,clip_limit,target_words,sparse_embedding_dir,)
+            clip_attribution_sam2(image_src_dir,clip_dir,clip_limit,target_words,sparse_embedding_dir,similarity_threshold,)
     
     sae_checkpoints="./sdxl_unbox/checkpoints/"
     sae_dict:dict[str,SparseAutoencoder]={}
