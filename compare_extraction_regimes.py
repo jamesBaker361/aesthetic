@@ -66,7 +66,7 @@ for block in BLOCKS:
             f"unet.{block}_k10_hidden5120_auxk256_bs4096_lr0.0001",
             "final",
         )
-    )
+    ).to(device)  # load_from_disk loads on CPU; a_flat/b_flat are GPU tensors
 
 # --- Step 1: generation regime - exactly matches collect_latents_dataset.py ---
 positions_to_cache = [f"unet.{block}" for block in BLOCKS]
