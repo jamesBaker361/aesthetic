@@ -33,7 +33,12 @@ from sdxl_unbox.SDLens.hooked_sd_pipeline import HookedStableDiffusionXLPipeline
 from sdxl_unbox.SAE import SparseAutoencoder
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-dtype = torch.float32  # matches sdxl_unbox/example.ipynb's own comparison dtype - avoid fp16 rounding as a confound
+# float32 SDXL-turbo (~3.5B params across UNet + 2 text encoders + VAE) needs
+# ~14GB just for weights, which OOMs on the smaller nodes in the generic gpu
+# pool (10.58GB seen on g20-01). fp16 halves that to ~7GB. Both extraction
+# regimes go through the same dtype, so fp16 rounding is common-mode and
+# shouldn't bias the regime-to-regime comparison itself.
+dtype = torch.float16 if device == "cuda" else torch.float32
 
 BLOCKS = [
     "down_blocks.2.attentions.1",
@@ -161,8 +166,11 @@ for ax, block in zip(axes, BLOCKS):
 
     sae = saes[block]
     with torch.no_grad():
-        a_codes = sae.encode(a_flat)
-        b_codes = sae.encode(b_flat)
+        # SparseAutoencoder's own weights stay float32 regardless of pipe
+        # dtype (load_state_dict preserves the destination param's dtype),
+        # so cast here to avoid a dtype-mismatch crash under fp16
+        a_codes = sae.encode(a_flat.float())
+        b_codes = sae.encode(b_flat.float())
     sae_cos = F.cosine_similarity(a_codes, b_codes, dim=-1)
 
     a_active = a_codes > 0
