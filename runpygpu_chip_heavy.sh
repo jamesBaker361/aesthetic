@@ -20,7 +20,7 @@
 
 #SBATCH --error=slurm_chip/generic/%j.err   # STDERR output file (optional)
 
-#SBATCH --constraint='L40S|H100'
+#SBATCH --constraint='L40S|H100|rtx_8000|rtx_6000'
 
 
 day=$(date +'%m/%d/%Y %R')
