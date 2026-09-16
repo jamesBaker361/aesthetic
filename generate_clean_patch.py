@@ -3,7 +3,9 @@
 import os
 import json
 import random
+import re
 import argparse
+import urllib.request
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.saving_helpers import save_and_load_functions
 from experiment_helpers.argprint import print_args
@@ -88,8 +90,52 @@ def get_or_make_partition(image_src_dir:str,partition_path:str,train_frac:float,
     return partition
 
 
+# commit pinned by the notebook's own `pip install saev@<sha>` cell, so the
+# constants parsed out of it can't silently drift if main changes later
+_SAEV_NOTEBOOK_COMMIT="6d6eff52c4ae04f5153badc0a553adddc8d3e3cc"
+_SAEV_NOTEBOOK_URL=f"https://raw.githubusercontent.com/Imageomics/saev/{_SAEV_NOTEBOOK_COMMIT}/examples/inference.ipynb"
+# which notebook cell (matched by its `..._SCALAR = ` variable name) holds the
+# norm constants for each ckpt we know how to fetch
+_DINO_NORM_VAR_BY_CKPT={
+    "dinov2_vitb14_reg":"DINOV2_IMAGENET1K",
+}
+
+
+def download_dino_norm_file(vit_ckpt:str,norm_path:str):
+    var_prefix=_DINO_NORM_VAR_BY_CKPT.get(vit_ckpt)
+    if var_prefix is None:
+        raise ValueError(
+            f"no known source for '{vit_ckpt}' normalization constants - "
+            f"add it to _DINO_NORM_VAR_BY_CKPT or drop a {os.path.basename(norm_path)} file in dino_norms/ by hand"
+        )
+
+    with urllib.request.urlopen(_SAEV_NOTEBOOK_URL) as resp:
+        notebook=json.load(resp)
+
+    source=""
+    for cell in notebook["cells"]:
+        text="".join(cell.get("source",[]))
+        if f"{var_prefix}_SCALAR" in text and f"{var_prefix}_MEAN" in text:
+            source=text
+            break
+    if not source:
+        raise RuntimeError(f"couldn't find {var_prefix}_SCALAR/{var_prefix}_MEAN in {_SAEV_NOTEBOOK_URL}")
+
+    scalar=float(re.search(rf"{var_prefix}_SCALAR\s*=\s*([0-9.eE+-]+)",source).group(1))
+    list_src=source[source.index(f"{var_prefix}_MEAN"):]
+    inner=list_src[list_src.index("[")+1:list_src.index("]")]
+    mean=[float(x.strip()) for x in inner.split(",") if x.strip()]
+
+    os.makedirs(os.path.dirname(norm_path),exist_ok=True)
+    with open(norm_path,"w") as f:
+        json.dump({"scalar":scalar,"mean":mean},f)
+
+
 def load_dino_normalize_fn(vit_ckpt:str):
     norm_path=os.path.join(os.path.dirname(os.path.abspath(__file__)),"dino_norms",f"{vit_ckpt}_in1k.json")
+    if not os.path.exists(norm_path):
+        print(f"{norm_path} not found, downloading normalization constants from {_SAEV_NOTEBOOK_URL}...")
+        download_dino_norm_file(vit_ckpt,norm_path)
     with open(norm_path) as f:
         data=json.load(f)
     mean=torch.tensor(data["mean"])
