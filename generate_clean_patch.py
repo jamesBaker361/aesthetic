@@ -31,10 +31,10 @@ from sklearn.metrics import roc_auc_score,average_precision_score
 from PIL import Image
 from torchvision.transforms import v2
 
-import saev.src.saev.data.models
-import saev.src.saev.data.shards
-import saev.src.saev.nn
-import saev.src.saev.viz
+import saev.data.models
+import saev.data.shards
+import saev.nn
+import saev.viz
 
 from sam3_repo.sam3.model_builder import build_sam3_image_model
 from sam3_repo.sam3.model.sam3_image_processor import Sam3Processor
