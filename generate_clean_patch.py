@@ -20,6 +20,9 @@ import torch.nn.functional as F
 import numpy as np
 import csv
 import sys
+
+sys.path.append("/umbc/rs/pi_donengel/users/jbaker15/aesthetic/saev_repo/src")
+
 import shutil
 import time
 from scipy.stats import rankdata

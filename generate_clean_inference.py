@@ -81,7 +81,8 @@ def read_prompts(prompt_file: str) -> list:
 
 
 def generate_and_cache(image_src_dir: str, embedding_dir: str, prompt_file: str, block_list: list,
-                        size: int, num_inference_steps: int, guidance_scale: float, mixed_precision: str, device):
+                        size: int, num_inference_steps: int, guidance_scale: float, mixed_precision: str, device,
+                        limit: int = -1):
     '''
     Generates one image per prompt AND caches each block's UNet input/output
     for that same generation, in a single stabilityai/sdxl-turbo pass - exactly
@@ -104,6 +105,8 @@ def generate_and_cache(image_src_dir: str, embedding_dir: str, prompt_file: str,
     pipe.set_progress_bar_config(disable=True)
 
     positions = [f"unet.{block}" for block in block_list]
+    if limit >= 0:
+        prompts = prompts[:limit]
 
     for i, prompt in enumerate(prompts):
         image_path = os.path.join(image_src_dir, f"prompt_{i}.jpg")
@@ -267,7 +270,8 @@ def main(args):
 
     if not args.disable_generate:
         generate_and_cache(image_src_dir, embedding_dir, args.prompt_file, block_list,
-                            args.size, args.num_inference_steps, args.guidance_scale, args.mixed_precision, device)
+                            args.size, args.num_inference_steps, args.guidance_scale, args.mixed_precision, device,
+                            args.limit)
 
     partition = get_or_make_partition(image_src_dir, args.partition_path, args.train_frac, args.seed)
     train_images, test_images = partition["train"], partition["test"]
