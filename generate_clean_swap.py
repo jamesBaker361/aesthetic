@@ -15,7 +15,6 @@ import torch
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.argprint import print_args
 from experiment_helpers.init_helpers import default_parser, repo_api_init
-from diffusers import UNet2DConditionModel
 
 from sdxl_unbox.SAE import SparseAutoencoder
 from sdxl_pipe import HookedStableDiffusionXLWithUNetPipeline
@@ -48,7 +47,6 @@ parser.add_argument("--image_dest_dir", type=str, default="swapped_images")
 parser.add_argument("--save_baseline", action="store_true")
 
 SAE_CHECKPOINTS = "./sdxl_unbox/checkpoints/"
-COUNTER = "step_counter"
 
 
 def load_sae(block: str) -> SparseAutoencoder:
@@ -80,47 +78,39 @@ def sae_forward_swap(sae: SparseAutoencoder, x: torch.Tensor, from_vec, alpha: f
     return sae.decode_sparse(inds, torch.relu(vals))
 
 
-def hookify(unet: UNet2DConditionModel, sae_dict: dict, vec_dict: dict, mode: str, start_step: int, end_step: int,
-            alpha: float, beta: float, device) -> list:
-    SAE_ATTR = "cached_sae"
-    FROM_VEC = "swap_from_vec"
-    TO_VEC = "swap_to_vec"
-    module_dict = dict(unet.named_modules())
+def make_swap_hook(sae: SparseAutoencoder, from_vec, to_vec, mode: str, start_step: int, end_step: int,
+                    alpha: float, beta: float, device):
+    # own step counter per hook closure - a fresh one is built for every
+    # pipe.run_with_hooks() call, so it doesn't need resetting between prompts
+    step_counter = {"step": 0}
 
-    def make_hook():
-        def hook_fn(module, input, output):
-            step = getattr(module, COUNTER)
-            if step >= start_step and step <= end_step:
-                out = output[0] if isinstance(output, tuple) else output
-                inp = input[0] if isinstance(input, tuple) else input
-                if mode == "diff":
-                    out = out - inp
-                sae: SparseAutoencoder = getattr(module, SAE_ATTR)
-                from_vec = getattr(module, FROM_VEC)
-                to_vec = getattr(module, TO_VEC)
-                # hook output is channel-first (B,C,H,W); the SAE (as everywhere
-                # else it's used, e.g. sparsify.py) expects channel-last (...,d_model)
-                out = sae_forward_swap(sae, out.permute(0, 2, 3, 1), from_vec, alpha, to_vec, beta)
-                out = out.permute(0, 3, 1, 2).to(device)
-                output = (out, *output[1:]) if isinstance(output, tuple) else out
-            setattr(module, COUNTER, step + 1)
-            return output
-        return hook_fn
+    def hook_fn(module, input, output):
+        step = step_counter["step"]
+        if start_step <= step <= end_step:
+            out = output[0] if isinstance(output, tuple) else output
+            inp = input[0] if isinstance(input, tuple) else input
+            if mode == "diff":
+                out = out - inp
+            # hook output is channel-first (B,C,H,W); the SAE (as everywhere
+            # else it's used, e.g. sparsify.py) expects channel-last (...,d_model)
+            out = sae_forward_swap(sae, out.permute(0, 2, 3, 1), from_vec, alpha, to_vec, beta)
+            out = out.permute(0, 3, 1, 2).to(device)
+            output = (out, *output[1:]) if isinstance(output, tuple) else out
+        step_counter["step"] = step + 1
+        return output
 
-    mods = []
+    return hook_fn
+
+
+def make_position_hook_dict(sae_dict: dict, vec_dict: dict, mode: str, start_step: int, end_step: int,
+                             alpha: float, beta: float, device) -> dict:
+    position_hook_dict = {}
     for block, sae in sae_dict.items():
-        mod = module_dict.get(block)
-        if mod is None:
-            continue
         from_vec, to_vec = vec_dict[block]
-        mod.register_forward_hook(make_hook())
-        setattr(mod, SAE_ATTR, sae)
-        setattr(mod, FROM_VEC, from_vec)
-        setattr(mod, TO_VEC, to_vec)
-        setattr(mod, COUNTER, 0)
-        mods.append(mod)
-    print(f"registered {len(mods)} swap hooks")
-    return mods
+        position_hook_dict[f"unet.{block}"] = make_swap_hook(
+            sae, from_vec, to_vec, mode, start_step, end_step, alpha, beta, device
+        )
+    return position_hook_dict
 
 
 def main(args):
@@ -168,14 +158,20 @@ def main(args):
                                    num_inference_steps=args.num_inference_steps, generator=baseline_gen).images[0]
             baseline_image.save(os.path.join(args.image_dest_dir, f"baseline_{i}.jpg"))
 
-    mods = hookify(pipe.unet, sae_dict, vec_dict, mode, args.start_step, args.end_step, args.alpha, args.beta, device)
     for i, prompt in enumerate(prompts):
-        for mod in mods:
-            setattr(mod, COUNTER, 0)
         rand_gen = torch.Generator()
         rand_gen.manual_seed(i)
-        swapped_image = pipe(prompt, height=args.size, width=args.size, guidance_scale=args.guidance_scale,
-                              num_inference_steps=args.num_inference_steps, generator=rand_gen).images[0]
+        # a fresh position_hook_dict per prompt - run_with_hooks registers
+        # these and removes them again once pipe() returns, so each hook's
+        # own step_counter naturally starts at 0 for every generation
+        position_hook_dict = make_position_hook_dict(
+            sae_dict, vec_dict, mode, args.start_step, args.end_step, args.alpha, args.beta, device
+        )
+        swapped_image = pipe.run_with_hooks(
+            prompt, position_hook_dict=position_hook_dict,
+            height=args.size, width=args.size, guidance_scale=args.guidance_scale,
+            num_inference_steps=args.num_inference_steps, generator=rand_gen,
+        ).images[0]
         swapped_image.save(os.path.join(args.image_dest_dir, f"{safe_suffix}_{i}.jpg"))
 
 
