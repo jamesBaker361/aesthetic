@@ -8,12 +8,21 @@
 # (same as generate_clean.py) -> for each query in query_list, use SAM3 to find
 # which patches of each generated image depict that query, at EVERY block's
 # own spatial resolution -> discover the most discriminative SAE latents for
-# that query per block (same AUROC technique as generate_clean_patch.py) and
-# average the (relu'd) sparse activation over the query's positive patches.
-# That per-block mean vector is "the SAE embedding" for the query - saved into
-# a single npz_dict keyed by "{query}__{block}" so generate_clean_swap.py can
-# later subtract it (remove the query) or subtract-and-inject another query's
-# vector (replace one query with another) at generation time.
+# that query per block and build a per-block "SAE embedding" vector for it -
+# saved into a single npz_dict keyed by "{query}__{block}" so generate_clean_swap.py
+# can later subtract it (remove the query) or subtract-and-inject another
+# query's vector (replace one query with another) at generation time.
+#
+# --feature_selection controls how that per-block vector is built:
+#   "auroc" (default): same technique as generate_clean_patch.py - rank latents
+#     by AUROC, keep the top_k, and average the (relu'd) sparse activation over
+#     the query's positive patches across all latents.
+#   "bce": Eq. (7) / p.5 of "Rediscovering SAEs" (arXiv:2511.17735) - fit a
+#     per-latent ridge-regularized 1D logistic regression (ridge=1e-8, 30
+#     Newton steps, w0=0, b0=prevalence - the appendix's "1D Probe Training"
+#     hyperparameters) and pick the single latent with lowest training binary
+#     cross-entropy for the query ("unsupervised feature-to-concept matching").
+#     The saved vector is then all-zero except at that one latent.
 
 import os
 import json
@@ -24,6 +33,7 @@ import numpy as np
 import torch
 from PIL import Image
 from scipy.stats import rankdata
+from scipy.special import expit
 from sklearn.metrics import roc_auc_score, average_precision_score
 
 from experiment_helpers.gpu_details import print_details
@@ -68,6 +78,15 @@ parser.add_argument("--mode", type=str, default="diff")  # fed to sparsify_embed
 
 parser.add_argument("--top_k", type=int, default=10)
 parser.add_argument("--n_visualize", type=int, default=5)
+
+parser.add_argument("--feature_selection", type=str, default="auroc", choices=["auroc", "bce"],
+                     help="'auroc': top_k-AUROC latents + positive-patch averaging (default, generate_clean_patch style). "
+                          "'bce': Eq. (7) of arXiv:2511.17735 - single lowest-training-BCE latent per query/block "
+                          "via a ridge-regularized 1D logistic regression (see appendix hyperparameters below).")
+parser.add_argument("--bce_ridge", type=float, default=1e-8,
+                     help="ridge regularization strength for --feature_selection=bce (paper appendix default)")
+parser.add_argument("--bce_newton_steps", type=int, default=30,
+                     help="number of Newton-method steps for --feature_selection=bce (paper appendix default)")
 
 parser.add_argument("--disable_generate", action="store_true")
 parser.add_argument("--disable_sparsify_embeddings", action="store_true")
@@ -189,7 +208,53 @@ def load_block_feats_and_labels(images: list, sparse_embedding_dir: str, mask_di
     return np.concatenate(feats_list, axis=0), np.concatenate(labels_list, axis=0)
 
 
-def discover_query_block(train_images: list, sparse_embedding_dir: str, mask_dir: str, query: str, block: str, top_k: int):
+def fit_1d_ridge_logistic(feats: np.ndarray, labels: np.ndarray, ridge: float, n_newton_steps: int):
+    """
+    Per-latent 1D ridge-regularized logistic regression, fit for every latent
+    at once via Newton's method (closed-form 2x2 Hessian inverse per latent).
+    Matches Eq. (7) and the "1D Probe Training" hyperparameters in the
+    appendix of "Rediscovering SAEs" (arXiv:2511.17735): w0=0, b0=prevalence,
+    solved with a handful of Newton steps under a small ridge penalty on w.
+
+    feats: (n_samples, n_dirs); labels: (n_samples,) 0/1, shared across latents.
+    Returns w, b, loss - each (n_dirs,) - loss is the unregularized mean
+    binary cross-entropy of the fitted probe on the training set (Eq. (7)).
+    """
+    y = labels.astype(np.float64)
+    z = feats.astype(np.float64)
+    n_dirs = z.shape[1]
+    prevalence = y.mean()
+
+    w = np.zeros(n_dirs, dtype=np.float64)
+    b = np.full(n_dirs, prevalence, dtype=np.float64)
+
+    for _ in range(n_newton_steps):
+        p = expit(w[None, :] * z + b[None, :])
+        resid = p - y[:, None]
+        s = p * (1.0 - p)
+
+        g_w = np.einsum("ij,ij->j", resid, z) + 2.0 * ridge * w
+        g_b = resid.sum(axis=0)
+
+        h_ww = np.einsum("ij,ij->j", s, z * z) + 2.0 * ridge
+        h_wb = np.einsum("ij,ij->j", s, z)
+        h_bb = s.sum(axis=0)
+
+        det = h_ww * h_bb - h_wb * h_wb
+        det = np.where(np.abs(det) < 1e-12, 1e-12, det)
+
+        w = w - (h_bb * g_w - h_wb * g_b) / det
+        b = b - (h_ww * g_b - h_wb * g_w) / det
+
+    p = np.clip(expit(w[None, :] * z + b[None, :]), 1e-12, 1 - 1e-12)
+    loss = -(y[:, None] * np.log(p) + (1 - y[:, None]) * np.log(1 - p)).mean(axis=0)
+
+    return w, b, loss
+
+
+def discover_query_block(train_images: list, sparse_embedding_dir: str, mask_dir: str, query: str, block: str,
+                          top_k: int, feature_selection: str = "auroc", bce_ridge: float = 1e-8,
+                          bce_newton_steps: int = 30):
     feats, labels = load_block_feats_and_labels(train_images, sparse_embedding_dir, mask_dir, query, block)
     if feats is None:
         return None
@@ -199,24 +264,41 @@ def discover_query_block(train_images: list, sparse_embedding_dir: str, mask_dir
     if n_pos == 0 or n_neg == 0:
         return None
 
-    # per-latent AUROC via rank-sum form of Mann-Whitney U (same technique as
-    # generate_clean_patch.discover_top_features) - avoids one roc_auc_score
-    # call per latent when there can be thousands of them
-    ranks = rankdata(feats, axis=0)
-    sum_ranks_pos = ranks[labels].sum(axis=0)
-    auc = (sum_ranks_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+    if feature_selection == "bce":
+        # Eq. (7): fit every latent's 1D probe and keep only the single
+        # feature with lowest training BCE for this concept - "unsupervised
+        # feature-to-concept matching" - instead of a top_k AUROC shortlist.
+        _, _, loss = fit_1d_ridge_logistic(feats, labels, bce_ridge, bce_newton_steps)
+        best_idx = int(np.argmin(loss))
+        top_idx = np.array([best_idx], dtype=np.int64)
+        top_score = loss[[best_idx]].astype(np.float32)  # lower is better (this is a loss, not an AUROC)
 
-    top_idx = np.argsort(auc)[::-1][:top_k]
+        # the SAE embedding for this query/block is now all-zero except at
+        # the single matched latent, set to its mean activation over the
+        # positive (on-target) patches
+        mean_vec = np.zeros(feats.shape[1], dtype=np.float32)
+        mean_vec[best_idx] = feats[labels, best_idx].mean()
+    else:
+        # per-latent AUROC via rank-sum form of Mann-Whitney U (same technique
+        # as generate_clean_patch.discover_top_features) - avoids one
+        # roc_auc_score call per latent when there can be thousands of them
+        ranks = rankdata(feats, axis=0)
+        sum_ranks_pos = ranks[labels].sum(axis=0)
+        auc = (sum_ranks_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
 
-    # "the SAE embedding" for this query/block: mean of the (already relu'd,
-    # top-k-sparse) latent vectors over the positive (on-target) patches -
-    # this is what generate_clean_swap.py subtracts/injects at generation time
-    mean_vec = feats[labels].mean(axis=0).astype(np.float32)
+        top_idx = np.argsort(auc)[::-1][:top_k].astype(np.int64)
+        top_score = auc[top_idx].astype(np.float32)
+
+        # "the SAE embedding" for this query/block: mean of the (already
+        # relu'd, top-k-sparse) latent vectors over the positive (on-target)
+        # patches - this is what generate_clean_swap.py subtracts/injects at
+        # generation time
+        mean_vec = feats[labels].mean(axis=0).astype(np.float32)
 
     return {
         "mean_vec": mean_vec,
-        "top_idx": top_idx.astype(np.int64),
-        "top_auc": auc[top_idx].astype(np.float32),
+        "top_idx": top_idx,
+        "top_auc": top_score,
         "n_pos": n_pos,
         "n_neg": n_neg,
     }
@@ -296,7 +378,8 @@ def main(args):
         for query in query_list:
             for block in block_list:
                 print(f"discovering SAE embedding for '{query}' / {block} ...")
-                result = discover_query_block(train_images, sparse_embedding_dir, mask_dir, query, block, args.top_k)
+                result = discover_query_block(train_images, sparse_embedding_dir, mask_dir, query, block, args.top_k,
+                                               args.feature_selection, args.bce_ridge, args.bce_newton_steps)
                 if result is None:
                     print(f"  skipped: no positive/negative patch contrast for '{query}' at {block}")
                     continue
