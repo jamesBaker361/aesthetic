@@ -95,12 +95,13 @@ def make_swap_hook(sae: SparseAutoencoder, from_vec, to_vec, mode: str, start_st
         if start_step <= step <= end_step:
             out = output[0] if isinstance(output, tuple) else output
             inp = input[0] if isinstance(input, tuple) else input
+            orig_dtype = out.dtype  # the SAE runs in float32 regardless of the pipe's dtype (fp16)
             if mode == "diff":
                 out = out - inp
             # hook output is channel-first (B,C,H,W); the SAE (as everywhere
             # else it's used, e.g. sparsify.py) expects channel-last (...,d_model)
             out = sae_forward_swap(sae, out.permute(0, 2, 3, 1), from_vec, alpha, to_vec, beta)
-            out = out.permute(0, 3, 1, 2).to(device)
+            out = out.permute(0, 3, 1, 2).to(device=device, dtype=orig_dtype)
             output = (out, *output[1:]) if isinstance(output, tuple) else out
         step_counter["step"] = step + 1
         return output
