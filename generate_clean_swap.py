@@ -68,6 +68,11 @@ def get_query_vec(npz_data: dict, query: str, block: str, device):
 
 
 def sae_forward_swap(sae: SparseAutoencoder, x: torch.Tensor, from_vec, alpha: float, to_vec, beta: float):
+    # x arrives as (B,H,W,d_model); decode_sparse (unlike sae.encode) hard-codes
+    # rows, cols = inds.shape[0], self.n_dirs and only accepts 2D (N,k) inds -
+    # flatten the spatial dims before topk/decode and restore them after
+    orig_shape = x.shape
+    x = x.reshape(-1, orig_shape[-1])
     x = x - sae.pre_bias
     latents_pre_act = sae.encoder(x) + sae.latent_bias
     if from_vec is not None:
@@ -75,7 +80,8 @@ def sae_forward_swap(sae: SparseAutoencoder, x: torch.Tensor, from_vec, alpha: f
     if to_vec is not None:
         latents_pre_act = latents_pre_act + beta * to_vec
     vals, inds = torch.topk(latents_pre_act, k=sae.k, dim=-1)
-    return sae.decode_sparse(inds, torch.relu(vals))
+    recons = sae.decode_sparse(inds, torch.relu(vals))
+    return recons.reshape(*orig_shape[:-1], recons.shape[-1])
 
 
 def make_swap_hook(sae: SparseAutoencoder, from_vec, to_vec, mode: str, start_step: int, end_step: int,
