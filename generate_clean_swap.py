@@ -20,6 +20,7 @@ from sdxl_unbox.SAE import SparseAutoencoder
 from sdxl_pipe import HookedStableDiffusionXLWithUNetPipeline
 from attribution import DEFAULT_BLOCK_LIST
 from generate_clean_inference import read_prompts
+from experiment_helpers.image_helpers import concat_images_horizontally
 
 parser = default_parser(
     {
@@ -44,7 +45,7 @@ parser.add_argument("--num_inference_steps", type=int, default=8)
 parser.add_argument("--size", type=int, default=512)
 parser.add_argument("--guidance_scale", type=float, default=0.0)
 parser.add_argument("--image_dest_dir", type=str, default="swapped_images")
-parser.add_argument("--save_baseline", action="store_true")
+parser.add_argument("--save_baseline", action="store_true")  # concat the no-hook baseline (same seed+prompt) alongside the swapped image
 
 SAE_CHECKPOINTS = "./sdxl_unbox/checkpoints/"
 
@@ -157,15 +158,38 @@ def main(args):
     suffix = f"remove_{query}" if not replace_query else f"{query}_to_{replace_query}"
     safe_suffix = suffix.replace(" ", "_")
 
-    if args.save_baseline:
-        for i, prompt in enumerate(prompts):
+    # vec_dict with every to_vec dropped: subtracts the removed query's
+    # embedding same as a full swap would, but never injects replace_query's
+    removal_only_vec_dict = {block: (from_vec, None) for block, (from_vec, _) in vec_dict.items()}
+
+    for i, prompt in enumerate(prompts):
+        panels = []
+
+        if args.save_baseline:
+            # same seed + prompt as the hooked runs below, just without any
+            # hooks registered, so it's the "before" half of the comparison
             baseline_gen = torch.Generator()
             baseline_gen.manual_seed(i)
             baseline_image = pipe(prompt, height=args.size, width=args.size, guidance_scale=args.guidance_scale,
                                    num_inference_steps=args.num_inference_steps, generator=baseline_gen).images[0]
-            baseline_image.save(os.path.join(args.image_dest_dir, f"baseline_{i}.jpg"))
+            panels.append(baseline_image)
 
-    for i, prompt in enumerate(prompts):
+        if replace_query:
+            # same seed again, hooked but only ever subtracting from_vec -
+            # shows removal alone, without replace_query's injection - always
+            # included when doing a replace, not just when --save_baseline
+            removal_gen = torch.Generator()
+            removal_gen.manual_seed(i)
+            removal_hook_dict = make_position_hook_dict(
+                sae_dict, removal_only_vec_dict, mode, args.start_step, args.end_step, args.alpha, args.beta, device
+            )
+            removal_only_image = pipe.run_with_hooks(
+                prompt, position_hook_dict=removal_hook_dict,
+                height=args.size, width=args.size, guidance_scale=args.guidance_scale,
+                num_inference_steps=args.num_inference_steps, generator=removal_gen,
+            ).images[0]
+            panels.append(removal_only_image)
+
         rand_gen = torch.Generator()
         rand_gen.manual_seed(i)
         # a fresh position_hook_dict per prompt - run_with_hooks registers
@@ -179,7 +203,10 @@ def main(args):
             height=args.size, width=args.size, guidance_scale=args.guidance_scale,
             num_inference_steps=args.num_inference_steps, generator=rand_gen,
         ).images[0]
-        swapped_image.save(os.path.join(args.image_dest_dir, f"{safe_suffix}_{i}.jpg"))
+        panels.append(swapped_image)
+
+        out_image = concat_images_horizontally(panels) if len(panels) > 1 else swapped_image
+        out_image.save(os.path.join(args.image_dest_dir, f"{safe_suffix}_{i}.jpg"))
 
 
 if __name__ == '__main__':
