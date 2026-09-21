@@ -16,11 +16,15 @@ from experiment_helpers.gpu_details import print_details
 from experiment_helpers.argprint import print_args
 from experiment_helpers.init_helpers import default_parser, repo_api_init
 
+from PIL import Image
+
 from sdxl_unbox.SAE import SparseAutoencoder
 from sdxl_pipe import HookedStableDiffusionXLWithUNetPipeline
 from attribution import DEFAULT_BLOCK_LIST
-from generate_clean_inference import read_prompts
+from generate_clean_inference import read_prompts, get_query_pixel_mask, resize_mask_to_grid
 from experiment_helpers.image_helpers import concat_images_horizontally
+from sam3_repo.sam3.model_builder import build_sam3_image_model
+from sam3_repo.sam3.model.sam3_image_processor import Sam3Processor
 
 parser = default_parser(
     {
@@ -68,28 +72,51 @@ def get_query_vec(npz_data: dict, query: str, block: str, device):
     return torch.tensor(npz_data[key], device=device, dtype=torch.float32)
 
 
-def sae_forward_swap(sae: SparseAutoencoder, x: torch.Tensor, from_vec, alpha: float, to_vec, beta: float):
+def highlight_pixel_mask(image: Image.Image, pixel_mask: np.ndarray, color=(255, 255, 0), alpha: float = 0.45) -> Image.Image:
+    # tint every pixel SAM3 flagged as the target query so it's visible at a
+    # glance which patches the "removed" concept was actually found in
+    img_np = np.array(image.convert("RGB")).astype(np.float32)
+    highlighted = img_np.copy()
+    highlighted[pixel_mask] = (1 - alpha) * img_np[pixel_mask] + alpha * np.array(color, dtype=np.float32)
+    return Image.fromarray(np.uint8(highlighted))
+
+
+def sae_forward_swap(sae: SparseAutoencoder, x: torch.Tensor, from_vec, alpha: float, to_vec, beta: float,
+                      patch_mask: torch.Tensor = None):
     # x arrives as (B,H,W,d_model); decode_sparse (unlike sae.encode) hard-codes
     # rows, cols = inds.shape[0], self.n_dirs and only accepts 2D (N,k) inds -
     # flatten the spatial dims before topk/decode and restore them after
     orig_shape = x.shape
+    b = orig_shape[0]
     x = x.reshape(-1, orig_shape[-1])
     x = x - sae.pre_bias
     latents_pre_act = sae.encoder(x) + sae.latent_bias
+
+    # patch_mask is (H,W), True at the patches SAM3 found `query` in - every
+    # patch is reconstructed through the SAE either way, but the edit vectors
+    # only get added/subtracted at those patches, same spatial layout for
+    # every item in the batch
+    edit_mask = 1.0
+    if patch_mask is not None:
+        edit_mask = patch_mask.reshape(-1).to(latents_pre_act.dtype).repeat(b).unsqueeze(-1)
+
     if from_vec is not None:
-        latents_pre_act = latents_pre_act - alpha * from_vec
+        latents_pre_act = latents_pre_act - alpha * from_vec * edit_mask
     if to_vec is not None:
-        latents_pre_act = latents_pre_act + beta * to_vec
+        latents_pre_act = latents_pre_act + beta * to_vec * edit_mask
     vals, inds = torch.topk(latents_pre_act, k=sae.k, dim=-1)
     recons = sae.decode_sparse(inds, torch.relu(vals))
     return recons.reshape(*orig_shape[:-1], recons.shape[-1])
 
 
 def make_swap_hook(sae: SparseAutoencoder, from_vec, to_vec, mode: str, start_step: int, end_step: int,
-                    alpha: float, beta: float, device):
+                    alpha: float, beta: float, device, pixel_mask: np.ndarray = None):
     # own step counter per hook closure - a fresh one is built for every
     # pipe.run_with_hooks() call, so it doesn't need resetting between prompts
     step_counter = {"step": 0}
+    # this block's own spatial resolution is fixed, so the resized patch_mask
+    # only needs computing once and can be cached across diffusion steps
+    patch_mask_cache = {}
 
     def hook_fn(module, input, output):
         step = step_counter["step"]
@@ -99,9 +126,18 @@ def make_swap_hook(sae: SparseAutoencoder, from_vec, to_vec, mode: str, start_st
             orig_dtype = out.dtype  # the SAE runs in float32 regardless of the pipe's dtype (fp16)
             if mode == "diff":
                 out = out - inp
+
+            patch_mask = None
+            if pixel_mask is not None:
+                grid_h, grid_w = out.shape[2], out.shape[3]  # out is channel-first (B,C,H,W) here
+                if (grid_h, grid_w) not in patch_mask_cache:
+                    resized = resize_mask_to_grid(pixel_mask, grid_h, grid_w)
+                    patch_mask_cache[(grid_h, grid_w)] = torch.from_numpy(resized).to(device)
+                patch_mask = patch_mask_cache[(grid_h, grid_w)]
+
             # hook output is channel-first (B,C,H,W); the SAE (as everywhere
             # else it's used, e.g. sparsify.py) expects channel-last (...,d_model)
-            out = sae_forward_swap(sae, out.permute(0, 2, 3, 1), from_vec, alpha, to_vec, beta)
+            out = sae_forward_swap(sae, out.permute(0, 2, 3, 1), from_vec, alpha, to_vec, beta, patch_mask)
             out = out.permute(0, 3, 1, 2).to(device=device, dtype=orig_dtype)
             output = (out, *output[1:]) if isinstance(output, tuple) else out
         step_counter["step"] = step + 1
@@ -111,12 +147,12 @@ def make_swap_hook(sae: SparseAutoencoder, from_vec, to_vec, mode: str, start_st
 
 
 def make_position_hook_dict(sae_dict: dict, vec_dict: dict, mode: str, start_step: int, end_step: int,
-                             alpha: float, beta: float, device) -> dict:
+                             alpha: float, beta: float, device, pixel_mask: np.ndarray = None) -> dict:
     position_hook_dict = {}
     for block, sae in sae_dict.items():
         from_vec, to_vec = vec_dict[block]
         position_hook_dict[f"unet.{block}"] = make_swap_hook(
-            sae, from_vec, to_vec, mode, start_step, end_step, alpha, beta, device
+            sae, from_vec, to_vec, mode, start_step, end_step, alpha, beta, device, pixel_mask
         )
     return position_hook_dict
 
@@ -162,17 +198,33 @@ def main(args):
     # embedding same as a full swap would, but never injects replace_query's
     removal_only_vec_dict = {block: (from_vec, None) for block, (from_vec, _) in vec_dict.items()}
 
+    # removal-only and swapped both restrict their edits to the patches SAM3
+    # finds `query` in, so the mask is needed unconditionally now, not just
+    # for the optional --save_baseline highlight panel
+    if device == "cuda" or (hasattr(device, "type") and device.type == "cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
+    sam3_model = build_sam3_image_model()
+    sam3_processor = Sam3Processor(sam3_model, device=device)
+
     for i, prompt in enumerate(prompts):
         panels = []
 
+        # same seed + prompt as the hooked runs below, just without any hooks
+        # registered - used to find `query`'s patches via SAM3, and (with
+        # --save_baseline) also shown as the "before" half of the comparison
+        reference_gen = torch.Generator()
+        reference_gen.manual_seed(i)
+        reference_image = pipe(prompt, height=args.size, width=args.size, guidance_scale=args.guidance_scale,
+                                num_inference_steps=args.num_inference_steps, generator=reference_gen).images[0]
+        pixel_mask = get_query_pixel_mask(reference_image, query, sam3_processor)
+
         if args.save_baseline:
-            # same seed + prompt as the hooked runs below, just without any
-            # hooks registered, so it's the "before" half of the comparison
-            baseline_gen = torch.Generator()
-            baseline_gen.manual_seed(i)
-            baseline_image = pipe(prompt, height=args.size, width=args.size, guidance_scale=args.guidance_scale,
-                                   num_inference_steps=args.num_inference_steps, generator=baseline_gen).images[0]
-            panels.append(baseline_image)
+            panels.append(reference_image)
+            # highlight every patch SAM3 finds `query` in on that same
+            # reference image - shows exactly what the edit is targeting
+            panels.append(highlight_pixel_mask(reference_image, pixel_mask))
 
         if replace_query:
             # same seed again, hooked but only ever subtracting from_vec -
@@ -181,7 +233,8 @@ def main(args):
             removal_gen = torch.Generator()
             removal_gen.manual_seed(i)
             removal_hook_dict = make_position_hook_dict(
-                sae_dict, removal_only_vec_dict, mode, args.start_step, args.end_step, args.alpha, args.beta, device
+                sae_dict, removal_only_vec_dict, mode, args.start_step, args.end_step, args.alpha, args.beta,
+                device, pixel_mask
             )
             removal_only_image = pipe.run_with_hooks(
                 prompt, position_hook_dict=removal_hook_dict,
@@ -196,7 +249,7 @@ def main(args):
         # these and removes them again once pipe() returns, so each hook's
         # own step_counter naturally starts at 0 for every generation
         position_hook_dict = make_position_hook_dict(
-            sae_dict, vec_dict, mode, args.start_step, args.end_step, args.alpha, args.beta, device
+            sae_dict, vec_dict, mode, args.start_step, args.end_step, args.alpha, args.beta, device, pixel_mask
         )
         swapped_image = pipe.run_with_hooks(
             prompt, position_hook_dict=position_hook_dict,
