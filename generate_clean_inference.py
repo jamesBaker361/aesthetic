@@ -31,6 +31,7 @@ import time
 
 import numpy as np
 import torch
+import random
 from PIL import Image
 from scipy.stats import rankdata
 from scipy.special import expit
@@ -40,7 +41,6 @@ from experiment_helpers.gpu_details import print_details
 from experiment_helpers.argprint import print_args
 from experiment_helpers.init_helpers import default_parser, repo_api_init
 
-from generate_clean_patch import get_or_make_partition, mask_out_path
 from sdxl_unbox.SDLens.hooked_sd_pipeline import HookedStableDiffusionXLPipeline
 from sparsify import sparsify_embeddings
 from attribution import DEFAULT_BLOCK_LIST
@@ -97,6 +97,28 @@ parser.add_argument("--disable_discover", action="store_true")
 def read_prompts(prompt_file: str) -> list:
     with open(prompt_file) as f:
         return [line.strip() for line in f if line.strip()]
+    
+IMAGE_EXTENSIONS=(".jpg",".jpeg",".png",".bmp",".webp")
+
+
+def list_images(image_src_dir:str)->list:
+    return sorted(f for f in os.listdir(image_src_dir) if f.lower().endswith(IMAGE_EXTENSIONS))
+
+
+    
+def get_or_make_partition(image_src_dir:str,partition_path:str,train_frac:float,seed:int)->dict:
+    if os.path.exists(partition_path):
+        with open(partition_path) as f:
+            return json.load(f)
+
+    images=list_images(image_src_dir)
+    rng=random.Random(seed)
+    rng.shuffle(images)
+    n_train=int(round(len(images)*train_frac))
+    partition={"train":images[:n_train],"test":images[n_train:]}
+    with open(partition_path,"w") as f:
+        json.dump(partition,f,indent=2)
+    return partition
 
 
 def generate_and_cache(image_src_dir: str, embedding_dir: str, prompt_file: str, block_list: list,
@@ -169,6 +191,9 @@ def get_query_pixel_mask(image: Image.Image, query: str, sam3_processor) -> np.n
     masks_np = masks.squeeze(1).cpu().numpy()
     return np.any(masks_np, axis=0)  # union of every returned mask
 
+def mask_out_path(mask_dir:str,name:str,target_query:str)->str:
+    safe_query=target_query.replace(" ","_")
+    return os.path.join(mask_dir,f"{name}.{safe_query}.npz")
 
 def cache_query_masks(images: list, image_src_dir: str, mask_dir: str, query: str, sam3_processor):
     for name in images:
