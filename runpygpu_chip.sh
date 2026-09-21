@@ -33,7 +33,7 @@ module load  CMake/3.29.3-GCCcore-13.3.0
 module load  CUDA/12.8.0  
 gcc --version
 eval "$(conda shell.bash hook)"
-conda activate p12
+conda activate p11
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64
 export TORCH_USE_CUDA_DSA="1"
 export CUDA_LAUNCH_BLOCKING="1"
