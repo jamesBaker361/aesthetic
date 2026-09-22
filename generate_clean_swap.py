@@ -151,7 +151,7 @@ def make_swap_hook(sae: SparseAutoencoder, from_vec, to_vec, mode: str, start_st
         if start_step <= step <= end_step:
             out = output[0] if isinstance(output, tuple) else output
             inp = input[0] if isinstance(input, tuple) else input
-            orig_dtype = out.dtype  # the SAE now matches the pipe's dtype, but cast back defensively either way
+            orig_dtype = out.dtype  # the SAE runs in float32 regardless of the pipe's dtype (fp16) - see load_sae call
             if mode == "diff":
                 out = out - inp
 
@@ -207,10 +207,11 @@ def main(args):
         if from_vec is None and to_vec is None:
             print(f"skipping {block}: no embedding for '{query}'" + (f" or '{replace_query}'" if replace_query else ""))
             continue
-        # match the pipe's dtype (fp16 on GPU) instead of always float32 -
-        # x arrives at the hook already in that dtype, so this also avoids an
-        # implicit float32 upcast of every patch on every hooked forward call
-        sae_dict[block] = load_sae(block).to(device=device, dtype=dtype)
+        # stays float32 - torch.sparse.mm (used in decode_sparse) has no fp16
+        # CUDA kernel ("addmm_sparse_cuda" not implemented for 'Half'), so the
+        # SAE can't just match the fp16 pipe the way sae_forward_swap's
+        # from_vec/to_vec dtype cast otherwise assumes
+        sae_dict[block] = load_sae(block).to(device)
         vec_dict[block] = (from_vec, to_vec)
 
     if not sae_dict:
