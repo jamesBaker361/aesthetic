@@ -350,6 +350,9 @@ def discover_query_block(train_images: list, sparse_embedding_dir: str, mask_dir
         # feature with lowest training BCE for this concept - "unsupervised
         # feature-to-concept matching" - instead of a top_k AUROC shortlist.
         _, _, loss = fit_1d_ridge_logistic(feats, labels, bce_ridge, bce_newton_steps)
+        print(f"  per-latent BCE loss: mean={loss.mean():.4f} median={np.median(loss):.4f} "
+              f"min={loss.min():.4f} max={loss.max():.4f} std={loss.std():.4f}")
+
         best_idx = int(np.argmin(loss))
         top_idx = np.array([best_idx], dtype=np.int64)
         top_score = loss[[best_idx]].astype(np.float32)  # lower is better (this is a loss, not an AUROC)
