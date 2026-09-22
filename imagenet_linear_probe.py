@@ -26,6 +26,7 @@
 
 import os
 import re
+import ast
 import csv
 import json
 import time
@@ -52,7 +53,10 @@ from generate_clean_inference import (
     get_query_pixel_mask, cache_query_masks, resize_mask_to_grid, load_block_feats_and_labels,
 )
 
-IMAGENET_CLASSMAP_URL = "https://deeplearning.cms.waikato.ac.nz/user-guide/class-maps/IMAGENET/"
+# the Waikato class-map page 403s from this cluster's network (bot-blocked);
+# this gist's raw file is a plain Python dict literal {idx: "name, synonym, ..."}
+# for all 1000 classes and fetches fine - see fetch_imagenet_classes
+IMAGENET_CLASSMAP_URL = "https://gist.githubusercontent.com/yrevar/942d3a0ac09ec9e5eb3a/raw/imagenet1000_clsidx_to_labels.txt"
 
 parser = default_parser(
     {
@@ -93,24 +97,27 @@ parser.add_argument("--disable_probe", action="store_true")
 def fetch_imagenet_classes(class_list_path: str) -> list:
     '''
     Step 1: the 1000 ImageNet class names, in class-index order, parsed from
-    the Waikato class-map table (<tr><td>idx</td><td>name, synonym, ...</td></tr>)
-    - cached to class_list_path (one class per line) so this only ever
-    downloads once. The primary (first, comma-separated) name is used as
-    both the generation prompt's subject and the SAM3/probe query text.
+    the gist's raw {idx: "name, synonym, ..."} dict literal - cached to
+    class_list_path (one class per line) so this only ever downloads once.
+    The primary (first, comma-separated) name is used as both the generation
+    prompt's subject and the SAM3/probe query text.
     '''
     if os.path.exists(class_list_path):
         return read_class_list(class_list_path)
 
     print(f"downloading ImageNet class list from {IMAGENET_CLASSMAP_URL}")
-    with urllib.request.urlopen(IMAGENET_CLASSMAP_URL) as resp:
-        html = resp.read().decode("utf-8", errors="replace")
+    req = urllib.request.Request(IMAGENET_CLASSMAP_URL, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req) as resp:
+        text = resp.read().decode("utf-8", errors="replace")
 
-    rows = re.findall(r"<td>\s*(\d+)\s*</td>\s*<td>([^<]+)</td>", html)
-    if len(rows) != 1000:
-        raise ValueError(f"expected 1000 ImageNet classes, parsed {len(rows)} from {IMAGENET_CLASSMAP_URL}")
+    # the gist is a literal Python dict {int: str} - ast.literal_eval parses
+    # only literals (unlike eval), so this is safe even though the content
+    # comes from a URL rather than a fixed local file
+    by_index = ast.literal_eval(text)
+    if len(by_index) != 1000:
+        raise ValueError(f"expected 1000 ImageNet classes, parsed {len(by_index)} from {IMAGENET_CLASSMAP_URL}")
 
-    by_index = {int(idx): names.split(",")[0].strip() for idx, names in rows}
-    classes = [by_index[i] for i in range(1000)]
+    classes = [by_index[i].split(",")[0].strip() for i in range(1000)]
 
     with open(class_list_path, "w") as f:
         f.write("\n".join(classes) + "\n")
