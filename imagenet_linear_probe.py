@@ -36,7 +36,9 @@ import numpy as np
 import torch
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, roc_auc_score, average_precision_score
+from sklearn.metrics import (
+    accuracy_score, roc_auc_score, average_precision_score, precision_score, recall_score, f1_score,
+)
 
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.argprint import print_args
@@ -374,6 +376,13 @@ def train_class_block_probe(class_idx: int, classes: list, images_by_class: dict
     pos_accuracy = float(accuracy_score(y_test[pos_mask], y_pred[pos_mask])) if pos_mask.any() else None
     neg_accuracy = float(accuracy_score(y_test[neg_mask], y_pred[neg_mask])) if neg_mask.any() else None
 
+    # zero_division=0 rather than a warning/exception - a probe that never
+    # predicts positive (precision undefined) or a test split with no actual
+    # positives (recall undefined) should just score 0, not blow up the run
+    precision = float(precision_score(y_test, y_pred, zero_division=0))
+    recall = float(recall_score(y_test, y_pred, zero_division=0))  # equal to pos_accuracy by definition
+    f1 = float(f1_score(y_test, y_pred, zero_division=0))
+
     return {
         "class": query,
         "class_idx": class_idx,
@@ -386,6 +395,9 @@ def train_class_block_probe(class_idx: int, classes: list, images_by_class: dict
         "accuracy": float(accuracy_score(y_test, y_pred)),
         "pos_accuracy": pos_accuracy,
         "neg_accuracy": neg_accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
         "auroc": float(roc_auc_score(y_test, y_score)) if multi_class_test else None,
         "ap": float(average_precision_score(y_test, y_score)) if multi_class_test else None,
     }
@@ -412,22 +424,23 @@ def write_report(probe_dir: str, block_list: list, classes: list, report_path: s
     # keys at all - treat missing the same as None, both sort to the bottom
     rows.sort(key=lambda r: r.get("pos_accuracy") if r.get("pos_accuracy") is not None else -1.0, reverse=True)
 
-    fieldnames = ["class", "class_idx", "block", "accuracy", "pos_accuracy", "neg_accuracy", "auroc", "ap",
-                  "n_pos", "n_neg", "n_extra_negatives", "n_train", "n_test"]
+    fieldnames = ["class", "class_idx", "block", "accuracy", "pos_accuracy", "neg_accuracy", "precision", "recall",
+                  "f1", "auroc", "ap", "n_pos", "n_neg", "n_extra_negatives", "n_train", "n_test"]
     with open(report_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
+    def fmt(row, key):
+        val = row.get(key)
+        return f"{val:.3f}" if val is not None else "n/a"
+
     print(f"wrote {len(rows)} (class, block) probe results to {report_path}")
     print("most linearly separable (ranked by positive accuracy):")
     for row in rows[:20]:
-        pos_acc = row.get("pos_accuracy")
-        neg_acc = row.get("neg_accuracy")
-        pos_str = f"{pos_acc:.3f}" if pos_acc is not None else "n/a"
-        neg_str = f"{neg_acc:.3f}" if neg_acc is not None else "n/a"
-        print(f"  pos_acc={pos_str} neg_acc={neg_str} overall_acc={row['accuracy']:.3f}  "
-              f"'{row['class']}' @ {row['block']}")
+        print(f"  pos_acc={fmt(row, 'pos_accuracy')} neg_acc={fmt(row, 'neg_accuracy')} "
+              f"precision={fmt(row, 'precision')} recall={fmt(row, 'recall')} f1={fmt(row, 'f1')} "
+              f"overall_acc={row['accuracy']:.3f}  '{row['class']}' @ {row['block']}")
 
 
 def main(args):

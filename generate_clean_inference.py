@@ -47,7 +47,7 @@ import random
 from PIL import Image
 from scipy.stats import rankdata
 from scipy.special import expit
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_score, recall_score, f1_score
 
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.argprint import print_args
@@ -349,7 +349,7 @@ def discover_query_block(train_images: list, sparse_embedding_dir: str, mask_dir
         # Eq. (7): fit every latent's 1D probe and keep only the single
         # feature with lowest training BCE for this concept - "unsupervised
         # feature-to-concept matching" - instead of a top_k AUROC shortlist.
-        _, _, loss = fit_1d_ridge_logistic(feats, labels, bce_ridge, bce_newton_steps)
+        w, b, loss = fit_1d_ridge_logistic(feats, labels, bce_ridge, bce_newton_steps)
         print(f"  per-latent BCE loss: mean={loss.mean():.4f} median={np.median(loss):.4f} "
               f"min={loss.min():.4f} max={loss.max():.4f} std={loss.std():.4f}")
 
@@ -357,11 +357,22 @@ def discover_query_block(train_images: list, sparse_embedding_dir: str, mask_dir
         top_idx = np.array([best_idx], dtype=np.int64)
         top_score = loss[[best_idx]].astype(np.float32)  # lower is better (this is a loss, not an AUROC)
 
+        best_feat = feats[:, best_idx].astype(np.float64)
+        p_best = expit(w[best_idx] * best_feat + b[best_idx])
+        pred_best = p_best >= 0.5
+        precision = precision_score(labels, pred_best, zero_division=0)
+        recall = recall_score(labels, pred_best, zero_division=0)
+        f1 = f1_score(labels, pred_best, zero_division=0)
+        pos_mean = feats[labels, best_idx].mean()
+        pos_std = feats[labels, best_idx].std()
+        print(f"  best latent {best_idx}: precision={precision:.4f} recall={recall:.4f} f1={f1:.4f} "
+              f"| positive activation mean={pos_mean:.4f} std={pos_std:.4f}")
+
         # the SAE embedding for this query/block is now all-zero except at
         # the single matched latent, set to its mean activation over the
         # positive (on-target) patches
         mean_vec = np.zeros(feats.shape[1], dtype=np.float32)
-        mean_vec[best_idx] = feats[labels, best_idx].mean()
+        mean_vec[best_idx] = pos_mean
     else:
         # per-latent AUROC via rank-sum form of Mann-Whitney U (same technique
         # as generate_clean_patch.discover_top_features) - avoids one
