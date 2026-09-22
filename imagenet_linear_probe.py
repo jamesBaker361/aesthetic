@@ -365,6 +365,15 @@ def train_class_block_probe(class_idx: int, classes: list, images_by_class: dict
     y_score = clf.decision_function(X_test)
     multi_class_test = len(set(y_test.tolist())) > 1
 
+    # accuracy split by ground-truth label - "positive accuracy" (recall) is
+    # what actually says the probe found the class, not just avoided the
+    # (usually much larger) negative pool; overall accuracy alone can look
+    # good just from getting negatives right
+    pos_mask = y_test.astype(bool)
+    neg_mask = ~pos_mask
+    pos_accuracy = float(accuracy_score(y_test[pos_mask], y_pred[pos_mask])) if pos_mask.any() else None
+    neg_accuracy = float(accuracy_score(y_test[neg_mask], y_pred[neg_mask])) if neg_mask.any() else None
+
     return {
         "class": query,
         "class_idx": class_idx,
@@ -375,13 +384,21 @@ def train_class_block_probe(class_idx: int, classes: list, images_by_class: dict
         "n_train": int(len(y_train)),
         "n_test": int(len(y_test)),
         "accuracy": float(accuracy_score(y_test, y_pred)),
+        "pos_accuracy": pos_accuracy,
+        "neg_accuracy": neg_accuracy,
         "auroc": float(roc_auc_score(y_test, y_score)) if multi_class_test else None,
         "ap": float(average_precision_score(y_test, y_score)) if multi_class_test else None,
     }
 
 
 def write_report(probe_dir: str, block_list: list, classes: list, report_path: str):
-    '''Step 5: gather every cached per-(class,block) probe result and rank by held-out accuracy - highest first.'''
+    '''
+    Step 5: gather every cached per-(class,block) probe result and rank by
+    positive accuracy (recall on the class's own patches) - highest first.
+    Overall accuracy alone can look good just from getting the (usually much
+    larger) negative pool right, so it's not what "most linearly separable"
+    should mean here.
+    '''
     rows = []
     for block in block_list:
         for class_idx in range(len(classes)):
@@ -391,19 +408,26 @@ def write_report(probe_dir: str, block_list: list, classes: list, report_path: s
             with open(path) as f:
                 rows.append(json.load(f))
 
-    rows.sort(key=lambda r: r["accuracy"], reverse=True)
+    # rows from before pos_accuracy/neg_accuracy were tracked won't have the
+    # keys at all - treat missing the same as None, both sort to the bottom
+    rows.sort(key=lambda r: r.get("pos_accuracy") if r.get("pos_accuracy") is not None else -1.0, reverse=True)
 
-    fieldnames = ["class", "class_idx", "block", "accuracy", "auroc", "ap", "n_pos", "n_neg", "n_extra_negatives",
-                  "n_train", "n_test"]
+    fieldnames = ["class", "class_idx", "block", "accuracy", "pos_accuracy", "neg_accuracy", "auroc", "ap",
+                  "n_pos", "n_neg", "n_extra_negatives", "n_train", "n_test"]
     with open(report_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
     print(f"wrote {len(rows)} (class, block) probe results to {report_path}")
-    print("most linearly separable:")
+    print("most linearly separable (ranked by positive accuracy):")
     for row in rows[:20]:
-        print(f"  acc={row['accuracy']:.3f}  '{row['class']}' @ {row['block']}")
+        pos_acc = row.get("pos_accuracy")
+        neg_acc = row.get("neg_accuracy")
+        pos_str = f"{pos_acc:.3f}" if pos_acc is not None else "n/a"
+        neg_str = f"{neg_acc:.3f}" if neg_acc is not None else "n/a"
+        print(f"  pos_acc={pos_str} neg_acc={neg_str} overall_acc={row['accuracy']:.3f}  "
+              f"'{row['class']}' @ {row['block']}")
 
 
 def main(args):
