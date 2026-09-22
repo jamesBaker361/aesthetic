@@ -142,15 +142,30 @@ def parse_image_name(name: str):
         raise ValueError(f"'{name}' doesn't look like an imagenet_linear_probe output (\"class{{i}}_img{{k}}.jpg\")")
     return int(m.group(1)), int(m.group(2))
 
+def get_prompt_list(class_name:str):
+    return [
+        f"a photo of a {class_name}",
+        f"a picture of a {class_name}",
+        f"an image of a {class_name}",
+        f"a zoomed out photo of a {class_name}",
+        f"a photo of a {class_name} in tokyo",
+        f"a photo of a {class_name} in paris",
+        f"a photo of a {class_name} in london",
+        f"a photo of a {class_name} in the jungle",
+        f"a photo of a {class_name} at the beach",
+        f"a photo of a {class_name} on a mountain",
+    ]
 
 def generate_and_cache_classes(image_src_dir: str, embedding_dir: str, classes: list, block_list: list,
                                 n_per_class: int, size: int, num_inference_steps: int, guidance_scale: float,
                                 mixed_precision: str, device, seed: int):
     '''
-    Step 2: n_per_class images of "a photo of a {class}" per ImageNet class,
-    caching each block's raw UNet input/output for that same generation -
-    identical technique to generate_clean_inference.generate_and_cache, just
-    looping over (class, k) instead of a flat prompt list.
+    Step 2: n_per_class images per ImageNet class, cycling through
+    get_prompt_list's varied phrasings/contexts (k % len(prompt_list)) so
+    the class isn't always shown the same way - caching each block's raw
+    UNet input/output for that same generation, identical technique to
+    generate_clean_inference.generate_and_cache, just looping over
+    (class, k) instead of a flat prompt list.
     '''
     print("generate per-class images + cache block activations")
     os.makedirs(image_src_dir, exist_ok=True)
@@ -166,8 +181,9 @@ def generate_and_cache_classes(image_src_dir: str, embedding_dir: str, classes: 
     positions = [f"unet.{block}" for block in block_list]
 
     for class_idx, class_name in enumerate(classes):
-        prompt = f"a photo of a {class_name}"
+        prompt_list=get_prompt_list(class_name)
         for k in range(n_per_class):
+            prompt= prompt_list[k % len(prompt_list)]
             name = image_name(class_idx, k)
             image_path = os.path.join(image_src_dir, name)
             npz_path = os.path.join(embedding_dir, name + ".npz")
