@@ -81,6 +81,28 @@ def highlight_pixel_mask(image: Image.Image, pixel_mask: np.ndarray, color=(255,
     return Image.fromarray(np.uint8(highlighted))
 
 
+def compute_query_pixel_mask(reference_image: Image.Image, query: str, sam3_model, device) -> np.ndarray:
+    # SAM3 lives on CPU the rest of the time so it's never resident on GPU at
+    # the same time as the (much larger) SDXL pipe - only pulled over for
+    # this one call, then moved back. Sam3Processor itself is cheap to
+    # rebuild (a couple of 1-element index tensors), so it's just recreated
+    # against wherever the model currently lives rather than kept around.
+    on_cuda = device == "cuda" or (hasattr(device, "type") and device.type == "cuda")
+    sam3_model.to(device)
+    sam3_processor = Sam3Processor(sam3_model, device=device)
+    try:
+        if on_cuda:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                pixel_mask = get_query_pixel_mask(reference_image, query, sam3_processor)
+        else:
+            pixel_mask = get_query_pixel_mask(reference_image, query, sam3_processor)
+    finally:
+        sam3_model.to("cpu")
+        if on_cuda:
+            torch.cuda.empty_cache()
+    return pixel_mask
+
+
 def sae_forward_swap(sae: SparseAutoencoder, x: torch.Tensor, from_vec, alpha: float, to_vec, beta: float,
                       patch_mask: torch.Tensor = None):
     # x arrives as (B,H,W,d_model); decode_sparse (unlike sae.encode) hard-codes
@@ -100,10 +122,13 @@ def sae_forward_swap(sae: SparseAutoencoder, x: torch.Tensor, from_vec, alpha: f
     if patch_mask is not None:
         edit_mask = patch_mask.reshape(-1).to(latents_pre_act.dtype).repeat(b).unsqueeze(-1)
 
+    # from_vec/to_vec are always loaded as float32 (see get_query_vec) - cast
+    # explicitly rather than let mixed-dtype arithmetic silently upcast the
+    # much larger latents_pre_act tensor back to float32
     if from_vec is not None:
-        latents_pre_act = latents_pre_act - alpha * from_vec * edit_mask
+        latents_pre_act = latents_pre_act - alpha * from_vec.to(latents_pre_act.dtype) * edit_mask
     if to_vec is not None:
-        latents_pre_act = latents_pre_act + beta * to_vec * edit_mask
+        latents_pre_act = latents_pre_act + beta * to_vec.to(latents_pre_act.dtype) * edit_mask
     vals, inds = torch.topk(latents_pre_act, k=sae.k, dim=-1)
     recons = sae.decode_sparse(inds, torch.relu(vals))
     return recons.reshape(*orig_shape[:-1], recons.shape[-1])
@@ -123,7 +148,7 @@ def make_swap_hook(sae: SparseAutoencoder, from_vec, to_vec, mode: str, start_st
         if start_step <= step <= end_step:
             out = output[0] if isinstance(output, tuple) else output
             inp = input[0] if isinstance(input, tuple) else input
-            orig_dtype = out.dtype  # the SAE runs in float32 regardless of the pipe's dtype (fp16)
+            orig_dtype = out.dtype  # the SAE now matches the pipe's dtype, but cast back defensively either way
             if mode == "diff":
                 out = out - inp
 
@@ -169,6 +194,8 @@ def main(args):
     print(f"using mode='{mode}'")
 
     block_list = list(DEFAULT_BLOCK_LIST)
+    on_cuda = device == "cuda" or (hasattr(device, "type") and device.type == "cuda")
+    dtype = torch.float16 if (torch.cuda.is_available() and args.mixed_precision == "fp16") else torch.float32
 
     sae_dict, vec_dict = {}, {}
     for block in block_list:
@@ -177,18 +204,29 @@ def main(args):
         if from_vec is None and to_vec is None:
             print(f"skipping {block}: no embedding for '{query}'" + (f" or '{replace_query}'" if replace_query else ""))
             continue
-        sae_dict[block] = load_sae(block).to(device)
+        # match the pipe's dtype (fp16 on GPU) instead of always float32 -
+        # x arrives at the hook already in that dtype, so this also avoids an
+        # implicit float32 upcast of every patch on every hooked forward call
+        sae_dict[block] = load_sae(block).to(device=device, dtype=dtype)
         vec_dict[block] = (from_vec, to_vec)
 
     if not sae_dict:
         raise ValueError(f"no blocks had a saved embedding for '{query}' in {args.npz_dict}")
 
-    dtype = torch.float16 if (torch.cuda.is_available() and args.mixed_precision == "fp16") else torch.float32
     pipe = HookedStableDiffusionXLWithUNetPipeline.from_pretrained(
         'stabilityai/sdxl-turbo',
         torch_dtype=dtype,
         variant=("fp16" if dtype == torch.float16 else None),
-    ).to(device)
+    )
+    pipe.enable_vae_slicing()
+    pipe.enable_attention_slicing()
+    if on_cuda:
+        # keeps the UNet/VAE/text-encoders on GPU only while each is actually
+        # running instead of all of them (plus the SAE dict, plus SAM3) sitting
+        # resident on GPU for the whole script - costs some transfer latency
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe.to(device)
 
     prompts = read_prompts(args.prompt_file)
     suffix = f"remove_{query}" if not replace_query else f"{query}_to_{replace_query}"
@@ -198,15 +236,14 @@ def main(args):
     # embedding same as a full swap would, but never injects replace_query's
     removal_only_vec_dict = {block: (from_vec, None) for block, (from_vec, _) in vec_dict.items()}
 
-    # removal-only and swapped both restrict their edits to the patches SAM3
-    # finds `query` in, so the mask is needed unconditionally now, not just
-    # for the optional --save_baseline highlight panel
-    if device == "cuda" or (hasattr(device, "type") and device.type == "cuda"):
+    if on_cuda:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
-    sam3_model = build_sam3_image_model()
-    sam3_processor = Sam3Processor(sam3_model, device=device)
+    # loaded on CPU and only moved to `device` transiently inside
+    # compute_query_pixel_mask - removal-only and swapped both restrict their
+    # edits to the patches found there, so the mask is needed unconditionally
+    # now, not just for the optional --save_baseline highlight panel
+    sam3_model = build_sam3_image_model(device="cpu")
 
     for i, prompt in enumerate(prompts):
         panels = []
@@ -218,7 +255,7 @@ def main(args):
         reference_gen.manual_seed(i)
         reference_image = pipe(prompt, height=args.size, width=args.size, guidance_scale=args.guidance_scale,
                                 num_inference_steps=args.num_inference_steps, generator=reference_gen).images[0]
-        pixel_mask = get_query_pixel_mask(reference_image, query, sam3_processor)
+        pixel_mask = compute_query_pixel_mask(reference_image, query, sam3_model, device)
 
         if args.save_baseline:
             panels.append(reference_image)
@@ -260,6 +297,12 @@ def main(args):
 
         out_image = concat_images_horizontally(panels) if len(panels) > 1 else swapped_image
         out_image.save(os.path.join(args.image_dest_dir, f"{safe_suffix}_{i}.jpg"))
+
+        if on_cuda:
+            # each prompt allocates/frees SAM3 activations, up to 3 diffusion
+            # passes, and SAE tensors in sequence - return unused cached
+            # blocks to avoid fragmentation-driven OOMs over a long prompt list
+            torch.cuda.empty_cache()
 
 
 if __name__ == '__main__':
