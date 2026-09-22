@@ -221,8 +221,6 @@ def main(args):
         torch_dtype=dtype,
         variant=("fp16" if dtype == torch.float16 else None),
     )
-    pipe.enable_vae_slicing()
-    pipe.enable_attention_slicing()
     if on_cuda:
         # keeps the UNet/VAE/text-encoders on GPU only while each is actually
         # running instead of all of them (plus the SAE dict, plus SAM3) sitting
