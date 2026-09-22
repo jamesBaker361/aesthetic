@@ -3,7 +3,10 @@
 # either removing a query concept (subtract its embedding from the SAE
 # latents before top-k, SAEURON style) or replacing it with another query's
 # embedding (subtract the source query's vector and inject the target
-# query's vector in its place) at every hooked UNet block.
+# query's vector in its place). Each of the 4 default UNet blocks is hooked
+# in isolation, one full generation at a time, producing 4 separate sets of
+# images (image_dest_dir/<block>/...) so each layer's effect can be seen on
+# its own rather than all 4 layers being edited together in one generation.
 
 import os
 import time
@@ -236,6 +239,15 @@ def main(args):
     # embedding same as a full swap would, but never injects replace_query's
     removal_only_vec_dict = {block: (from_vec, None) for block, (from_vec, _) in vec_dict.items()}
 
+    # one set of images per block/layer, each hooked in isolation, so the
+    # effect of editing that one layer's SAE latents can be seen on its own
+    # instead of all layers being edited together in a single generation
+    block_out_dirs = {}
+    for block in sae_dict:
+        safe_block = block.replace(".", "_")
+        block_out_dirs[block] = os.path.join(args.image_dest_dir, safe_block)
+        os.makedirs(block_out_dirs[block], exist_ok=True)
+
     if on_cuda:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -246,62 +258,68 @@ def main(args):
     sam3_model = build_sam3_image_model(device="cpu")
 
     for i, prompt in enumerate(prompts):
-        panels = []
-
-        # same seed + prompt as the hooked runs below, just without any hooks
+        # same seed + prompt for every block below, just without any hooks
         # registered - used to find `query`'s patches via SAM3, and (with
-        # --save_baseline) also shown as the "before" half of the comparison
+        # --save_baseline) also shown as the "before" half of each comparison.
+        # Generated once per prompt and reused across blocks since it doesn't
+        # depend on which layer is being hooked.
         reference_gen = torch.Generator()
         reference_gen.manual_seed(i)
         reference_image = pipe(prompt, height=args.size, width=args.size, guidance_scale=args.guidance_scale,
                                 num_inference_steps=args.num_inference_steps, generator=reference_gen).images[0]
         pixel_mask = compute_query_pixel_mask(reference_image, query, sam3_model, device)
+        highlighted_reference = highlight_pixel_mask(reference_image, pixel_mask) if args.save_baseline else None
 
-        if args.save_baseline:
-            panels.append(reference_image)
-            # highlight every patch SAM3 finds `query` in on that same
-            # reference image - shows exactly what the edit is targeting
-            panels.append(highlight_pixel_mask(reference_image, pixel_mask))
+        for block in sae_dict:
+            panels = []
+            if args.save_baseline:
+                panels.append(reference_image)
+                # highlight every patch SAM3 finds `query` in on that same
+                # reference image - shows exactly what the edit is targeting
+                panels.append(highlighted_reference)
 
-        if replace_query:
-            # same seed again, hooked but only ever subtracting from_vec -
-            # shows removal alone, without replace_query's injection - always
-            # included when doing a replace, not just when --save_baseline
-            removal_gen = torch.Generator()
-            removal_gen.manual_seed(i)
-            removal_hook_dict = make_position_hook_dict(
-                sae_dict, removal_only_vec_dict, mode, args.start_step, args.end_step, args.alpha, args.beta,
-                device, pixel_mask
+            single_sae_dict = {block: sae_dict[block]}
+
+            if replace_query:
+                # same seed again, hooked but only ever subtracting from_vec -
+                # shows removal alone, without replace_query's injection -
+                # always included when doing a replace, not just --save_baseline
+                removal_gen = torch.Generator()
+                removal_gen.manual_seed(i)
+                removal_hook_dict = make_position_hook_dict(
+                    single_sae_dict, removal_only_vec_dict, mode, args.start_step, args.end_step, args.alpha,
+                    args.beta, device, pixel_mask
+                )
+                removal_only_image = pipe.run_with_hooks(
+                    prompt, position_hook_dict=removal_hook_dict,
+                    height=args.size, width=args.size, guidance_scale=args.guidance_scale,
+                    num_inference_steps=args.num_inference_steps, generator=removal_gen,
+                ).images[0]
+                panels.append(removal_only_image)
+
+            rand_gen = torch.Generator()
+            rand_gen.manual_seed(i)
+            # a fresh position_hook_dict per prompt/block - run_with_hooks
+            # registers these and removes them again once pipe() returns, so
+            # each hook's own step_counter naturally starts at 0 every time
+            position_hook_dict = make_position_hook_dict(
+                single_sae_dict, vec_dict, mode, args.start_step, args.end_step, args.alpha, args.beta, device,
+                pixel_mask
             )
-            removal_only_image = pipe.run_with_hooks(
-                prompt, position_hook_dict=removal_hook_dict,
+            swapped_image = pipe.run_with_hooks(
+                prompt, position_hook_dict=position_hook_dict,
                 height=args.size, width=args.size, guidance_scale=args.guidance_scale,
-                num_inference_steps=args.num_inference_steps, generator=removal_gen,
+                num_inference_steps=args.num_inference_steps, generator=rand_gen,
             ).images[0]
-            panels.append(removal_only_image)
+            panels.append(swapped_image)
 
-        rand_gen = torch.Generator()
-        rand_gen.manual_seed(i)
-        # a fresh position_hook_dict per prompt - run_with_hooks registers
-        # these and removes them again once pipe() returns, so each hook's
-        # own step_counter naturally starts at 0 for every generation
-        position_hook_dict = make_position_hook_dict(
-            sae_dict, vec_dict, mode, args.start_step, args.end_step, args.alpha, args.beta, device, pixel_mask
-        )
-        swapped_image = pipe.run_with_hooks(
-            prompt, position_hook_dict=position_hook_dict,
-            height=args.size, width=args.size, guidance_scale=args.guidance_scale,
-            num_inference_steps=args.num_inference_steps, generator=rand_gen,
-        ).images[0]
-        panels.append(swapped_image)
-
-        out_image = concat_images_horizontally(panels) if len(panels) > 1 else swapped_image
-        out_image.save(os.path.join(args.image_dest_dir, f"{safe_suffix}_{i}.jpg"))
+            out_image = concat_images_horizontally(panels) if len(panels) > 1 else swapped_image
+            out_image.save(os.path.join(block_out_dirs[block], f"{safe_suffix}_{i}.jpg"))
 
         if on_cuda:
-            # each prompt allocates/frees SAM3 activations, up to 3 diffusion
-            # passes, and SAE tensors in sequence - return unused cached
-            # blocks to avoid fragmentation-driven OOMs over a long prompt list
+            # each prompt allocates/frees SAM3 activations, up to 1 + 2*len(sae_dict)
+            # diffusion passes, and SAE tensors in sequence - return unused
+            # cached blocks to avoid fragmentation-driven OOMs over a long list
             torch.cuda.empty_cache()
 
 
