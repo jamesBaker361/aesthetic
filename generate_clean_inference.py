@@ -23,6 +23,18 @@
 #     hyperparameters) and pick the single latent with lowest training binary
 #     cross-entropy for the query ("unsupervised feature-to-concept matching").
 #     The saved vector is then all-zero except at that one latent.
+#
+# --mask_function controls how each image's positive/negative patches are
+# labeled for a given query:
+#   "sam3" (default): SAM3 text-prompted segmentation finds which patches of
+#     the image actually depict the query concept.
+#   "prompt": no segmentation at all - every patch of an image is labeled
+#     positive for whichever query's text literally appears in the prompt
+#     that generated it (via --prompt_file), and negative for every other
+#     query. Meant for concepts SAM3 can't spatially localize, like a style
+#     ("anime_style"), where the honest ground truth is "the whole image
+#     is/isn't this". Only valid for images generate_and_cache produced
+#     itself (relies on the "prompt_{i}.jpg" naming to recover the prompt).
 
 import os
 import json
@@ -87,6 +99,11 @@ parser.add_argument("--bce_ridge", type=float, default=1e-8,
                      help="ridge regularization strength for --feature_selection=bce (paper appendix default)")
 parser.add_argument("--bce_newton_steps", type=int, default=30,
                      help="number of Newton-method steps for --feature_selection=bce (paper appendix default)")
+
+parser.add_argument("--mask_function", type=str, default="sam3", choices=["sam3", "prompt"],
+                     help="'sam3' (default): SAM3 text-prompted segmentation finds the query's patches. "
+                          "'prompt': whole image is positive/negative based on whether the query's text appears "
+                          "in the prompt that generated it - for concepts SAM3 can't spatially localize (e.g. a style).")
 
 parser.add_argument("--disable_generate", action="store_true")
 parser.add_argument("--disable_sparsify_embeddings", action="store_true")
@@ -202,6 +219,45 @@ def cache_query_masks(images: list, image_src_dir: str, mask_dir: str, query: st
             continue
         image = Image.open(os.path.join(image_src_dir, name)).convert("RGB")
         pixel_mask = get_query_pixel_mask(image, query, sam3_processor)
+        np.savez(out_path, pixel_mask=pixel_mask)
+
+
+def image_name_to_prompt_index(name: str) -> int:
+    # generate_and_cache names every image "prompt_{i}.jpg" (i = its line
+    # number in --prompt_file) - recovering the prompt just means parsing
+    # that index back out of the filename
+    stem = os.path.splitext(name)[0]
+    try:
+        return int(stem.rsplit("_", 1)[-1])
+    except ValueError:
+        raise ValueError(
+            f"'{name}' doesn't look like a generate_and_cache output (\"prompt_{{i}}.jpg\") - "
+            "--mask_function=prompt only works on images this script generated itself"
+        )
+
+
+def get_whole_image_mask(image: Image.Image, prompt: str, query: str) -> np.ndarray:
+    '''
+    Alternative to SAM3 segmentation: labels every patch of the image the
+    same way, based solely on whether `query` was the concept that actually
+    prompted it - all-positive if `query` (read with underscores as spaces)
+    appears in the prompt text, all-negative otherwise. Useful for concepts
+    SAM3 can't spatially localize, like a style ("anime_style"), where the
+    honest ground truth is "the whole image is/isn't this".
+    '''
+    w, h = image.size
+    is_positive = query.replace("_", " ").lower() in prompt.lower()
+    return np.full((h, w), is_positive, dtype=bool)
+
+
+def cache_whole_image_masks(images: list, image_src_dir: str, mask_dir: str, query: str, prompts: list):
+    for name in images:
+        out_path = mask_out_path(mask_dir, name, query)
+        if os.path.exists(out_path):
+            continue
+        image = Image.open(os.path.join(image_src_dir, name)).convert("RGB")
+        prompt = prompts[image_name_to_prompt_index(name)]
+        pixel_mask = get_whole_image_mask(image, prompt, query)
         np.savez(out_path, pixel_mask=pixel_mask)
 
 
@@ -389,15 +445,21 @@ def main(args):
         sparsify_embeddings(sparse_embedding_dir, embedding_dir, args.mode)
 
     if not args.disable_masks:
-        if device == "cuda" or (hasattr(device, "type") and device.type == "cuda"):
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
-        sam3_model = build_sam3_image_model()
-        sam3_processor = Sam3Processor(sam3_model, device=device)
-        for query in query_list:
-            print(f"extracting SAM3 masks for '{query}'...")
-            cache_query_masks(all_images, image_src_dir, mask_dir, query, sam3_processor)
+        if args.mask_function == "prompt":
+            prompts = read_prompts(args.prompt_file)
+            for query in query_list:
+                print(f"labeling whole-image masks for '{query}' from prompt text...")
+                cache_whole_image_masks(all_images, image_src_dir, mask_dir, query, prompts)
+        else:
+            if device == "cuda" or (hasattr(device, "type") and device.type == "cuda"):
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
+            sam3_model = build_sam3_image_model()
+            sam3_processor = Sam3Processor(sam3_model, device=device)
+            for query in query_list:
+                print(f"extracting SAM3 masks for '{query}'...")
+                cache_query_masks(all_images, image_src_dir, mask_dir, query, sam3_processor)
 
     if not args.disable_discover:
         for query in query_list:
