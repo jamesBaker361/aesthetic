@@ -214,13 +214,25 @@ def list_class_images(image_src_dir: str, classes: list) -> dict:
     return by_class
 
 
-def cache_all_class_masks(images_by_class: dict, classes: list, image_src_dir: str, mask_dir: str, sam3_processor):
-    '''Step 3: SAM3 patch masks, per class, over that class's own images (reuses generate_clean_inference.cache_query_masks).'''
+def cache_all_class_masks(images_by_class: dict, classes: list, image_src_dir: str, mask_dir: str, sam3_processor,
+                           device):
+    '''
+    Step 3: SAM3 patch masks, per class, over that class's own images
+    (reuses generate_clean_inference.cache_query_masks). Some of SAM3's own
+    layers run in bf16 internally while its weights stay float32, so calls
+    into it need to run under bf16 autocast - without it, F.linear raises
+    "mat1 and mat2 must have the same dtype, but got BFloat16 and Float".
+    '''
+    on_cuda = device == "cuda" or (hasattr(device, "type") and device.type == "cuda")
     for class_idx, images in images_by_class.items():
         if not images:
             continue
         print(f"extracting SAM3 masks for '{classes[class_idx]}' ({len(images)} images)...")
-        cache_query_masks(images, image_src_dir, mask_dir, classes[class_idx], sam3_processor)
+        if on_cuda:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                cache_query_masks(images, image_src_dir, mask_dir, classes[class_idx], sam3_processor)
+        else:
+            cache_query_masks(images, image_src_dir, mask_dir, classes[class_idx], sam3_processor)
 
 
 def filter_classes_by_patch_count(images_by_class: dict, classes: list, sparse_embedding_dir: str, mask_dir: str,
@@ -409,7 +421,7 @@ def main(args):
             torch.backends.cudnn.allow_tf32 = True
         sam3_model = build_sam3_image_model()
         sam3_processor = Sam3Processor(sam3_model, device=device)
-        cache_all_class_masks(images_by_class, classes, args.image_src_dir, args.mask_dir, sam3_processor)
+        cache_all_class_masks(images_by_class, classes, args.image_src_dir, args.mask_dir, sam3_processor, device)
 
     if not args.disable_probe:
         counts_path = os.path.join(args.probe_dir, "class_patch_counts.json")
