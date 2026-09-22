@@ -23,6 +23,10 @@
 #     hyperparameters) and pick the single latent with lowest training binary
 #     cross-entropy for the query ("unsupervised feature-to-concept matching").
 #     The saved vector is then all-zero except at that one latent.
+#   "f1": same per-latent probes as "bce", but pick whichever latent's
+#     thresholded (p>=0.5) predictions score highest training F1 instead of
+#     lowest BCE - rewards precision/recall balance directly rather than
+#     calibrated probability quality.
 #
 # --mask_function controls how each image's positive/negative patches are
 # labeled for a given query:
@@ -91,10 +95,11 @@ parser.add_argument("--mode", type=str, default="diff")  # fed to sparsify_embed
 parser.add_argument("--top_k", type=int, default=10)
 parser.add_argument("--n_visualize", type=int, default=5)
 
-parser.add_argument("--feature_selection", type=str, default="auroc", choices=["auroc", "bce"],
+parser.add_argument("--feature_selection", type=str, default="auroc", choices=["auroc", "bce", "f1"],
                      help="'auroc': top_k-AUROC latents + positive-patch averaging (default, generate_clean_patch style). "
                           "'bce': Eq. (7) of arXiv:2511.17735 - single lowest-training-BCE latent per query/block "
-                          "via a ridge-regularized 1D logistic regression (see appendix hyperparameters below).")
+                          "via a ridge-regularized 1D logistic regression (see appendix hyperparameters below). "
+                          "'f1': same per-latent probes as 'bce', but pick the single highest-training-F1 latent instead.")
 parser.add_argument("--bce_ridge", type=float, default=1e-8,
                      help="ridge regularization strength for --feature_selection=bce (paper appendix default)")
 parser.add_argument("--bce_newton_steps", type=int, default=30,
@@ -333,6 +338,56 @@ def fit_1d_ridge_logistic(feats: np.ndarray, labels: np.ndarray, ridge: float, n
     return w, b, loss
 
 
+def per_latent_f1_at_threshold(p: np.ndarray, labels: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+    """
+    Vectorized per-latent F1 at a fixed probability threshold. p is
+    (n_samples, n_dirs) (e.g. fit_1d_ridge_logistic's fitted per-latent
+    probes), labels is (n_samples,) shared across latents. Zero-division (no
+    predicted positives, or no actual positives) scores 0, matching sklearn's
+    zero_division=0 convention.
+    """
+    pred = p >= threshold
+    y = labels[:, None]
+    tp = (pred & y).sum(axis=0).astype(np.float64)
+    fp = (pred & ~y).sum(axis=0).astype(np.float64)
+    fn = (~pred & y).sum(axis=0).astype(np.float64)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        precision = np.where(tp + fp > 0, tp / (tp + fp), 0.0)
+        recall = np.where(tp + fn > 0, tp / (tp + fn), 0.0)
+        denom = precision + recall
+        f1 = np.where(denom > 0, 2 * precision * recall / denom, 0.0)
+    return f1
+
+
+def _best_latent_mean_vec(feats: np.ndarray, labels: np.ndarray, w: np.ndarray, b: np.ndarray,
+                           best_idx: int) -> tuple:
+    """
+    Shared by the "bce" and "f1" feature_selection modes (both fit the same
+    per-latent probes via fit_1d_ridge_logistic, just picking best_idx by a
+    different criterion): prints precision/recall/F1 + activation stats for
+    the chosen latent, and returns (mean_vec, pos_mean, pos_std) - mean_vec is
+    the SAE embedding, all-zero except at best_idx, set to its mean activation
+    over the positive (on-target) patches; pos_mean/pos_std are that same
+    latent's activation mean/std over the positive patches, for the caller to
+    persist alongside it.
+    """
+    best_feat = feats[:, best_idx].astype(np.float64)
+    p_best = expit(w[best_idx] * best_feat + b[best_idx])
+    pred_best = p_best >= 0.5
+    precision = precision_score(labels, pred_best, zero_division=0)
+    recall = recall_score(labels, pred_best, zero_division=0)
+    f1 = f1_score(labels, pred_best, zero_division=0)
+    pos_mean = float(feats[labels, best_idx].mean())
+    pos_std = float(feats[labels, best_idx].std())
+    print(f"  best latent {best_idx}: precision={precision:.4f} recall={recall:.4f} f1={f1:.4f} "
+          f"| positive activation mean={pos_mean:.4f} std={pos_std:.4f}")
+
+    mean_vec = np.zeros(feats.shape[1], dtype=np.float32)
+    mean_vec[best_idx] = pos_mean
+    return mean_vec, pos_mean, pos_std
+
+
 def discover_query_block(train_images: list, sparse_embedding_dir: str, mask_dir: str, query: str, block: str,
                           top_k: int, feature_selection: str = "auroc", bce_ridge: float = 1e-8,
                           bce_newton_steps: int = 30):
@@ -345,6 +400,9 @@ def discover_query_block(train_images: list, sparse_embedding_dir: str, mask_dir
     if n_pos == 0 or n_neg == 0:
         return None
 
+    chosen_pos_mean = None
+    chosen_pos_std = None
+
     if feature_selection == "bce":
         # Eq. (7): fit every latent's 1D probe and keep only the single
         # feature with lowest training BCE for this concept - "unsupervised
@@ -356,23 +414,21 @@ def discover_query_block(train_images: list, sparse_embedding_dir: str, mask_dir
         best_idx = int(np.argmin(loss))
         top_idx = np.array([best_idx], dtype=np.int64)
         top_score = loss[[best_idx]].astype(np.float32)  # lower is better (this is a loss, not an AUROC)
+        mean_vec, chosen_pos_mean, chosen_pos_std = _best_latent_mean_vec(feats, labels, w, b, best_idx)
+    elif feature_selection == "f1":
+        # same per-latent probes as "bce", but pick whichever latent's
+        # thresholded (p>=0.5) predictions score highest F1 instead of
+        # lowest training BCE
+        w, b, _ = fit_1d_ridge_logistic(feats, labels, bce_ridge, bce_newton_steps)
+        p = expit(w[None, :] * feats.astype(np.float64) + b[None, :])
+        f1_per_latent = per_latent_f1_at_threshold(p, labels)
+        print(f"  per-latent F1: mean={f1_per_latent.mean():.4f} median={np.median(f1_per_latent):.4f} "
+              f"min={f1_per_latent.min():.4f} max={f1_per_latent.max():.4f} std={f1_per_latent.std():.4f}")
 
-        best_feat = feats[:, best_idx].astype(np.float64)
-        p_best = expit(w[best_idx] * best_feat + b[best_idx])
-        pred_best = p_best >= 0.5
-        precision = precision_score(labels, pred_best, zero_division=0)
-        recall = recall_score(labels, pred_best, zero_division=0)
-        f1 = f1_score(labels, pred_best, zero_division=0)
-        pos_mean = feats[labels, best_idx].mean()
-        pos_std = feats[labels, best_idx].std()
-        print(f"  best latent {best_idx}: precision={precision:.4f} recall={recall:.4f} f1={f1:.4f} "
-              f"| positive activation mean={pos_mean:.4f} std={pos_std:.4f}")
-
-        # the SAE embedding for this query/block is now all-zero except at
-        # the single matched latent, set to its mean activation over the
-        # positive (on-target) patches
-        mean_vec = np.zeros(feats.shape[1], dtype=np.float32)
-        mean_vec[best_idx] = pos_mean
+        best_idx = int(np.argmax(f1_per_latent))
+        top_idx = np.array([best_idx], dtype=np.int64)
+        top_score = f1_per_latent[[best_idx]].astype(np.float32)  # higher is better (this is F1, not a loss)
+        mean_vec, chosen_pos_mean, chosen_pos_std = _best_latent_mean_vec(feats, labels, w, b, best_idx)
     else:
         # per-latent AUROC via rank-sum form of Mann-Whitney U (same technique
         # as generate_clean_patch.discover_top_features) - avoids one
@@ -396,6 +452,8 @@ def discover_query_block(train_images: list, sparse_embedding_dir: str, mask_dir
         "top_auc": top_score,
         "n_pos": n_pos,
         "n_neg": n_neg,
+        "chosen_pos_mean": chosen_pos_mean,
+        "chosen_pos_std": chosen_pos_std,
     }
 
 
@@ -408,6 +466,11 @@ def update_npz_dict(npz_dict_path: str, query: str, block: str, result: dict, mo
     existing[key] = result["mean_vec"]
     existing[f"{key}__topk_idx"] = result["top_idx"]
     existing[f"{key}__topk_auc"] = result["top_auc"]
+    # only "bce"/"f1" feature_selection picks a single chosen latent - "auroc"
+    # averages over a top_k shortlist, so there's no one feature's mean/std to save
+    if result["chosen_pos_mean"] is not None:
+        existing[f"{key}__chosen_pos_mean"] = np.float32(result["chosen_pos_mean"])
+        existing[f"{key}__chosen_pos_std"] = np.float32(result["chosen_pos_std"])
     existing["__meta_mode__"] = np.array(mode)
     np.savez(npz_dict_path, **existing)
 
