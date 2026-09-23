@@ -133,7 +133,7 @@ def main(args):
     # HookedStableDiffusionXLWithUNetPipeline doesn't define these itself -
     # go through .pipe (the wrapped diffusers pipeline) explicitly rather
     # than relying on HookedDiffusionAbstractPipeline's __getattr__ proxy
-    pipe.pipe.enable_vae_slicing()
+    pipe.pipe.vae.enable_slicing()  # enable_vae_slicing() was removed from the pipeline itself in this diffusers version
     pipe.pipe.enable_attention_slicing()
     if on_cuda:
         # keeps the UNet/VAE/text-encoders on GPU only while each is actually
