@@ -27,6 +27,16 @@
 #     thresholded (p>=0.5) predictions score highest training F1 instead of
 #     lowest BCE - rewards precision/recall balance directly rather than
 #     calibrated probability quality.
+#   "saeuron": the feature-selection heuristic from "SAeUron: Interpretable
+#     Concept Unlearning in Diffusion Models with Sparse Autoencoders"
+#     (arXiv:2501.18052), adapted to this repo's patch-level labels instead
+#     of their whole-image ones. Scores every latent by normalized mean
+#     activation difference, score(i) = mean_pos[i]/sum(mean_pos) -
+#     mean_neg[i]/sum(mean_neg), then keeps every latent above the
+#     --saeuron_percentile threshold with above-average positive activation
+#     (their paper reports this usually converges to ~1-2 features per
+#     concept). Unlike "bce"/"f1", this is a heuristic activation-difference
+#     ranking, not a fitted probe, and can select more than one latent.
 #
 # --mask_function controls how each image's positive/negative patches are
 # labeled for a given query:
@@ -95,15 +105,21 @@ parser.add_argument("--mode", type=str, default="diff")  # fed to sparsify_embed
 parser.add_argument("--top_k", type=int, default=10)
 parser.add_argument("--n_visualize", type=int, default=5)
 
-parser.add_argument("--feature_selection", type=str, default="auroc", choices=["auroc", "bce", "f1"],
+parser.add_argument("--feature_selection", type=str, default="auroc", choices=["auroc", "bce", "f1", "saeuron"],
                      help="'auroc': top_k-AUROC latents + positive-patch averaging (default, generate_clean_patch style). "
                           "'bce': Eq. (7) of arXiv:2511.17735 - single lowest-training-BCE latent per query/block "
                           "via a ridge-regularized 1D logistic regression (see appendix hyperparameters below). "
-                          "'f1': same per-latent probes as 'bce', but pick the single highest-training-F1 latent instead.")
+                          "'f1': same per-latent probes as 'bce', but pick the single highest-training-F1 latent instead. "
+                          "'saeuron': SAeUron's (arXiv:2501.18052) normalized-activation-difference percentile "
+                          "thresholding instead of a fitted probe - see --saeuron_percentile.")
 parser.add_argument("--bce_ridge", type=float, default=1e-8,
                      help="ridge regularization strength for --feature_selection=bce (paper appendix default)")
 parser.add_argument("--bce_newton_steps", type=int, default=30,
                      help="number of Newton-method steps for --feature_selection=bce (paper appendix default)")
+parser.add_argument("--saeuron_percentile", type=float, default=99.9,
+                     help="percentile threshold tau_c for --feature_selection=saeuron (SAeUron's paper uses up to "
+                          "99.999 for styles) - only latents above this percentile of the activation-difference "
+                          "score, and with above-average positive activation, get selected")
 
 parser.add_argument("--mask_function", type=str, default="sam3", choices=["sam3", "prompt"],
                      help="'sam3' (default): SAM3 text-prompted segmentation finds the query's patches. "
@@ -390,7 +406,7 @@ def _best_latent_mean_vec(feats: np.ndarray, labels: np.ndarray, w: np.ndarray, 
 
 def discover_query_block(train_images: list, sparse_embedding_dir: str, mask_dir: str, query: str, block: str,
                           top_k: int, feature_selection: str = "auroc", bce_ridge: float = 1e-8,
-                          bce_newton_steps: int = 30):
+                          bce_newton_steps: int = 30, saeuron_percentile: float = 99.9):
     feats, labels = load_block_feats_and_labels(train_images, sparse_embedding_dir, mask_dir, query, block)
     if feats is None:
         return None
@@ -429,6 +445,40 @@ def discover_query_block(train_images: list, sparse_embedding_dir: str, mask_dir
         top_idx = np.array([best_idx], dtype=np.int64)
         top_score = f1_per_latent[[best_idx]].astype(np.float32)  # higher is better (this is F1, not a loss)
         mean_vec, chosen_pos_mean, chosen_pos_std = _best_latent_mean_vec(feats, labels, w, b, best_idx)
+    elif feature_selection == "saeuron":
+        # SAeUron (arXiv:2501.18052): normalized mean-activation difference
+        # between positive and negative patches, rather than a fitted probe.
+        # score(i) = mean_pos[i]/sum(mean_pos) - mean_neg[i]/sum(mean_neg)
+        mean_pos = feats[labels].mean(axis=0).astype(np.float64)
+        mean_neg = feats[~labels].mean(axis=0).astype(np.float64)
+        sum_pos, sum_neg = mean_pos.sum(), mean_neg.sum()
+        norm_pos = mean_pos / sum_pos if sum_pos > 0 else np.zeros_like(mean_pos)
+        norm_neg = mean_neg / sum_neg if sum_neg > 0 else np.zeros_like(mean_neg)
+        score = norm_pos - norm_neg
+        print(f"  SAeUron score: mean={score.mean():.6f} median={np.median(score):.6f} "
+              f"min={score.min():.6f} max={score.max():.6f} std={score.std():.6f}")
+
+        # the paper's selection condition: above the percentile threshold AND
+        # above-average positive activation (filters out latents whose score
+        # is only high because they're near-inactive on both sides)
+        threshold = np.percentile(score, saeuron_percentile)
+        candidates = np.where((score >= threshold) & (mean_pos > mean_pos.mean()))[0]
+        if len(candidates) == 0:
+            # threshold too strict for this query/block - fall back to the
+            # single highest-scoring latent so a feature always gets picked,
+            # matching bce/f1's guarantee of never returning empty-handed
+            candidates = np.array([int(np.argmax(score))])
+
+        order = np.argsort(score[candidates])[::-1]
+        top_idx = candidates[order].astype(np.int64)
+        top_score = score[top_idx].astype(np.float32)
+        print(f"  selected {len(top_idx)} feature(s) above the {saeuron_percentile} percentile: "
+              f"{top_idx.tolist()} (scores {top_score.tolist()})")
+
+        # the paper ablates every selected feature together (a set, not
+        # necessarily just one) - mean_vec is zero except at those latents
+        mean_vec = np.zeros(feats.shape[1], dtype=np.float32)
+        mean_vec[top_idx] = mean_pos[top_idx]
     else:
         # per-latent AUROC via rank-sum form of Mann-Whitney U (same technique
         # as generate_clean_patch.discover_top_features) - avoids one
@@ -543,7 +593,8 @@ def main(args):
             for block in block_list:
                 print(f"discovering SAE embedding for '{query}' / {block} ...")
                 result = discover_query_block(train_images, sparse_embedding_dir, mask_dir, query, block, args.top_k,
-                                               args.feature_selection, args.bce_ridge, args.bce_newton_steps)
+                                               args.feature_selection, args.bce_ridge, args.bce_newton_steps,
+                                               args.saeuron_percentile)
                 if result is None:
                     print(f"  skipped: no positive/negative patch contrast for '{query}' at {block}")
                     continue
