@@ -49,7 +49,7 @@ parser.add_argument("--start_step", type=int, default=0)
 parser.add_argument("--end_step", type=int, default=1000)
 parser.add_argument("--mode", type=str, default=None)  # "diff" or "out"; defaults to whatever generate_clean_inference.py recorded in npz_dict
 
-parser.add_argument("--num_inference_steps", type=int, default=8)
+parser.add_argument("--num_inference_steps", type=int, default=1)
 parser.add_argument("--size", type=int, default=512)
 parser.add_argument("--guidance_scale", type=float, default=0.0)
 parser.add_argument("--seed", type=int, default=0)
