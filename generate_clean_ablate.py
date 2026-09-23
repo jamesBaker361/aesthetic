@@ -130,7 +130,20 @@ def main(args):
         torch_dtype=dtype,
         variant=("fp16" if dtype == torch.float16 else None),
     )
-    pipe.to(device)
+    # HookedStableDiffusionXLWithUNetPipeline doesn't define these itself -
+    # go through .pipe (the wrapped diffusers pipeline) explicitly rather
+    # than relying on HookedDiffusionAbstractPipeline's __getattr__ proxy
+    pipe.pipe.enable_vae_slicing()
+    pipe.pipe.enable_attention_slicing()
+    if on_cuda:
+        # keeps the UNet/VAE/text-encoders on GPU only while each is actually
+        # running instead of the whole pipe sitting resident for the entire
+        # script - without this, SAM3's own GPU use (right after the base
+        # image generation, before any hooked generation) OOMs on smaller
+        # GPUs since the full fp16 SDXL pipe never gets a chance to shrink
+        pipe.pipe.enable_model_cpu_offload()
+    else:
+        pipe.to(device)
 
     if on_cuda:
         torch.backends.cuda.matmul.allow_tf32 = True

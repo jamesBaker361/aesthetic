@@ -225,8 +225,11 @@ def main(args):
     if on_cuda:
         # keeps the UNet/VAE/text-encoders on GPU only while each is actually
         # running instead of all of them (plus the SAE dict, plus SAM3) sitting
-        # resident on GPU for the whole script - costs some transfer latency
-        pipe.enable_model_cpu_offload()
+        # resident on GPU for the whole script - costs some transfer latency.
+        # HookedStableDiffusionXLWithUNetPipeline doesn't define this itself -
+        # go through .pipe (the wrapped diffusers pipeline) explicitly rather
+        # than relying on HookedDiffusionAbstractPipeline's __getattr__ proxy
+        pipe.pipe.enable_model_cpu_offload()
     else:
         pipe.to(device)
 
