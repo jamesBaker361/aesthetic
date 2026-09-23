@@ -12,7 +12,7 @@
 
 #SBATCH --gres=gpu:1
 
-#SBATCH --mem=128000                # Real memory (RAM) required (MB)
+#SBATCH --mem=32000                # Real memory (RAM) required (MB)
 
 #SBATCH --time=3-00:00:00           # Total run time limit (D-HH:MM:SS)
 
