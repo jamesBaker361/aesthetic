@@ -114,6 +114,8 @@ def build_variants(mean_vec: np.ndarray, best_idx, pos_mean, pos_std):
 def main(args):
     api, accelerator, device = repo_api_init(args)
     os.makedirs(args.image_dest_dir, exist_ok=True)
+    
+    base_prompt=args.base_prompt.replace("_"," ")
 
     npz_data = load_npz_dict(args.npz_dict)
     mode = args.mode or str(npz_data.get("__meta_mode__", np.array("diff")))
@@ -144,7 +146,7 @@ def main(args):
 
     base_gen = torch.Generator()
     base_gen.manual_seed(args.seed)
-    base_image = pipe(args.base_prompt, height=args.size, width=args.size, guidance_scale=args.guidance_scale,
+    base_image = pipe(base_prompt, height=args.size, width=args.size, guidance_scale=args.guidance_scale,
                        num_inference_steps=args.num_inference_steps, generator=base_gen).images[0]
 
     pixel_mask = compute_query_pixel_mask(base_image, args.mask_target, sam3_model, device)
@@ -184,7 +186,7 @@ def main(args):
             gen = torch.Generator()
             gen.manual_seed(args.seed)  # same seed as the base image - only the masked region should differ
             out_image = pipe.run_with_hooks(
-                args.base_prompt, position_hook_dict=hook_dict,
+                base_prompt, position_hook_dict=hook_dict,
                 height=args.size, width=args.size, guidance_scale=args.guidance_scale,
                 num_inference_steps=args.num_inference_steps, generator=gen,
             ).images[0]
