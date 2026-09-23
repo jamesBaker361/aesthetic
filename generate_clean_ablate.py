@@ -174,13 +174,29 @@ def main(args):
     entries = list(iter_npz_features(npz_data, block_list))
     print(f"{len(entries)} features found in {args.npz_dict}")
 
+    # if different queries' bce/f1 selection all converged on the same
+    # best_idx for a block, every one of their ablations will look alike
+    # regardless of which query "caused" them - surface that directly rather
+    # than leaving it to be inferred from the output images
+    idx_by_block = {}
+    for query, block, _mean_vec, best_idx, _pos_mean, _pos_std in entries:
+        if best_idx is not None:
+            idx_by_block.setdefault(block, []).append((query, best_idx))
+    for block, pairs in idx_by_block.items():
+        unique_idxs = sorted(set(idx for _, idx in pairs))
+        print(f"{block}: {len(pairs)} queries -> {len(unique_idxs)} distinct best_idx {unique_idxs}")
+        if len(unique_idxs) < len(pairs):
+            from collections import Counter
+            dupes = {idx: [q for q, i in pairs if i == idx] for idx, c in Counter(i for _, i in pairs).items() if c > 1}
+            print(f"  ! shared best_idx across queries: {dupes}")
+
     for query, block, mean_vec, best_idx, pos_mean, pos_std in entries:
         safe_query = query.replace(" ", "_")
         safe_block = block.replace(".", "_")
         variants = build_variants(mean_vec, best_idx, pos_mean, pos_std)
         if best_idx is None:
             print(f"'{query}' @ {block}: no tracked std (an 'auroc' entry) - only generating the mean variant")
-        print(f"ablating '{query}' @ {block} into the '{args.mask_target}' mask region "
+        print(f"ablating '{query}' @ {block} (best_idx={best_idx}) into the '{args.mask_target}' mask region "
               f"({len(variants)} variant(s))...")
 
         sae = get_sae(block)
