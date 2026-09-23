@@ -130,12 +130,7 @@ def main(args):
         torch_dtype=dtype,
         variant=("fp16" if dtype == torch.float16 else None),
     )
-    pipe.enable_vae_slicing()
-    pipe.enable_attention_slicing()
-    if on_cuda:
-        pipe.enable_model_cpu_offload()
-    else:
-        pipe.to(device)
+    pipe.to(device)
 
     if on_cuda:
         torch.backends.cuda.matmul.allow_tf32 = True
