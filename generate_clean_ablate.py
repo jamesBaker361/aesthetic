@@ -43,6 +43,13 @@ parser.add_argument("--base_prompt", type=str, required=True)  # single prompt f
 parser.add_argument("--mask_target", type=str, required=True)  # SAM3 query for the region to inject features into
 parser.add_argument("--npz_dict", type=str, default="platonic.npz")
 
+parser.add_argument("--sae_source", type=str, default="local", choices=["local", "saeuron"],
+                     help="'local': this repo's own trained checkpoints (default). 'saeuron': checkpoints converted "
+                          "by convert_saeuron_checkpoint.py from github.com/cywinski/SAeUron - pair with "
+                          "--block_list since they don't overlap DEFAULT_BLOCK_LIST.")
+parser.add_argument("--block_list", nargs="*", default=None,
+                     help="overrides attribution.DEFAULT_BLOCK_LIST - required when --sae_source=saeuron")
+
 parser.add_argument("--beta", type=float, default=1.0)  # injection strength multiplier on top of each variant's value
 
 parser.add_argument("--start_step", type=int, default=0)
@@ -64,8 +71,10 @@ def iter_npz_features(npz_data: dict, block_list: list):
     "__chosen_pos_mean"/"__chosen_pos_std" scalars for the single latent that
     actually matters there. "auroc"-built entries don't have those scalars.
 
-    Yields (query, block, mean_vec, best_idx, pos_mean, pos_std) - the last
-    three are None when this entry has no tracked std (an "auroc" entry).
+    Yields (query, block, mean_vec, top_idx, best_idx, pos_mean, pos_std) -
+    top_idx is the saved "__topk_idx" array (one entry for bce/f1, up to
+    --top_k for auroc); best_idx/pos_mean/pos_std are None when this entry
+    has no tracked std (an "auroc" entry).
     '''
     reserved_suffixes = ("__topk_idx", "__topk_auc", "__chosen_pos_mean", "__chosen_pos_std")
     for key in npz_data:
@@ -78,34 +87,49 @@ def iter_npz_features(npz_data: dict, block_list: list):
 
         mean_vec = npz_data[key]
         mean_key, std_key, idx_key = f"{key}__chosen_pos_mean", f"{key}__chosen_pos_std", f"{key}__topk_idx"
+        top_idx = npz_data[idx_key]
 
         if mean_key in npz_data and std_key in npz_data:
-            best_idx = int(npz_data[idx_key][0])
+            best_idx = int(top_idx[0])
             pos_mean = float(npz_data[mean_key])
             pos_std = float(npz_data[std_key])
         else:
             best_idx = pos_mean = pos_std = None
 
-        yield query, block, mean_vec, best_idx, pos_mean, pos_std
+        yield query, block, mean_vec, top_idx, best_idx, pos_mean, pos_std
 
 
-def build_variants(mean_vec: np.ndarray, best_idx, pos_mean, pos_std):
+def build_variants(mean_vec: np.ndarray, top_idx: np.ndarray, best_idx, pos_mean, pos_std):
     '''
+    The injected vector is all-zero except at top_idx (the latents actually
+    selected by --feature_selection), set to mean_vec's value there - not the
+    raw saved mean_vec itself, which for "auroc" entries is the mean over
+    positive patches of already-top-k-sparse-per-patch activations and so can
+    carry small nonzero values at latents outside that block's top_idx
+    shortlist (different patches pick different top-k latents). Restricting
+    to top_idx keeps the injection targeted at only those latents; because
+    sae_forward_swap adds beta * to_vec into the pre-activation, the zeroed
+    entries contribute nothing and only the targeted latents' pre-activations
+    are actually added to.
+
     ("mean", vec) always; ("plus_std", vec)/("minus_std", vec) only when this
     feature has a tracked single-latent std - those two just swap that one
-    latent's value in an otherwise-identical copy of mean_vec. Negative values
-    aren't clipped: sae_forward_swap's own torch.relu(vals) after top-k
-    selection already floors a latent at 0 if it's selected with a negative
-    pre-activation, so "minus_std" going negative just naturally reads as
-    "suppress this latent" without any special-casing here.
+    latent's value in an otherwise-identical copy of the sparse vector.
+    Negative values aren't clipped: sae_forward_swap's own torch.relu(vals)
+    after top-k selection already floors a latent at 0 if it's selected with
+    a negative pre-activation, so "minus_std" going negative just naturally
+    reads as "suppress this latent" without any special-casing here.
     '''
-    variants = [("mean", mean_vec)]
+    sparse_vec = np.zeros_like(mean_vec)
+    sparse_vec[top_idx] = mean_vec[top_idx]
+
+    variants = [("mean", sparse_vec)]
     if best_idx is not None:
-        plus_vec = mean_vec.copy()
+        plus_vec = sparse_vec.copy()
         plus_vec[best_idx] = pos_mean + pos_std
         variants.append(("plus_std", plus_vec))
 
-        minus_vec = mean_vec.copy()
+        minus_vec = sparse_vec.copy()
         minus_vec[best_idx] = pos_mean - pos_std
         variants.append(("minus_std", minus_vec))
     return variants
@@ -121,7 +145,7 @@ def main(args):
     mode = args.mode or str(npz_data.get("__meta_mode__", np.array("diff")))
     print(f"using mode='{mode}'")
 
-    block_list = list(DEFAULT_BLOCK_LIST)
+    block_list = args.block_list if args.block_list else list(DEFAULT_BLOCK_LIST)
     on_cuda = device == "cuda" or (hasattr(device, "type") and device.type == "cuda")
     dtype = torch.float16 if (torch.cuda.is_available() and args.mixed_precision == "fp16") else torch.float32
 
@@ -168,7 +192,7 @@ def main(args):
 
     def get_sae(block):
         if block not in sae_cache:
-            sae_cache[block] = load_sae(block).to(device)
+            sae_cache[block] = load_sae(block, args.sae_source).to(device)
         return sae_cache[block]
 
     entries = list(iter_npz_features(npz_data, block_list))
@@ -179,7 +203,7 @@ def main(args):
     # regardless of which query "caused" them - surface that directly rather
     # than leaving it to be inferred from the output images
     idx_by_block = {}
-    for query, block, _mean_vec, best_idx, _pos_mean, _pos_std in entries:
+    for query, block, _mean_vec, _top_idx, best_idx, _pos_mean, _pos_std in entries:
         if best_idx is not None:
             idx_by_block.setdefault(block, []).append((query, best_idx))
     for block, pairs in idx_by_block.items():
@@ -190,10 +214,10 @@ def main(args):
             dupes = {idx: [q for q, i in pairs if i == idx] for idx, c in Counter(i for _, i in pairs).items() if c > 1}
             print(f"  ! shared best_idx across queries: {dupes}")
 
-    for query, block, mean_vec, best_idx, pos_mean, pos_std in entries:
+    for query, block, mean_vec, top_idx, best_idx, pos_mean, pos_std in entries:
         safe_query = query.replace(" ", "_")
         safe_block = block.replace(".", "_")
-        variants = build_variants(mean_vec, best_idx, pos_mean, pos_std)
+        variants = build_variants(mean_vec, top_idx, best_idx, pos_mean, pos_std)
         if best_idx is None:
             print(f"'{query}' @ {block}: no tracked std (an 'auroc' entry) - only generating the mean variant")
         print(f"ablating '{query}' @ {block} (best_idx={best_idx}) into the '{args.mask_target}' mask region "

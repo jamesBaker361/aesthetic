@@ -28,6 +28,7 @@ from generate_clean_inference import read_prompts, get_query_pixel_mask, resize_
 from experiment_helpers.image_helpers import concat_images_horizontally
 from sam3_repo.sam3.model_builder import build_sam3_image_model
 from sam3_repo.sam3.model.sam3_image_processor import Sam3Processor
+from convert_saeuron_checkpoint import saeuron_checkpoint_dir, SAEURON_HOOKPOINTS
 
 parser = default_parser(
     {
@@ -40,6 +41,13 @@ parser.add_argument("--npz_dict", type=str, default="platonic.npz")
 
 parser.add_argument("--query", type=str, required=True)  # concept to remove (or replace)
 parser.add_argument("--replace_query", type=str, default=None)  # if set, inject this concept's embedding in query's place instead of just removing it
+
+parser.add_argument("--sae_source", type=str, default="local", choices=["local", "saeuron"],
+                     help="'local': this repo's own trained checkpoints (default). 'saeuron': checkpoints converted "
+                          "by convert_saeuron_checkpoint.py from github.com/cywinski/SAeUron - pair with "
+                          f"--block_list from {SAEURON_HOOKPOINTS} since they don't overlap DEFAULT_BLOCK_LIST.")
+parser.add_argument("--block_list", nargs="*", default=None,
+                     help="overrides attribution.DEFAULT_BLOCK_LIST - required when --sae_source=saeuron")
 
 parser.add_argument("--alpha", type=float, default=1.0)  # subtraction strength for --query
 parser.add_argument("--beta", type=float, default=1.0)  # injection strength for --replace_query
@@ -57,7 +65,12 @@ parser.add_argument("--save_baseline", action="store_true")  # concat the no-hoo
 SAE_CHECKPOINTS = "./sdxl_unbox/checkpoints/"
 
 
-def load_sae(block: str) -> SparseAutoencoder:
+def load_sae(block: str, source: str = "local") -> SparseAutoencoder:
+    if source == "saeuron":
+        # converted by convert_saeuron_checkpoint.py - only covers
+        # "up_blocks.1.attentions.1"/"up_blocks.1.attentions.2", not
+        # DEFAULT_BLOCK_LIST, so --block_list needs overriding alongside this
+        return SparseAutoencoder.load_from_disk(os.path.join(saeuron_checkpoint_dir(SAE_CHECKPOINTS, block), "final"))
     return SparseAutoencoder.load_from_disk(
         os.path.join(SAE_CHECKPOINTS, f"unet.{block}_k10_hidden5120_auxk256_bs4096_lr0.0001", "final"),
     )
@@ -196,7 +209,7 @@ def main(args):
     mode = args.mode or str(npz_data.get("__meta_mode__", np.array("diff")))
     print(f"using mode='{mode}'")
 
-    block_list = list(DEFAULT_BLOCK_LIST)
+    block_list = args.block_list if args.block_list else list(DEFAULT_BLOCK_LIST)
     on_cuda = device == "cuda" or (hasattr(device, "type") and device.type == "cuda")
     dtype = torch.float16 if (torch.cuda.is_available() and args.mixed_precision == "fp16") else torch.float32
 
@@ -211,7 +224,7 @@ def main(args):
         # CUDA kernel ("addmm_sparse_cuda" not implemented for 'Half'), so the
         # SAE can't just match the fp16 pipe the way sae_forward_swap's
         # from_vec/to_vec dtype cast otherwise assumes
-        sae_dict[block] = load_sae(block).to(device)
+        sae_dict[block] = load_sae(block, args.sae_source).to(device)
         vec_dict[block] = (from_vec, to_vec)
 
     if not sae_dict:

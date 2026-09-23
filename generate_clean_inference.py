@@ -126,6 +126,13 @@ parser.add_argument("--mask_function", type=str, default="sam3", choices=["sam3"
                           "'prompt': whole image is positive/negative based on whether the query's text appears "
                           "in the prompt that generated it - for concepts SAM3 can't spatially localize (e.g. a style).")
 
+parser.add_argument("--sae_source", type=str, default="local", choices=["local", "saeuron"],
+                     help="'local': this repo's own trained checkpoints (default). 'saeuron': checkpoints converted "
+                          "by convert_saeuron_checkpoint.py from github.com/cywinski/SAeUron - pair with "
+                          "--block_list since they don't overlap DEFAULT_BLOCK_LIST.")
+parser.add_argument("--block_list", nargs="*", default=None,
+                     help="overrides attribution.DEFAULT_BLOCK_LIST - required when --sae_source=saeuron")
+
 parser.add_argument("--disable_generate", action="store_true")
 parser.add_argument("--disable_sparsify_embeddings", action="store_true")
 parser.add_argument("--disable_masks", action="store_true")
@@ -556,7 +563,7 @@ def main(args):
     if not query_list:
         raise ValueError("--query_list is required (e.g. --query_list banana orange)")
 
-    block_list = list(DEFAULT_BLOCK_LIST)
+    block_list = args.block_list if args.block_list else list(DEFAULT_BLOCK_LIST)
 
     if not args.disable_generate:
         generate_and_cache(image_src_dir, embedding_dir, args.prompt_file, block_list,
@@ -569,7 +576,7 @@ def main(args):
     print(f"partition: {len(train_images)} train images, {len(test_images)} test images")
 
     if not args.disable_sparsify_embeddings:
-        sparsify_embeddings(sparse_embedding_dir, embedding_dir, args.mode)
+        sparsify_embeddings(sparse_embedding_dir, embedding_dir, args.mode, block_list, args.sae_source)
 
     if not args.disable_masks:
         if args.mask_function == "prompt":
