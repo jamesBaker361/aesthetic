@@ -17,6 +17,7 @@ import cv2
 from concurrent.futures import ThreadPoolExecutor
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
 from experiment_helpers.gpu_details import print_details
+from convert_saeuron_checkpoint import saeuron_checkpoint_dir
 
 def top_n_mask(x, n, dim=-1):
     """
@@ -46,25 +47,32 @@ embedding_src_dir="embeddings"
 image_src_dir= "laion"
 
 
-def sparsify_embeddings(sparse_dest_dir:str="sparse_embeddings",embedding_src_dir:str="embeddings",mode:str="diff"):
+def sparsify_embeddings(sparse_dest_dir:str="sparse_embeddings",embedding_src_dir:str="embeddings",mode:str="diff",
+                         block_list:list=None, sae_source:str="local"):
     print("sparsify embeddings")
+    # this file's own module-level block_list is the default (local, 4-block
+    # setup) - pass block_list explicitly to target different blocks, e.g.
+    # convert_saeuron_checkpoint.py's SAEURON_HOOKPOINTS with sae_source="saeuron"
+    if block_list is None:
+        block_list = globals()["block_list"]
     saes_dict:dict[str,SparseAutoencoder] = {}
     for block in tqdm(block_list, desc="Loading SAEs"):
-        sae = SparseAutoencoder.load_from_disk(
-            os.path.join(path_to_checkpoints, f"unet.{block}_k10_hidden5120_auxk256_bs4096_lr0.0001", "final"),
-        )
+        if sae_source == "saeuron":
+            ckpt_dir = os.path.join(saeuron_checkpoint_dir(path_to_checkpoints, block), "final")
+            means = None  # SAeUron checkpoints have no mean.pt; unused below anyway (subtraction is commented out)
+        else:
+            ckpt_dir = os.path.join(path_to_checkpoints, f"unet.{block}_k10_hidden5120_auxk256_bs4096_lr0.0001", "final")
+            mean_path = os.path.join(ckpt_dir, "mean.pt")
+            means = torch.load(mean_path, weights_only=True) if os.path.exists(mean_path) else None
+
+        sae = SparseAutoencoder.load_from_disk(ckpt_dir)
         if torch.isnan(sae.decoder.weight).any():
             print("nan decoder weight ",block)
-        means = torch.load(
-            os.path.join(path_to_checkpoints, f"unet.{block}_k10_hidden5120_auxk256_bs4096_lr0.0001", "final", "mean.pt"),
-            weights_only=True
-        )
-        
-        if torch.isnan(means).any():
+        if means is not None and torch.isnan(means).any():
             print(" nan mean for ",block)
-        
+
         saes_dict[block]=sae
-        
+
 
 
     for file in tqdm(os.listdir(embedding_src_dir), desc="Sparsifying"):
