@@ -33,7 +33,7 @@ from experiment_helpers.image_helpers import concat_images_horizontally
 
 from sam3_repo.sam3.model_builder import build_sam3_image_model
 
-from generate_clean_swap import load_sae, SAE_CHECKPOINTS, highlight_pixel_mask, compute_query_pixel_mask
+from generate_clean_swap import load_sae, load_feature_mean, highlight_pixel_mask, compute_query_pixel_mask
 from generate_clean_ablate import make_add_position_hook_dict
 
 parser = default_parser(
@@ -66,14 +66,6 @@ KNOWN_FEATURES = [
     ("up_blocks.0.attentions.1", 90, "fur"),
     ("up_blocks.0.attentions.1", 2165, "twilight_blur"),
 ]
-
-
-def load_feature_mean(block: str, feature_idx: int, device) -> float:
-    # same mean.pt each SAE checkpoint ships with that sdxl_unbox/app.py
-    # reads into its own means_dict - see sparsify.py's identical mean_path
-    mean_path = os.path.join(SAE_CHECKPOINTS, f"unet.{block}_k10_hidden5120_auxk256_bs4096_lr0.0001", "final", "mean.pt")
-    means = torch.load(mean_path, weights_only=True, map_location=device)
-    return float(means[feature_idx])
 
 
 def main(args):

@@ -76,6 +76,16 @@ def load_sae(block: str, source: str = "local") -> SparseAutoencoder:
     )
 
 
+def load_feature_mean(block: str, feature_idx: int, device) -> float:
+    # same mean.pt each SAE checkpoint ships with that sdxl_unbox/app.py reads
+    # into its own means_dict - see sparsify.py's identical mean_path. Only
+    # covers "local" checkpoints - SAeUron ones have no mean.pt (sparsify.py's
+    # own comment on that).
+    mean_path = os.path.join(SAE_CHECKPOINTS, f"unet.{block}_k10_hidden5120_auxk256_bs4096_lr0.0001", "final", "mean.pt")
+    means = torch.load(mean_path, weights_only=True, map_location=device)
+    return float(means[feature_idx])
+
+
 def load_npz_dict(npz_dict_path: str) -> dict:
     with np.load(npz_dict_path, allow_pickle=True) as data:
         return {k: data[k] for k in data.files}

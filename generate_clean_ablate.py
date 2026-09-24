@@ -39,7 +39,7 @@ from sdxl_unbox.SAE import SparseAutoencoder
 
 from sam3_repo.sam3.model_builder import build_sam3_image_model
 
-from generate_clean_swap import load_sae, load_npz_dict, highlight_pixel_mask, compute_query_pixel_mask
+from generate_clean_swap import load_sae, load_npz_dict, load_feature_mean, highlight_pixel_mask, compute_query_pixel_mask
 from generate_clean_inference import resize_mask_to_grid
 
 parser = default_parser(
@@ -59,7 +59,7 @@ parser.add_argument("--sae_source", type=str, default="local", choices=["local",
 parser.add_argument("--block_list", nargs="*", default=None,
                      help="overrides attribution.DEFAULT_BLOCK_LIST - required when --sae_source=saeuron")
 
-parser.add_argument("--beta", type=float, default=1.0)  # injection strength multiplier on top of each variant's value
+parser.add_argument("--strength", type=float, default=10.0)  # injection strength multiplier on top of each variant's saved mean vector - same convention/default as sanity_check_known_features.py
 
 parser.add_argument("--start_step", type=int, default=0)
 parser.add_argument("--end_step", type=int, default=1000)
@@ -108,46 +108,45 @@ def iter_npz_features(npz_data: dict, block_list: list):
         yield query, block, mean_vec, top_idx, best_idx, pos_mean, pos_std
 
 
-def build_variants(mean_vec: np.ndarray, top_idx: np.ndarray, best_idx, pos_mean, pos_std):
+def build_variants(mean_vec: np.ndarray, top_idx: np.ndarray, best_idx, pos_std, block: str, device):
     '''
-    The injected vector is all-zero except at the selected latent(s).
-
-    - bce/f1 (best_idx is not None): a single chosen latent - its value comes
-      straight from the tracked pos_mean/pos_std scalars, never from the
-      saved mean_vec array (mean_vec happens to already equal pos_mean there,
-      but pos_mean is the actual source of truth, not a byproduct of it).
-    - auroc (best_idx is None): a top_idx shortlist with no per-latent scalar
-      tracked for them, so mean_vec[top_idx] - the mean over positive patches
-      of already-top-k-sparse-per-patch activations, restricted to just the
-      shortlisted latents - is the only per-latent magnitude available.
-
-    Either way only the selected latent(s) end up nonzero; because
-    sae_forward_swap adds beta * to_vec into the pre-activation, the zeroed
-    entries contribute nothing and only the targeted latents' pre-activations
-    are actually added to.
+    The injected vector is all-zero except at the selected latent(s) (a
+    single best_idx for bce/f1, or the top_idx shortlist for auroc). The
+    value placed there comes from load_feature_mean (generate_clean_swap.py)
+    - each SAE checkpoint's own mean.pt, the same per-latent "typical
+    activation strength" sdxl_unbox/app.py and sanity_check_known_features.py
+    use - rather than anything generate_clean_inference.py computed from this
+    query's own positive patches (mean_vec/pos_mean). That keeps the injected
+    magnitude on the same footing as the known-good features
+    sanity_check_known_features.py validates, regardless of which query
+    "found" this latent. mean_vec is only used for its shape/dtype here.
 
     ("mean", vec) always; ("plus_std", vec)/("minus_std", vec) only when this
-    feature has a tracked single-latent std - those two just swap that one
-    latent's value in an otherwise-identical copy of the sparse vector.
-    Negative values aren't clipped: sae_forward_swap's own torch.relu(vals)
-    after top-k selection already floors a latent at 0 if it's selected with
-    a negative pre-activation, so "minus_std" going negative just naturally
-    reads as "suppress this latent" without any special-casing here.
+    feature has a tracked single-latent std (bce/f1) - those two just swap
+    that one latent's value in an otherwise-identical copy of the sparse
+    vector, adding/subtracting the query's own tracked pos_std around the
+    checkpoint's mean. Negative values aren't clipped here or in
+    sae_decode_add: "minus_std" going negative just naturally reads as
+    "suppress this latent" (a negative decoded delta), since there's no
+    top-k/relu step in this decode-only injection to floor it at 0.
     '''
     sparse_vec = np.zeros_like(mean_vec)
     if best_idx is not None:
-        sparse_vec[best_idx] = pos_mean
+        sparse_vec[best_idx] = load_feature_mean(block, best_idx, device)
     else:
-        sparse_vec = mean_vec
+        for idx in top_idx:
+            idx = int(idx)
+            sparse_vec[idx] = load_feature_mean(block, idx, device)
 
     variants = [("mean", sparse_vec)]
     if best_idx is not None:
+        checkpoint_mean = sparse_vec[best_idx]
         plus_vec = sparse_vec.copy()
-        plus_vec[best_idx] = pos_mean + pos_std
+        plus_vec[best_idx] = checkpoint_mean + pos_std
         variants.append(("plus_std", plus_vec))
 
         minus_vec = sparse_vec.copy()
-        minus_vec[best_idx] = pos_mean - pos_std
+        minus_vec[best_idx] = checkpoint_mean - pos_std
         variants.append(("minus_std", minus_vec))
     return variants
 
@@ -301,7 +300,7 @@ def main(args):
     for query, block, mean_vec, top_idx, best_idx, pos_mean, pos_std in entries:
         safe_query = query.replace(" ", "_")
         safe_block = block.replace(".", "_")
-        variants = build_variants(mean_vec, top_idx, best_idx, pos_mean, pos_std)
+        variants = build_variants(mean_vec, top_idx, best_idx, pos_std, block, device)
         if best_idx is None:
             print(f"'{query}' @ {block}: no tracked std (an 'auroc' entry) - only generating the mean variant")
         print(f"ablating '{query}' @ {block} (best_idx={best_idx}) into the '{args.mask_target}' mask region "
@@ -312,7 +311,7 @@ def main(args):
         for variant_name, vec in variants:
             to_vec = torch.tensor(vec, device=device, dtype=torch.float32)
             hook_dict = make_add_position_hook_dict(
-                {block: sae}, {block: to_vec}, args.start_step, args.end_step, args.beta, device, pixel_mask
+                {block: sae}, {block: to_vec}, args.start_step, args.end_step, args.strength, device, pixel_mask
             )
             gen = torch.Generator()
             gen.manual_seed(args.seed)  # same seed as the base image - only the masked region should differ
