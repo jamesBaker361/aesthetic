@@ -121,7 +121,7 @@ def build_variants(mean_vec: np.ndarray, top_idx: np.ndarray, best_idx, pos_mean
     reads as "suppress this latent" without any special-casing here.
     '''
     sparse_vec = np.zeros_like(mean_vec)
-    sparse_vec[top_idx] = mean_vec[top_idx]
+    sparse_vec[top_idx] = pos_mean
 
     variants = [("mean", sparse_vec)]
     if best_idx is not None:
