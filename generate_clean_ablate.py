@@ -2,8 +2,15 @@
 # a SAM3 mask for mask_target on it, then for every {query, block} feature
 # saved in --npz_dict (by generate_clean_inference.py), regenerates the same
 # image (same seed/prompt) injecting that feature ONLY inside the masked
-# region - background stays anchored to the base image, same technique as
-# generate_clean_swap.py's patch_mask-restricted editing.
+# region - background stays anchored to the base image. Unlike
+# generate_clean_swap.py's make_swap_hook (which adds the injected vector to
+# the block's *pre*-top-k activation and then re-runs top-k, so the injection
+# can knock one of the patch's own genuinely active latents out of the
+# reconstruction), this script encodes each patch's real top-k latents first,
+# ADDS the injected feature on top of that already-fixed sparse vector, and
+# only then decodes - see make_add_hook/sae_decode_add below. The patch's own
+# active latents always survive in the output; only the extra injected
+# direction is ever added.
 #
 # Each feature gets up to 3 variants: injected at its mean activation, mean
 # plus one std, and mean minus one std. The plus/minus variants only exist
@@ -26,12 +33,12 @@ from experiment_helpers.init_helpers import default_parser, repo_api_init
 from attribution import DEFAULT_BLOCK_LIST
 from sdxl_pipe import HookedStableDiffusionXLWithUNetPipeline
 from experiment_helpers.image_helpers import concat_images_horizontally
+from sdxl_unbox.SAE import SparseAutoencoder
 
 from sam3_repo.sam3.model_builder import build_sam3_image_model
 
-from generate_clean_swap import (
-    load_sae, load_npz_dict, highlight_pixel_mask, compute_query_pixel_mask, make_position_hook_dict,
-)
+from generate_clean_swap import load_sae, load_npz_dict, highlight_pixel_mask, compute_query_pixel_mask
+from generate_clean_inference import resize_mask_to_grid
 
 parser = default_parser(
     {
@@ -101,13 +108,18 @@ def iter_npz_features(npz_data: dict, block_list: list):
 
 def build_variants(mean_vec: np.ndarray, top_idx: np.ndarray, best_idx, pos_mean, pos_std):
     '''
-    The injected vector is all-zero except at top_idx (the latents actually
-    selected by --feature_selection), set to mean_vec's value there - not the
-    raw saved mean_vec itself, which for "auroc" entries is the mean over
-    positive patches of already-top-k-sparse-per-patch activations and so can
-    carry small nonzero values at latents outside that block's top_idx
-    shortlist (different patches pick different top-k latents). Restricting
-    to top_idx keeps the injection targeted at only those latents; because
+    The injected vector is all-zero except at the selected latent(s).
+
+    - bce/f1 (best_idx is not None): a single chosen latent - its value comes
+      straight from the tracked pos_mean/pos_std scalars, never from the
+      saved mean_vec array (mean_vec happens to already equal pos_mean there,
+      but pos_mean is the actual source of truth, not a byproduct of it).
+    - auroc (best_idx is None): a top_idx shortlist with no per-latent scalar
+      tracked for them, so mean_vec[top_idx] - the mean over positive patches
+      of already-top-k-sparse-per-patch activations, restricted to just the
+      shortlisted latents - is the only per-latent magnitude available.
+
+    Either way only the selected latent(s) end up nonzero; because
     sae_forward_swap adds beta * to_vec into the pre-activation, the zeroed
     entries contribute nothing and only the targeted latents' pre-activations
     are actually added to.
@@ -121,7 +133,10 @@ def build_variants(mean_vec: np.ndarray, top_idx: np.ndarray, best_idx, pos_mean
     reads as "suppress this latent" without any special-casing here.
     '''
     sparse_vec = np.zeros_like(mean_vec)
-    sparse_vec[top_idx] = pos_mean
+    if best_idx is not None:
+        sparse_vec[best_idx] = pos_mean
+    else:
+        sparse_vec = mean_vec
 
     variants = [("mean", sparse_vec)]
     if best_idx is not None:
@@ -133,6 +148,77 @@ def build_variants(mean_vec: np.ndarray, top_idx: np.ndarray, best_idx, pos_mean
         minus_vec[best_idx] = pos_mean - pos_std
         variants.append(("minus_std", minus_vec))
     return variants
+
+
+def sae_decode_add(sae: SparseAutoencoder, x: torch.Tensor, to_vec: torch.Tensor, beta: float,
+                    patch_mask: torch.Tensor = None) -> torch.Tensor:
+    '''
+    Encode x through the real SAE (sae.encode: top-k + relu, exactly what the
+    SAE would compute for this patch on its own - x's own k active latents
+    are fixed by this call and never touched again), add beta * to_vec
+    directly onto that already-sparsified latent vector (so the injected
+    latent(s) are simply appended on top - no re-competition for a slot),
+    then decode the combined latent vector back into activation space and
+    return that. Unlike make_swap_hook (which adds to_vec to the *pre*-top-k
+    activation and re-runs top-k, so the injected direction can knock one of
+    x's own genuinely active latents out of the reconstruction entirely),
+    this never re-selects: x's original top-k latents survive untouched in
+    the output, and to_vec is pure addition on top of them.
+    '''
+    orig_shape = x.shape
+    flat = x.reshape(-1, orig_shape[-1])
+
+    edit_mask = 1.0
+    if patch_mask is not None:
+        b = orig_shape[0]
+        edit_mask = patch_mask.reshape(-1).to(flat.dtype).repeat(b).unsqueeze(-1)
+
+    latents = sae.encode(flat)  # (N, n_dirs), already top-k + relu'd
+    latents = latents + beta * to_vec.to(latents.dtype) * edit_mask
+    recons = sae.decoder(latents) + sae.pre_bias
+    return recons.reshape(orig_shape)
+
+
+def make_add_hook(sae: SparseAutoencoder, to_vec: torch.Tensor, start_step: int, end_step: int,
+                   beta: float, device, pixel_mask: np.ndarray = None):
+    # same step-counter/patch_mask-cache structure as generate_clean_swap.py's
+    # make_swap_hook, minus the "mode"/from_vec/encode/top-k machinery - see
+    # sae_decode_add for what actually changed
+    step_counter = {"step": 0}
+    patch_mask_cache = {}
+
+    def hook_fn(module, input, output):
+        step = step_counter["step"]
+        if start_step <= step <= end_step:
+            out = output[0] if isinstance(output, tuple) else output
+            orig_dtype = out.dtype
+
+            patch_mask = None
+            if pixel_mask is not None:
+                grid_h, grid_w = out.shape[2], out.shape[3]  # out is channel-first (B,C,H,W) here
+                if (grid_h, grid_w) not in patch_mask_cache:
+                    resized = resize_mask_to_grid(pixel_mask, grid_h, grid_w)
+                    patch_mask_cache[(grid_h, grid_w)] = torch.from_numpy(resized).to(device)
+                patch_mask = patch_mask_cache[(grid_h, grid_w)]
+
+            out = sae_decode_add(sae, out.permute(0, 2, 3, 1).float(), to_vec, beta, patch_mask)
+            out = out.permute(0, 3, 1, 2).to(device=device, dtype=orig_dtype)
+            output = (out, *output[1:]) if isinstance(output, tuple) else out
+        step_counter["step"] = step + 1
+        return output
+
+    return hook_fn
+
+
+def make_add_position_hook_dict(sae_dict: dict, vec_dict: dict, start_step: int, end_step: int,
+                                 beta: float, device, pixel_mask: np.ndarray = None) -> dict:
+    position_hook_dict = {}
+    for block, sae in sae_dict.items():
+        to_vec = vec_dict[block]
+        position_hook_dict[f"unet.{block}"] = make_add_hook(
+            sae, to_vec, start_step, end_step, beta, device, pixel_mask
+        )
+    return position_hook_dict
 
 
 def main(args):
@@ -227,9 +313,8 @@ def main(args):
         panels = [base_image]
         for variant_name, vec in variants:
             to_vec = torch.tensor(vec, device=device, dtype=torch.float32)
-            hook_dict = make_position_hook_dict(
-                {block: sae}, {block: (None, to_vec)}, mode, args.start_step, args.end_step,
-                1.0, args.beta, device, pixel_mask
+            hook_dict = make_add_position_hook_dict(
+                {block: sae}, {block: to_vec}, args.start_step, args.end_step, args.beta, device, pixel_mask
             )
             gen = torch.Generator()
             gen.manual_seed(args.seed)  # same seed as the base image - only the masked region should differ
