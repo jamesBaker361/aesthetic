@@ -2,15 +2,17 @@
 # a SAM3 mask for mask_target on it, then for every {query, block} feature
 # saved in --npz_dict (by generate_clean_inference.py), regenerates the same
 # image (same seed/prompt) injecting that feature ONLY inside the masked
-# region - background stays anchored to the base image. Unlike
-# generate_clean_swap.py's make_swap_hook (which adds the injected vector to
-# the block's *pre*-top-k activation and then re-runs top-k, so the injection
-# can knock one of the patch's own genuinely active latents out of the
-# reconstruction), this script encodes each patch's real top-k latents first,
-# ADDS the injected feature on top of that already-fixed sparse vector, and
-# only then decodes - see make_add_hook/sae_decode_add below. The patch's own
-# active latents always survive in the output; only the extra injected
-# direction is ever added.
+# region - background stays anchored to the base image, same injection
+# sdxl_unbox/utils/hooks.py's add_feature_on_area_turbo uses for its own demo
+# app: build an all-zero latent vector except at the injected latent(s),
+# decode it through just the SAE's linear decoder (no pre_bias - this is a
+# delta, not a full reconstruction), and add that delta straight onto the
+# block's real output. Unlike generate_clean_swap.py's make_swap_hook (which
+# adds the injected vector to the block's *pre*-top-k activation and then
+# re-runs top-k, so the injection can knock one of the patch's own genuinely
+# active latents out of the reconstruction), the patch's own activation is
+# never encoded or touched at all here - see make_add_hook/sae_decode_add
+# below.
 #
 # Each feature gets up to 3 variants: injected at its mean activation, mean
 # plus one std, and mean minus one std. The plus/minus variants only exist
@@ -153,17 +155,14 @@ def build_variants(mean_vec: np.ndarray, top_idx: np.ndarray, best_idx, pos_mean
 def sae_decode_add(sae: SparseAutoencoder, x: torch.Tensor, to_vec: torch.Tensor, beta: float,
                     patch_mask: torch.Tensor = None) -> torch.Tensor:
     '''
-    Encode x through the real SAE (sae.encode: top-k + relu, exactly what the
-    SAE would compute for this patch on its own - x's own k active latents
-    are fixed by this call and never touched again), add beta * to_vec
-    directly onto that already-sparsified latent vector (so the injected
-    latent(s) are simply appended on top - no re-competition for a slot),
-    then decode the combined latent vector back into activation space and
-    return that. Unlike make_swap_hook (which adds to_vec to the *pre*-top-k
-    activation and re-runs top-k, so the injected direction can knock one of
-    x's own genuinely active latents out of the reconstruction entirely),
-    this never re-selects: x's original top-k latents survive untouched in
-    the output, and to_vec is pure addition on top of them.
+    sdxl_unbox/utils/hooks.py's add_feature_on_area_turbo, generalized from a
+    single feature_idx/value to the full sparse to_vec from build_variants:
+    build an all-zero latent vector except at the injected latent(s), decode
+    it through just the SAE's linear decoder - no pre_bias, since this is a
+    delta being added on top of a real activation, not a full reconstruction
+    - and add beta * that delta straight onto x. x's own activation is never
+    encoded or otherwise touched; only the injected direction is added, and
+    only inside patch_mask.
     '''
     orig_shape = x.shape
     flat = x.reshape(-1, orig_shape[-1])
@@ -173,10 +172,9 @@ def sae_decode_add(sae: SparseAutoencoder, x: torch.Tensor, to_vec: torch.Tensor
         b = orig_shape[0]
         edit_mask = patch_mask.reshape(-1).to(flat.dtype).repeat(b).unsqueeze(-1)
 
-    latents = sae.encode(flat)  # (N, n_dirs), already top-k + relu'd
-    latents = latents + beta * to_vec.to(latents.dtype) * edit_mask
-    recons = sae.decoder(latents) + sae.pre_bias
-    return recons.reshape(orig_shape)
+    mask = beta * to_vec.to(flat.dtype) * edit_mask  # (N, n_dirs)
+    to_add = sae.decoder(mask)  # linear decode, bias=False -> (N, C)
+    return (flat + to_add).reshape(orig_shape)
 
 
 def make_add_hook(sae: SparseAutoencoder, to_vec: torch.Tensor, start_step: int, end_step: int,
