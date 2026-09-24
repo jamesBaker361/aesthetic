@@ -44,12 +44,16 @@ parser = default_parser(
 
 parser.add_argument("--base_prompt", type=str, default="a photo of a man standing outside")
 parser.add_argument("--mask_target", type=str, default=None)  # SAM3 query for the region to inject into; None = whole image
-parser.add_argument("--strength", type=float, default=10.0)  # same default as sdxl_unbox app.py's "Strength" slider
 parser.add_argument("--num_inference_steps", type=int, default=1)
 parser.add_argument("--size", type=int, default=512)
 parser.add_argument("--guidance_scale", type=float, default=0.0)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--image_dest_dir", type=str, default="known_feature_sanity")
+
+# each known feature gets one panel: base image + one image per strength, so
+# you can see the effect strengthen (or, if the mechanism is broken, fail to
+# strengthen) across the sweep rather than judging a single fixed magnitude
+STRENGTHS = [1.0, 2.0, 5.0, 10.0]
 
 # (block, feature_idx, human label) - the block names match attribution.py's
 # DEFAULT_BLOCK_LIST / load_sae's naming, not app.py's short "down.2.1" codes
@@ -127,22 +131,27 @@ def main(args):
         to_vec = torch.tensor(vec, device=device, dtype=torch.float32)
 
         sae = get_sae(block)
-        # pixel_mask is None (whole image) unless --mask_target was given
-        hook_dict = make_add_position_hook_dict(
-            {block: sae}, {block: to_vec}, 0, 1000, args.strength, device, pixel_mask=pixel_mask
-        )
-        gen = torch.Generator()
-        gen.manual_seed(args.seed)  # same seed as the base image
-        out_image = pipe.run_with_hooks(
-            base_prompt, position_hook_dict=hook_dict,
-            height=args.size, width=args.size, guidance_scale=args.guidance_scale,
-            num_inference_steps=args.num_inference_steps, generator=gen,
-        ).images[0]
+        panels = [base_image]
+        for strength in STRENGTHS:
+            # pixel_mask is None (whole image) unless --mask_target was given
+            hook_dict = make_add_position_hook_dict(
+                {block: sae}, {block: to_vec}, 0, 1000, strength, device, pixel_mask=pixel_mask
+            )
+            gen = torch.Generator()
+            gen.manual_seed(args.seed)  # same seed as the base image
+            out_image = pipe.run_with_hooks(
+                base_prompt, position_hook_dict=hook_dict,
+                height=args.size, width=args.size, guidance_scale=args.guidance_scale,
+                num_inference_steps=args.num_inference_steps, generator=gen,
+            ).images[0]
+            panels.append(out_image)
+            print(f"{block} #{feature_idx} ({label}): strength={strength} pos_mean={pos_mean:.4f} "
+                  f"injected={strength * pos_mean:.4f}")
 
         safe_block = block.replace(".", "_")
         out_path = os.path.join(args.image_dest_dir, f"{safe_block}_{feature_idx}_{label}.jpg")
-        concat_images_horizontally([base_image, out_image]).save(out_path)
-        print(f"{block} #{feature_idx} ({label}): pos_mean={pos_mean:.4f}, injected={args.strength * pos_mean:.4f} -> {out_path}")
+        concat_images_horizontally(panels).save(out_path)
+        print(f"-> {out_path}")
 
         if on_cuda:
             torch.cuda.empty_cache()
