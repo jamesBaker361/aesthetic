@@ -1,0 +1,16 @@
+cube
+sphere
+man
+woman
+boy
+girl
+cat
+dog
+horse
+dragon
+bicycle
+car
+boat
+desk
+chair
+box
