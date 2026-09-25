@@ -102,9 +102,9 @@ parser.add_argument("--end_step", type=int, default=1000)
 parser.add_argument("--n_random_controls", type=int, default=1,
                     help="random latents per block injected as a baseline")
 
-parser.add_argument("--vqa_model", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct",
+parser.add_argument("--vqa_model", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct",
                     help="Hugging Face Qwen2.5-VL model for vqa_scorer.VQAScore "
-                         "(Qwen/Qwen2.5-VL-3B-Instruct is faster)")
+                         "(7B needs ~17 GB of GPU memory)")
 parser.add_argument("--clip_model", type=str, default="openai/clip-vit-large-patch14",
                     help="Hugging Face CLIP model for vqa_scorer.CLIPScore; ignored with --disable_clip")
 parser.add_argument("--text_template", type=str, default="a photo of a {}",
