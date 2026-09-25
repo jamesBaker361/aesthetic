@@ -75,8 +75,8 @@ parser.add_argument("--subject_list", nargs="*", default=None,
                     help="overrides --subject_file, e.g. to shard subjects across jobs")
 parser.add_argument("--placeholder", type=str, default="<sks>",
                     help="token replaced by the subject; templates without it get the subject appended")
-parser.add_argument("--out_dir", type=str, default="sae_eval")
-parser.add_argument("--outputs_dir", type=str, default="outputs",
+parser.add_argument("--out_dir", type=str, default="evaluation/sae_eval")
+parser.add_argument("--outputs_dir", type=str, default="evaluation/outputs",
                     help="folder for results.csv: every metric per subject x block, merged across runs")
 
 parser.add_argument("--sae_source", type=str, default="local", choices=["local", "saeuron"])
