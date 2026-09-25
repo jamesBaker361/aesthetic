@@ -80,9 +80,9 @@ class CLIPScore:
         inputs = self.processor(text=list(texts), images=images, return_tensors="pt",
                                 padding=True, truncation=True).to(self.device)
         inputs["pixel_values"] = inputs["pixel_values"].to(self.model.dtype)
-        img = self.model.get_image_features(pixel_values=inputs["pixel_values"]).float()
+        img = self.model.get_image_features(pixel_values=inputs["pixel_values"]).pooler_output.float()
         txt = self.model.get_text_features(input_ids=inputs["input_ids"],
-                                           attention_mask=inputs["attention_mask"]).float()
+                                           attention_mask=inputs["attention_mask"]).pooler_output.float()
         cos = torch.nn.functional.cosine_similarity(img, txt, dim=-1).cpu().tolist()
         return [{"score": 2.5 * max(c, 0.0), "cosine": c} for c in cos]
 
