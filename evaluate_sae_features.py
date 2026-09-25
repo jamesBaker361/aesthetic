@@ -169,10 +169,16 @@ class Models:
         self.saes = {}
 
     def free(self, keep: str = None):
+        # Move to CPU before dropping, so a stray reference elsewhere
+        # can't keep the weights on the GPU.
         for name in ["pipe", "sam", "vqa", "clip"]:
-            if name != keep and getattr(self, name) is not None:
+            obj = getattr(self, name)
+            if name != keep and obj is not None:
+                (obj if name == "pipe" else obj.model).to("cpu")
                 setattr(self, name, None)
-        if keep != "pipe":
+        if keep not in ("pipe", "sae"):
+            for sae in self.saes.values():
+                sae.to("cpu")
             self.saes = {}
         gc.collect()
         if torch.cuda.is_available():
@@ -358,6 +364,7 @@ def run_base(args, models: Models, device) -> list:
         pipe = models.get_pipe()
         for e in todo:
             generate(pipe, e["prompt"], e["seed"], args).save(e["image"])
+        del pipe
 
     ensure_sam_masks(models, [(e["image"], e["subject"]) for e in entries], device)
     for e in entries:
@@ -429,7 +436,7 @@ def run_dream_sparsify(args, models: Models, entries: list, block_list: list):
     print(f"sparsify: {len(todo)} of {len(entries)} to encode")
     if not todo:
         return
-    models.free(keep="pipe")
+    models.free(keep="sae")
     device = models.device
     for e in todo:
         result = {}
