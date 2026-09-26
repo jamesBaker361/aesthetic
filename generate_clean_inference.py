@@ -417,7 +417,14 @@ def discover_query_block(train_images: list, sparse_embedding_dir: str, mask_dir
     feats, labels = load_block_feats_and_labels(train_images, sparse_embedding_dir, mask_dir, query, block)
     if feats is None:
         return None
+    return select_features(feats, labels, top_k, feature_selection, bce_ridge, bce_newton_steps, saeuron_percentile)
 
+
+def select_features(feats: np.ndarray, labels: np.ndarray, top_k: int, feature_selection: str = "auroc",
+                     bce_ridge: float = 1e-8, bce_newton_steps: int = 30, saeuron_percentile: float = 99.9):
+    # feats: (n_patches, n_dirs), labels: (n_patches,) bool - split out of
+    # discover_query_block so generate_clean_style.py can reuse it on its own
+    # paired plain/styled labels
     n_pos = int(labels.sum())
     n_neg = len(labels) - n_pos
     if n_pos == 0 or n_neg == 0:

@@ -22,3 +22,6 @@
 [submodule "SAeUron"]
 	path = SAeUron
 	url = https://github.com/cywinski/SAeUron.git
+[submodule "Grad-Eclip"]
+	path = Grad-Eclip
+	url = https://github.com/Cyang-Zhao/Grad-Eclip.git
