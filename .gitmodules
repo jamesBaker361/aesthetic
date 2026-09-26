@@ -25,3 +25,6 @@
 [submodule "Grad-Eclip"]
 	path = Grad-Eclip
 	url = https://github.com/Cyang-Zhao/Grad-Eclip.git
+[submodule "UnlearnCanvas"]
+	path = UnlearnCanvas
+	url = https://github.com/OPTML-Group/UnlearnCanvas.git

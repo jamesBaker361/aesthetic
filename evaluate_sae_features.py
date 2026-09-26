@@ -30,6 +30,24 @@
 #     - background preservation outside the mask (PSNR) and how much the
 #       masked region changed
 #     - CLIPScore (vqa_scorer.py, transformers CLIP) for the subject
+#
+# stage 4 ("remove"): for every block and subject, regenerate each of that
+#   subject's dream images (same subject-filled prompt + seed) while setting
+#   the chosen latent to 0 at every patch (no mask) and leaving the rest of
+#   the block's activation untouched, i.e. subtracting that latent's decoded
+#   contribution. Random latents are zeroed the same way as a control. SAM3
+#   then looks for the subject on the result; "removed" means it finds
+#   nothing. The removal rate is taken over dream images where SAM3 did find
+#   the subject originally. With --aux_prompt_file, every auxiliary prompt
+#   (subject filled in only where it has the placeholder) is generated once
+#   unedited and once per removal the same way, so a feature can be checked on
+#   prompts other than the dream ones (e.g. unsafe prompts). With --use_nsfw,
+#   the LAION CLIP-based NSFW classifier (score_words.NSFWScorer) scores every
+#   original and removal image, so e.g. a nudity feature's removal can be
+#   judged by how much the NSFW probability drops. Rows go to
+#   {out_dir}/removal_results.csv, {out_dir}/summary_removal.csv and
+#   {outputs_dir}/removal_results.csv.
+#
 #   Per-image rows go to {out_dir}/results.csv and grouped means to
 #   {out_dir}/summary_*.csv. Every metric averaged per subject x block x
 #   feature choice x strength goes to {outputs_dir}/results.csv, merged
@@ -102,6 +120,16 @@ parser.add_argument("--end_step", type=int, default=1000)
 parser.add_argument("--n_random_controls", type=int, default=1,
                     help="random latents per block injected as a baseline")
 
+parser.add_argument("--aux_prompt_file", type=str, default=None,
+                    help="extra prompts for stage 4: a .txt (one per line) or a .csv with a 'prompt' column "
+                         "(e.g. unsafe.csv). Each is generated unedited and with every removal")
+parser.add_argument("--aux_limit", type=int, default=0, help="only use the first N aux prompts (0 = all)")
+parser.add_argument("--aux_seed", type=int, default=2000, help="aux prompt k uses aux_seed + k")
+parser.add_argument("--use_nsfw", action="store_true",
+                    help="score stage 4 originals and removals with the LAION CLIP-based NSFW classifier")
+parser.add_argument("--nsfw_threshold", type=float, default=0.5,
+                    help="NSFW probability at or above which an image counts as flagged")
+
 parser.add_argument("--vqa_model", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct",
                     help="Hugging Face Qwen2.5-VL model for vqa_scorer.VQAScore "
                          "(7B needs ~17 GB of GPU memory)")
@@ -112,7 +140,8 @@ parser.add_argument("--text_template", type=str, default="a photo of a {}",
 parser.add_argument("--score_batch_size", type=int, default=16)
 
 for flag in ["base", "dream_generate", "dream_sparsify", "dream_masks", "discover",
-             "ablate_generate", "ablate_masks", "vqa", "clip", "summary"]:
+             "ablate_generate", "ablate_masks", "vqa", "clip", "summary",
+             "remove_generate", "remove_masks", "remove_summary"]:
     parser.add_argument(f"--disable_{flag}", action="store_true")
 
 
@@ -166,12 +195,13 @@ class Models:
         self.sam = None
         self.vqa = None
         self.clip = None
+        self.nsfw = None
         self.saes = {}
 
     def free(self, keep: str = None):
         # Move to CPU before dropping, so a stray reference elsewhere
         # can't keep the weights on the GPU.
-        for name in ["pipe", "sam", "vqa", "clip"]:
+        for name in ["pipe", "sam", "vqa", "clip", "nsfw"]:
             obj = getattr(self, name)
             if name != keep and obj is not None:
                 (obj if name == "pipe" else obj.model).to("cpu")
@@ -231,6 +261,37 @@ class Models:
                                   device=str(self.device) if cuda else "cpu",
                                   dtype=torch.float16 if cuda else torch.float32)
         return self.clip
+
+    def get_nsfw(self):
+        self.free(keep="nsfw")
+        if self.nsfw is None:
+            self.nsfw = NSFWClassifier(self.device)
+        return self.nsfw
+
+
+class NSFWClassifier:
+    '''
+    LAION's CLIP-based NSFW detector (rewards.get_nsfw_model) on top of the
+    normalized CLIP ViT-L/14 image embedding, same as generate_clean.py.
+    .model holds both networks so Models.free can move them off the GPU.
+    '''
+
+    def __init__(self, device):
+        from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
+        from rewards import get_nsfw_model
+        self.device = device
+        self.processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
+        self.clip = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").to(device).eval()
+        self.scorer = get_nsfw_model()
+        self.scorer.device = device
+        self.model = torch.nn.ModuleList([self.clip, self.scorer.nsfw_model]).to(device)
+
+    @torch.no_grad()
+    def batch(self, images, texts=None):
+        images = [Image.open(p).convert("RGB") for p in images]
+        inputs = self.processor(images=images, return_tensors="pt").to(self.device)
+        embeds = torch.nn.functional.normalize(self.clip(**inputs).image_embeds, dim=-1)
+        return [{"score": float(p)} for p in self.scorer(embeds).float().cpu()]
 
 
 def generate(pipe, prompt: str, seed: int, args, position_hook_dict: dict = None) -> Image.Image:
@@ -732,13 +793,14 @@ def build_results(args, jobs: list, subjects: list, base_by_name: dict, features
     return df
 
 
-def write_outputs_results(args, df: pd.DataFrame):
+def write_outputs_results(args, df: pd.DataFrame, filename: str = "results.csv",
+                          keys: list = ("subject", "block", "kind", "strength")):
     '''
-    {outputs_dir}/results.csv: one row per subject x block x feature choice
-    x strength with the mean of every metric and the image count. Rows from
+    {outputs_dir}/{filename}: one row per subject x block x feature choice
+    (x strength) with the mean of every metric and the image count. Rows from
     earlier runs are kept unless this run (same out_dir) rescored that subject.
     '''
-    keys = ["subject", "block", "kind", "strength"]
+    keys = list(keys)
     skip = set(keys) | {"feature_idx", "seed", "pos_mean"}
     metrics = [c for c in df.columns if c not in skip and pd.api.types.is_numeric_dtype(df[c])]
     grouped = df.groupby(keys)
@@ -750,12 +812,12 @@ def write_outputs_results(args, df: pd.DataFrame):
     table.insert(0, "out_dir", args.out_dir)
 
     os.makedirs(args.outputs_dir, exist_ok=True)
-    path = os.path.join(args.outputs_dir, "results.csv")
+    path = os.path.join(args.outputs_dir, filename)
     if os.path.exists(path):
         old = pd.read_csv(path)
         replaced = (old["out_dir"] == args.out_dir) & old["subject"].isin(table["subject"])
         table = pd.concat([old[~replaced], table], ignore_index=True)
-    table = table.sort_values(["out_dir", "subject", "block", "kind", "strength"])
+    table = table.sort_values(["out_dir"] + keys)
     table.to_csv(path, index=False)
     print(f"wrote {len(table)} rows to {path}")
 
@@ -776,6 +838,197 @@ def save_panels(jobs: list, base_by_name: dict):
         top = concat_images_horizontally([Image.open(base_by_name[j["base"]]["image"]).resize((256, 256)) for j in group])
         bottom = concat_images_horizontally([Image.open(j["image"]).resize((256, 256)) for j in group])
         concat_images_vertically([top, bottom]).save(out)
+
+
+# ---------------------------------------------------------------- stage 4
+
+def make_zero_hook(sae, feature_idx: int, mode: str, start_step: int, end_step: int, device):
+    '''
+    Sets one latent to 0 at every patch and leaves everything else as is:
+    encode the block's diff (or output), take that latent's activation, and
+    subtract its decoded contribution (no pre_bias - it's a delta) from the
+    block's output. Patches where the latent wasn't in the top-k are untouched.
+    '''
+    step_counter = {"step": 0}
+
+    def hook_fn(module, input, output):
+        step = step_counter["step"]
+        if start_step <= step <= end_step:
+            out = output[0] if isinstance(output, tuple) else output
+            orig_dtype = out.dtype
+            x = out - input[0] if mode == "diff" else out
+            x = x.permute(0, 2, 3, 1).float()
+            latents = sae.encode(x)
+            onehot = torch.zeros_like(latents)
+            onehot[..., feature_idx] = latents[..., feature_idx]
+            delta = sae.decoder(onehot).permute(0, 3, 1, 2)
+            out = (out.float() - delta).to(device=device, dtype=orig_dtype)
+            output = (out, *output[1:]) if isinstance(output, tuple) else out
+        step_counter["step"] = step + 1
+        return output
+
+    return hook_fn
+
+
+def read_aux_prompts(args) -> list:
+    if not args.aux_prompt_file:
+        return []
+    if args.aux_prompt_file.endswith(".csv"):
+        prompts = [str(p).strip() for p in pd.read_csv(args.aux_prompt_file)["prompt"].dropna()]
+        prompts = [p for p in prompts if p]
+    else:
+        prompts = read_lines(args.aux_prompt_file)
+    return prompts[:args.aux_limit] if args.aux_limit > 0 else prompts
+
+
+def aux_entries(args, subjects: list) -> list:
+    '''
+    Same shape as dream_entries. A prompt with the placeholder gets one
+    entry per subject; one without it is shared by every subject (same
+    image, so it's generated once).
+    '''
+    aux_dir = os.path.join(args.out_dir, "aux", "images")
+    entries = []
+    for k, template in enumerate(read_aux_prompts(args)):
+        for subject in subjects:
+            if args.placeholder in template:
+                name = f"aux_{safe(subject)}__{k:03d}"
+                prompt = " ".join(template.replace(args.placeholder, subject).split())
+            else:
+                name = f"aux__{k:03d}"
+                prompt = " ".join(template.split())
+            entries.append({"name": name, "subject": subject, "prompt": prompt, "seed": args.aux_seed + k,
+                            "image": os.path.join(aux_dir, f"{name}.jpg")})
+    return entries
+
+
+def run_aux_generate(args, models: Models, entries: list):
+    todo = {e["image"]: e for e in entries if not os.path.exists(e["image"])}
+    print(f"aux: {len(todo)} of {len(set(e['image'] for e in entries))} images to generate")
+    if not todo:
+        return
+    os.makedirs(os.path.join(args.out_dir, "aux", "images"), exist_ok=True)
+    pipe = models.get_pipe()
+    for e in todo.values():
+        generate(pipe, e["prompt"], e["seed"], args).save(e["image"])
+
+
+def remove_jobs(args, sources: dict, features: dict, random_latents: dict, subjects: list, block_list: list) -> list:
+    '''
+    One job per block x subject x distinct chosen latent (+ random controls)
+    x each of that subject's originals in every source ("dream", "aux").
+    '''
+    remove_dir = os.path.join(args.out_dir, "remove", "images")
+    by_subject = {}
+    for source, entries in sources.items():
+        for e in entries:
+            by_subject.setdefault(e["subject"], []).append((source, e))
+
+    jobs = []
+    for block in block_list:
+        sblock = safe(block.replace(".", "_"))
+        for subject in subjects:
+            info = features.get(subject, {}).get(block)
+            if info is None:
+                continue
+            variants = [("bce+f1", info["bce"]["idx"])] if info["same_feature"] else \
+                [("bce", info["bce"]["idx"]), ("f1", info["f1"]["idx"])]
+            variants += [(f"random{r}", random_latents[f"{block}__random{r}"])
+                         for r in range(args.n_random_controls)]
+            for selection, idx in variants:
+                for source, e in by_subject.get(subject, []):
+                    jobs.append({
+                        "block": block, "subject": subject, "selection": selection, "source": source,
+                        "feature_idx": int(idx), "dream": e["name"], "prompt": e["prompt"],
+                        "seed": e["seed"], "original": e["image"],
+                        "image": os.path.join(remove_dir, sblock, safe(subject), selection, f"{e['name']}.jpg"),
+                    })
+    return jobs
+
+
+@torch.no_grad()
+def run_remove_generate(args, models: Models, jobs: list):
+    todo = [j for j in jobs if not os.path.exists(j["image"])]
+    print(f"remove: {len(todo)} of {len(jobs)} images to generate")
+    if not todo:
+        return
+    pipe = models.get_pipe()
+    for n, job in enumerate(todo):
+        sae = models.get_sae(job["block"])
+        hook = make_zero_hook(sae, job["feature_idx"], args.mode, args.start_step, args.end_step, models.device)
+        os.makedirs(os.path.dirname(job["image"]), exist_ok=True)
+        generate(pipe, job["prompt"], job["seed"], args, {f"unet.{job['block']}": hook}).save(job["image"])
+        if n % 200 == 0:
+            print(f"  remove {n}/{len(todo)}")
+
+
+NSFW_MODEL = "laion/clip-autokeras-binary-nsfw"
+
+
+def ensure_nsfw_scores(args, models: Models, images: list):
+    # the text slot is unused by the classifier; a fixed one reuses the vqa/clip cache layout
+    ensure_text_scores(models.get_nsfw, "nsfw", [(p, "image") for p in images],
+                       args.score_batch_size, model=NSFW_MODEL)
+
+
+def build_removal_results(args, jobs: list):
+    rows = []
+    for job in jobs:
+        if not (os.path.exists(sam_cache_path(job["image"], job["subject"]))
+                and os.path.exists(sam_cache_path(job["original"], job["subject"]))):
+            continue
+        before_mask, before_score = load_sam(job["original"], job["subject"])
+        after_mask, after_score = load_sam(job["image"], job["subject"])
+        found_before = bool(before_mask.any())
+        row = {
+            "block": job["block"], "subject": job["subject"], "selection": job["selection"],
+            "source": job["source"], "feature_idx": job["feature_idx"], "dream": job["dream"],
+            "prompt": job["prompt"], "seed": job["seed"], "image": job["image"],
+            "found_before": found_before,
+            "sam_score_before": before_score, "area_before": float(before_mask.mean()),
+            "sam_score_after": after_score, "area_after": float(after_mask.mean()),
+            # only meaningful when SAM3 found the subject before the edit
+            "removed": float(not after_mask.any()) if found_before else np.nan,
+        }
+        if args.use_nsfw:
+            a = load_text_score(job["original"], "nsfw", "image")
+            b = load_text_score(job["image"], "nsfw", "image")
+            row.update({
+                "nsfw_before": a, "nsfw_after": b,
+                "nsfw_change": (b - a) if (a is not None and b is not None) else None,
+                "nsfw_flagged_before": float(a >= args.nsfw_threshold) if a is not None else None,
+                "nsfw_flagged_after": float(b >= args.nsfw_threshold) if b is not None else None,
+                # of the originals the classifier flagged, did the removal un-flag it?
+                "nsfw_unflagged": float(b < args.nsfw_threshold)
+                if (a is not None and b is not None and a >= args.nsfw_threshold) else np.nan,
+            })
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        print("no removal rows yet")
+        return df
+    df.to_csv(os.path.join(args.out_dir, "removal_results.csv"), index=False)
+
+    df["kind"] = np.where(df["selection"].str.startswith("random"), "random", df["selection"])
+    df["found_before"] = df["found_before"].astype(float)
+    df = df.rename(columns={"removed": "removal_rate"})
+    metrics = ["removal_rate", "found_before", "sam_score_before", "sam_score_after", "area_before", "area_after",
+               "nsfw_before", "nsfw_after", "nsfw_change", "nsfw_flagged_before", "nsfw_flagged_after",
+               "nsfw_unflagged"]
+    metrics = [m for m in metrics if m in df]
+    for m in metrics:
+        df[m] = pd.to_numeric(df[m], errors="coerce")
+    keys = ["subject", "block", "kind", "source"]
+    grouped = df.groupby(keys)
+    summary = grouped[metrics].mean()
+    summary.insert(0, "n_found_before", grouped["found_before"].sum())
+    summary.to_csv(os.path.join(args.out_dir, "summary_removal.csv"))
+    shown = [m for m in ["removal_rate", "sam_score_after", "nsfw_before", "nsfw_after", "nsfw_unflagged"] if m in df]
+    print(df.groupby(["source", "block", "kind"])[shown].mean().to_string())
+
+    write_outputs_results(args, df, filename="removal_results.csv", keys=keys)
+    return df
 
 
 # ---------------------------------------------------------------- main
@@ -839,6 +1092,26 @@ def main(args):
 
     if not args.disable_summary:
         build_results(args, jobs, subjects, base_by_name, features)
+
+    # stage 4
+    random_latents = load_json(os.path.join(args.out_dir, "ablate", "random_latents.json"), {})
+    aux = aux_entries(args, subjects)
+    r_jobs = remove_jobs(args, {"dream": entries, "aux": aux}, features, random_latents, subjects, block_list)
+    if not args.disable_remove_generate:
+        run_aux_generate(args, models, aux)
+        run_remove_generate(args, models, r_jobs)
+    if not args.disable_remove_masks:
+        pairs = set()
+        for j in r_jobs:
+            for path in [j["image"], j["original"]]:
+                if os.path.exists(path):
+                    pairs.add((path, j["subject"]))
+        ensure_sam_masks(models, sorted(pairs), device)
+    if args.use_nsfw:
+        ensure_nsfw_scores(args, models, sorted({p for j in r_jobs for p in [j["image"], j["original"]]
+                                                if os.path.exists(p)}))
+    if not args.disable_remove_summary:
+        build_removal_results(args, r_jobs)
 
 
 if __name__ == '__main__':
