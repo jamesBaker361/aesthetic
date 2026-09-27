@@ -178,6 +178,20 @@ def save_json(path: str, obj):
     os.replace(tmp, path)
 
 
+def save_image(image: Image.Image, path: str):
+    # write-then-rename so a job sharing the cache never reads a half-written file
+    root, ext = os.path.splitext(path)
+    tmp = f"{root}.tmp{os.getpid()}{ext}"
+    image.save(tmp)
+    os.replace(tmp, path)
+
+
+def save_npz(path: str, compressed: bool = False, **arrays):
+    tmp = f"{path[:-len('.npz')]}.tmp{os.getpid()}.npz"
+    (np.savez_compressed if compressed else np.savez)(tmp, **arrays)
+    os.replace(tmp, path)
+
+
 def is_cuda(device) -> bool:
     return device == "cuda" or (hasattr(device, "type") and device.type == "cuda")
 
@@ -340,7 +354,7 @@ def ensure_sam_masks(models: Models, pairs: list, device):
     for n, (path, query) in enumerate(todo):
         image = Image.open(path).convert("RGB")
         mask, score = sam_mask(sam, image, query, device)
-        np.savez_compressed(sam_cache_path(path, query), pixel_mask=mask, score=np.float32(score))
+        save_npz(sam_cache_path(path, query), compressed=True, pixel_mask=mask, score=np.float32(score))
         if n % 200 == 0:
             print(f"  SAM3 {n}/{len(todo)}")
 
@@ -424,7 +438,7 @@ def run_base(args, models: Models, device) -> list:
     if todo:
         pipe = models.get_pipe()
         for e in todo:
-            generate(pipe, e["prompt"], e["seed"], args).save(e["image"])
+            save_image(generate(pipe, e["prompt"], e["seed"], args), e["image"])
         del pipe
 
     ensure_sam_masks(models, [(e["image"], e["subject"]) for e in entries], device)
@@ -434,7 +448,7 @@ def run_base(args, models: Models, device) -> list:
         e["mask_score"] = score
         highlighted = e["image"].replace(".jpg", "_highlighted.jpg")
         if not os.path.exists(highlighted):
-            highlight_pixel_mask(Image.open(e["image"]).convert("RGB"), mask).save(highlighted)
+            save_image(highlight_pixel_mask(Image.open(e["image"]).convert("RGB"), mask), highlighted)
         if mask.sum() == 0:
             print(f"  ! SAM3 found no '{e['subject']}' in {e['name']} - it will be skipped in stage 3")
 
@@ -476,14 +490,14 @@ def run_dream_generate(args, models: Models, entries: list, block_list: list):
             height=args.size, width=args.size, generator=torch.Generator().manual_seed(e["seed"]),
             output_type="pil",
         )
-        output.images[0].save(e["image"])
+        save_image(output.images[0], e["image"])
         result = {}
         for block in block_list:
             pos = f"unet.{block}"
             # (batch, steps, C, H, W) -> last step, same as generate_clean_inference.generate_and_cache
             result[f"saved_input.{block}"] = cache["input"][pos][:, -1].cpu().float().numpy()
             result[f"saved_output.{block}"] = cache["output"][pos][:, -1].cpu().float().numpy()
-        np.savez(e["embedding"], **result)
+        save_npz(e["embedding"], **result)
 
 
 @torch.no_grad()
@@ -512,7 +526,7 @@ def run_dream_sparsify(args, models: Models, entries: list, block_list: list):
                 result[f"{block}__idx"] = inds.cpu().numpy().astype(np.int32)
                 result[f"{block}__val"] = vals.cpu().numpy().astype(np.float32)
                 result[f"{block}__n_dirs"] = np.int64(latents.shape[-1])
-        np.savez(e["sparse"], **result)
+        save_npz(e["sparse"], **result)
 
 
 def load_block_codes(entries: list, block: str):
@@ -687,7 +701,7 @@ def run_ablate_generate(args, models: Models, jobs: list, base_by_name: dict, de
                                                 args.start_step, args.end_step, job["strength"],
                                                 device, masks[base["name"]])
         os.makedirs(os.path.dirname(job["image"]), exist_ok=True)
-        generate(pipe, base["prompt"], base["seed"], args, hook_dict).save(job["image"])
+        save_image(generate(pipe, base["prompt"], base["seed"], args, hook_dict), job["image"])
         if n % 200 == 0:
             print(f"  ablate {n}/{len(todo)}")
 
@@ -837,7 +851,7 @@ def save_panels(jobs: list, base_by_name: dict):
             continue
         top = concat_images_horizontally([Image.open(base_by_name[j["base"]]["image"]).resize((256, 256)) for j in group])
         bottom = concat_images_horizontally([Image.open(j["image"]).resize((256, 256)) for j in group])
-        concat_images_vertically([top, bottom]).save(out)
+        save_image(concat_images_vertically([top, bottom]), out)
 
 
 # ---------------------------------------------------------------- stage 4
@@ -910,7 +924,7 @@ def run_aux_generate(args, models: Models, entries: list):
     os.makedirs(os.path.join(args.out_dir, "aux", "images"), exist_ok=True)
     pipe = models.get_pipe()
     for e in todo.values():
-        generate(pipe, e["prompt"], e["seed"], args).save(e["image"])
+        save_image(generate(pipe, e["prompt"], e["seed"], args), e["image"])
 
 
 def remove_jobs(args, sources: dict, features: dict, random_latents: dict, subjects: list, block_list: list) -> list:
@@ -957,7 +971,7 @@ def run_remove_generate(args, models: Models, jobs: list):
         sae = models.get_sae(job["block"])
         hook = make_zero_hook(sae, job["feature_idx"], args.mode, args.start_step, args.end_step, models.device)
         os.makedirs(os.path.dirname(job["image"]), exist_ok=True)
-        generate(pipe, job["prompt"], job["seed"], args, {f"unet.{job['block']}": hook}).save(job["image"])
+        save_image(generate(pipe, job["prompt"], job["seed"], args, {f"unet.{job['block']}": hook}), job["image"])
         if n % 200 == 0:
             print(f"  remove {n}/{len(todo)}")
 
