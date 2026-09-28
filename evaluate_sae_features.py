@@ -167,7 +167,10 @@ def read_lines(path: str) -> list:
 def load_json(path: str, default):
     if os.path.exists(path):
         with open(path) as f:
-            return json.load(f)
+            try:
+                return json.load(f)
+            except json.decoder.JSONDecodeError:
+                raise Exception("json.decoder.JSONDecodeError for ", path)
     return default
 
 
