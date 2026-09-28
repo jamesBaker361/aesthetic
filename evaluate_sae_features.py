@@ -172,10 +172,8 @@ def load_json(path: str, default):
 
 
 def save_json(path: str, obj):
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
+    with open(path, "w") as f:
         json.dump(obj, f, indent=2)
-    os.replace(tmp, path)
 
 
 def save_image(image: Image.Image, path: str):
