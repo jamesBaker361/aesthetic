@@ -9,6 +9,10 @@
 #   while caching the SAE blocks' activations AND the UNet's cross-attention
 #   (attn2) probabilities for the object's and the style's text tokens. The
 #   activations are SAE-encoded (top-k only, same as evaluate_sae_features).
+#   With --object_discover_prompt_file (e.g. prompt_dir/dream_prompts.txt),
+#   objects are discovered from those prompts instead (the placeholder filled
+#   with the object, x --discover_seeds, no style); the object x style grid
+#   is then only generated for style targets.
 #
 # stage 2 ("masks"): positives for a concept come from one of three masks:
 #   - "attention": the object's/style's token cross-attention map averaged
@@ -109,7 +113,7 @@ from evaluate_sae_features import (
     Models, NSFW_MODEL, safe, load_json, save_json, generate, ensure_sam_masks, load_sam, sam_cache_path,
     ensure_text_scores, score_cache_path, load_text_score, run_dream_sparsify, load_block_codes,
     make_zero_hook, run_remove_generate, psnr, write_outputs_results,
-    run_base, run_ablate_generate, save_image, save_npz,
+    run_base, run_ablate_generate, save_image, save_npz, fill_prompt, read_lines,
 )
 
 
@@ -135,6 +139,9 @@ parser.add_argument("--target_styles", nargs="*", default=None,
 parser.add_argument("--template", type=str, default="A {object} image in {style} style.",
                     help="UnlearnCanvas's own answer-set prompt")
 parser.add_argument("--discover_seeds", nargs="*", type=int, default=[0])
+parser.add_argument("--object_discover_prompt_file", type=str, default=None,
+                    help="discover objects from these prompts (--placeholder filled with the object, e.g. "
+                         "prompt_dir/dream_prompts.txt) instead of the object x style grid")
 parser.add_argument("--eval_objects", nargs="*", default=None, help="answer-set objects (default: --object_list)")
 parser.add_argument("--eval_styles", nargs="*", default=None, help="answer-set styles (default: --style_list)")
 parser.add_argument("--eval_seeds", nargs="*", type=int, default=[188, 288, 588, 688, 888],
@@ -378,21 +385,42 @@ class RecordingAttnProcessor:
         return self.inner(attn, hidden_states, encoder_hidden_states, attention_mask, *args, **kwargs)
 
 
-def discover_entries(args, objects: list, styles: list) -> list:
+def discover_entries(args, objects: list, styles: list, style_targets: bool) -> list:
+    '''
+    "grid" entries (object x style x seed, the benchmark prompt) and, with
+    --object_discover_prompt_file, "prompt" entries (template x object x seed,
+    style None). Grid entries are only made when something uses them: always
+    without the prompt file, else only for style targets.
+    '''
     d = os.path.join(args.cache_dir, "discover")
+
+    def entry(name, obj, style, seed, prompt, source):
+        return {"name": name, "object": obj, "style": style, "seed": seed, "prompt": prompt, "source": source,
+                "image": os.path.join(d, "images", f"{name}.jpg"),
+                "embedding": os.path.join(d, "embeddings", f"{name}.npz"),
+                "sparse": os.path.join(d, "sparse", f"{name}.npz"),
+                "attn": os.path.join(d, "attn", f"{name}.npz")}
+
     entries = []
-    for obj in objects:
-        for style in styles:
-            for seed in args.discover_seeds:
-                name = f"{obj}__{style}__s{seed}"
-                entries.append({
-                    "name": name, "object": obj, "style": style, "seed": seed, "prompt": fill(args, obj, style),
-                    "image": os.path.join(d, "images", f"{name}.jpg"),
-                    "embedding": os.path.join(d, "embeddings", f"{name}.npz"),
-                    "sparse": os.path.join(d, "sparse", f"{name}.npz"),
-                    "attn": os.path.join(d, "attn", f"{name}.npz"),
-                })
+    if not args.object_discover_prompt_file or style_targets:
+        for obj in objects:
+            for style in styles:
+                for seed in args.discover_seeds:
+                    entries.append(entry(f"{obj}__{style}__s{seed}", obj, style, seed,
+                                         fill(args, obj, style), "grid"))
+    if args.object_discover_prompt_file:
+        for j, template in enumerate(read_lines(args.object_discover_prompt_file)):
+            for obj in objects:
+                for seed in args.discover_seeds:
+                    entries.append(entry(f"{obj}__prompt{j:02d}__s{seed}", obj, None, seed,
+                                         fill_prompt(template, words(obj), args.placeholder), "prompt"))
     return entries
+
+
+def concept_entries(args, entries: list, ctype: str, concept: str) -> list:
+    '''Indices of the discovery images a concept is probed on.'''
+    source = "prompt" if (ctype == "object" and args.object_discover_prompt_file) else "grid"
+    return [n for n, e in enumerate(entries) if e["source"] == source and e[ctype] == concept]
 
 
 @torch.no_grad()
@@ -426,8 +454,8 @@ def run_discover_generate(args, models: UCModels, entries: list, block_list: lis
                 result[f"saved_output.{block}"] = cache["output"][pos][:, -1].cpu().float().numpy()
             save_npz(e["embedding"], **result)
 
-            spans = {"object": token_span(tokenizer, e["prompt"], words(e["object"])),
-                     "style": token_span(tokenizer, e["prompt"], words(e["style"]))}
+            spans = {role: token_span(tokenizer, e["prompt"], words(e[role]))
+                     for role in ["object", "style"] if e[role] is not None}
             for role, span in spans.items():
                 if not span:
                     print(f"  ! no '{e[role]}' tokens found in '{e['prompt']}' - its attention map is all zero")
@@ -466,9 +494,8 @@ def run_masks(args, models: UCModels, entries: list, targets: list, device):
     sam_pairs, geclip_pairs = set(), set()
     for ctype, concept in targets:
         methods = concept_methods(args, ctype)
-        for e in entries:
-            if e[ctype] != concept:
-                continue
+        for n in concept_entries(args, entries, ctype, concept):
+            e = entries[n]
             if "sam" in methods:
                 sam_pairs.add((e["image"], sam_query(concept)))
             if "grad_eclip" in methods:
@@ -506,7 +533,7 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
             continue
         idx_all, val_all, owner, (gh, gw), n_dirs = load_block_codes(entries, block)
         for ctype, concept, method in todo:
-            own = [n for n, e in enumerate(entries) if e[ctype] == concept]
+            own = concept_entries(args, entries, ctype, concept)
             labels = np.zeros(len(owner), dtype=bool)
             for n in own:
                 labels[owner == n] = patch_labels(args, entries[n], ctype, concept, method, gh, gw).reshape(-1)
@@ -930,7 +957,8 @@ def main(args):
     models = UCModels(args, device)
 
     # stages 1-3
-    entries = discover_entries(args, args.object_list, args.style_list)
+    entries = discover_entries(args, args.object_list, args.style_list,
+                               style_targets=any(t == "style" for t, _ in targets))
     os.makedirs(os.path.join(args.cache_dir, "discover", "sparse"), exist_ok=True)
     if not args.disable_discover_generate:
         run_discover_generate(args, models, entries, block_list)
