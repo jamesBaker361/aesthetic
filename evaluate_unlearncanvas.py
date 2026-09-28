@@ -90,6 +90,63 @@
 # probe (stages 1-2 for all mask methods, base/unedited images, random
 # controls) and exits; run it first, then the per-method runs in parallel.
 
+# ---------------------------------------------------------------- metrics
+#
+# Removal (stage 5) -> uc_results.csv.gz, uc_summary.csv, {outputs_dir}/uc_results.csv
+# "target images" = answer-set prompts that contain the concept.
+#
+#   metric                  source                    computed on                      meaning
+#   UA                      UnlearnCanvas classifier  target images                    fraction NOT classified as the target
+#   CRA                     other-domain classifier   target images (--eval_scope      is the other half still recognized?
+#                                                     target, the default)             (remove Cats -> still Van Gogh?)
+#   IRA                     same-domain classifier    non-target images (--eval_scope  are other concepts of the same type
+#                                                     all only)                        still recognized?
+#   CRA_target              other-domain classifier   target images (--eval_scope      CRA's target-image version; with
+#                                                     all only)                        "all", CRA uses non-target images
+#   p_target                classifier softmax        target images                    probability given to the target
+#   style_acc, object_acc   both classifiers          every image                      raw accuracy of each classifier
+#   sam_removed             SAM3                      target images, objects only      fraction where SAM3 finds no object
+#   sam_score, sam_area     SAM3                      target images, objects only      SAM3 confidence, mask share of image
+#   vqa, clip               VQAScore / CLIPScore      target images                    still matches "a photo of a {object}"
+#                                                                                      / "an image in {style} style"?
+#   psnr_target             pixels                    target images                    change vs the unedited image
+#   psnr_retain             pixels                    non-target images (--eval_scope  collateral change on unrelated prompts
+#                                                     all only)
+#   nsfw, nsfw_flagged      LAION NSFW classifier     every image (--use_nsfw)         NSFW probability, >= --nsfw_threshold
+#
+#   uc_summary.csv also has UA_base, CRA_base, p_target_base, sam_removed_base,
+#   vqa_base, clip_base, nsfw_base (and IRA_base / CRA_target_base where they
+#   apply): the same metrics on the unedited answer set. Every row carries
+#   probe_bce / probe_loss_explained / probe_f1: how well the chosen latent
+#   separated the mask on the discovery images.
+#
+# Injection (stage 6) -> inject_results.csv, inject_summary.csv, {outputs_dir}/uc_inject_results.csv
+# "mask" = SAM3 mask of the base subject (cube, man, dog, ...) on the unedited base image.
+#
+#   metric                                source                 meaning
+#   uc_classified_as (+_before)           UnlearnCanvas          is the edit classified as the injected
+#                                         classifier             object/style?
+#   uc_p_target (+_before, _gain)         classifier softmax     probability of the injected concept, and its change
+#   mask_iou / mask_precision /           SAM3, objects only     overlap of the injected object's mask with the
+#     mask_recall                                                original region
+#   subject_area, subject_sam_score       SAM3, objects only     size of the injected object's mask, SAM3 confidence
+#     (+_before)
+#   base_subject_remaining,               SAM3                   how much of the original subject is still found
+#     base_subject_sam_score                                     in its region
+#   vqa_subject, clip_subject             VQAScore / CLIPScore   does the image now match the injected concept's text?
+#     (+_before, _gain)
+#   background_psnr                       pixels                 background preservation outside the mask
+#   foreground_change, background_change  pixels                 mean absolute pixel change inside / outside the mask
+#   nsfw (+_before)                       NSFW classifier        NSFW probability before/after (--use_nsfw)
+#
+#   Rows also carry probe_bce / probe_loss_explained / probe_f1.
+#
+# Grouping: every metric is averaged per concept x mask method (attention /
+# sam / grad_eclip) x block x rule (bce, f1, or bce+f1 when both pick the same
+# latent), and per strength for injection. "random*" rows zero/inject a random
+# latent instead of the probe's pick (control); "base" rows in the removal
+# tables are the unedited model.
+
 import os
 import time
 import argparse
