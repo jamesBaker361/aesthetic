@@ -27,7 +27,10 @@
 #   probes over every latent (sparse_probe.select_bce_and_f1) on the images
 #   that contain the concept (positive patches vs the rest of those images;
 #   --negatives all also adds every patch of the other images). Keeps the
-#   lowest-BCE and the highest-F1 latent -> {out_dir}/features/{concept}.json
+#   lowest-BCE and the highest-F1 latent -> {out_dir}/features/{concept}__{method}.json
+#   (one file per mask method, so parallel per-method jobs sharing an out_dir
+#   never overwrite each other; an older combined {concept}.json is still read).
+#   Only the --*_mask_methods of this run are loaded and tested in stage 4.
 #
 # stage 4 ("answers"): the UnlearnCanvas answer set is every --eval_objects x
 #   --eval_styles x --eval_seeds prompt. With --eval_scope target (default)
@@ -569,14 +572,38 @@ def patch_labels(args, e: dict, ctype: str, concept: str, method: str, gh: int, 
 
 # ---------------------------------------------------------------- stage 3
 
-def features_path(args, concept: str) -> str:
+def features_path(args, concept: str, method: str) -> str:
+    return os.path.join(args.out_dir, "features", f"{safe(concept)}__{method}.json")
+
+
+def legacy_features_path(args, concept: str) -> str:
+    # before per-method files: every method of a concept in one json
     return os.path.join(args.out_dir, "features", f"{safe(concept)}.json")
+
+
+def load_features(args, targets: list) -> dict:
+    '''
+    {concept: {"type": ctype, "methods": {method: {block: result}}}} for this
+    run's mask methods only, from the per-method files (falling back to the
+    legacy combined file).
+    '''
+    features = {}
+    for ctype, concept in targets:
+        legacy = load_json(legacy_features_path(args, concept), {}).get("methods", {})
+        methods = {}
+        for method in concept_methods(args, ctype):
+            per_block = load_json(features_path(args, concept, method), None)
+            if per_block is None:
+                per_block = legacy.get(method, {})
+            methods[method] = per_block
+        features[concept] = {"type": ctype, "methods": methods}
+    return features
 
 
 def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
     '''{concept: {"type": ctype, "methods": {method: {block: select_bce_and_f1 result}}}}'''
     os.makedirs(os.path.join(args.out_dir, "features"), exist_ok=True)
-    features = {c: load_json(features_path(args, c), {"type": t, "methods": {}}) for t, c in targets}
+    features = load_features(args, targets)
 
     for block in block_list:
         todo = [(t, c, m) for t, c in targets for m in concept_methods(args, t)
@@ -602,8 +629,8 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
             print(f"{ctype} '{concept}' ({method}) @ {block}: bce latent {result['bce']['idx']} "
                   f"(bce={result['bce']['bce']:.4f}, explained={result['bce']['loss_explained']:.3f}) | "
                   f"f1 latent {result['f1']['idx']} (f1={result['f1']['f1']:.3f})")
-        for concept, info in features.items():
-            save_json(features_path(args, concept), info)
+        for ctype, concept, method in todo:
+            save_json(features_path(args, concept, method), features[concept]["methods"].get(method, {}))
     return features
 
 
@@ -646,6 +673,8 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
         out.append({**common, "method": "none", "block": "none", "kind": "base", "feature_idx": None,
                     "probe": {}})
         for method, per_block in features.get(concept, {}).get("methods", {}).items():
+            if method not in concept_methods(args, ctype):
+                continue  # only the mask methods this run was asked to test
             for block in block_list:
                 info = per_block.get(block)
                 if info is None:
@@ -1008,7 +1037,7 @@ def main(args):
     if args.prepare_only:
         features = {}  # -> only the unedited answers and the random controls below
     elif args.disable_probe:
-        features = {c: load_json(features_path(args, c), {}) for _, c in targets}
+        features = load_features(args, targets)
     else:
         features = run_probe(args, entries, targets, block_list)
 
