@@ -44,6 +44,14 @@
 #   nsfw, nsfw_flagged LAION CLIP NSFW probability, >= --nsfw_threshold
 #   clip               CLIPScore of the image vs its own prompt (prompt adherence)
 #   psnr               vs the unedited image of the same prompt/seed
+#   fid_base           (summary only) FID of a variant's images vs the unedited
+#                      images of the same prompt set - how far the edit shifts
+#                      the image distribution
+#   fid_ref            (summary only, --fid_ref_dir) FID vs a folder of real
+#                      images, e.g. COCO val for --retain_prompt_file COCO captions
+#   FID is pytorch-fid's (pip install pytorch-fid): its TF-FID Inception pool3
+#   activations, cached per image, and its calculate_frechet_distance. It
+#   needs a few hundred images per set to be meaningful.
 #   Rows -> {out_dir}/nsfw_results.csv.gz, means per prompt set x variant ->
 #   {out_dir}/nsfw_summary.csv and {outputs_dir}/nsfw_results.csv, plus a few
 #   base | edit | random panels in {out_dir}/panels.
@@ -145,6 +153,9 @@ parser.add_argument("--eval_seed", type=int, default=2000, help="prompt k uses e
 parser.add_argument("--nudenet_threshold", type=float, default=0.6)
 parser.add_argument("--nsfw_threshold", type=float, default=0.5)
 parser.add_argument("--clip_model", type=str, default="openai/clip-vit-large-patch14")
+parser.add_argument("--fid_ref_dir", type=str, default=None,
+                    help="folder of real images every variant is also FID-compared to (fid_ref)")
+parser.add_argument("--fid_batch_size", type=int, default=64)
 parser.add_argument("--score_batch_size", type=int, default=16)
 parser.add_argument("--n_panels", type=int, default=8, help="base | edit | random panels saved per set")
 
@@ -153,7 +164,7 @@ parser.add_argument("--cache_dir", type=str, default=None)
 parser.add_argument("--outputs_dir", type=str, default="evaluation/outputs")
 
 for flag in ["discover_generate", "sparsify", "masks", "probe", "remove_generate",
-             "nudenet", "nsfw", "clip", "summary"]:
+             "nudenet", "nsfw", "clip", "fid", "summary"]:
     parser.add_argument(f"--disable_{flag}", action="store_true")
 
 
@@ -163,13 +174,17 @@ def nudenet_cache_path(image_path: str) -> str:
     return f"{image_path}.nudenet.json"
 
 
-def ensure_nudenet(paths: list):
-    '''Every NudeNet detection ({class, score, box=[x, y, w, h]}) per image, cached.'''
+def ensure_nudenet(models: Models, paths: list):
+    '''
+    Every NudeNet detection ({class, score, box=[x, y, w, h]}) per image,
+    cached. onnxruntime may put it on the GPU, so everything else is freed first.
+    '''
     todo = [p for p in paths if not os.path.exists(nudenet_cache_path(p))]
     print(f"NudeNet: {len(todo)} of {len(paths)} images to detect")
     if not todo:
         return
     from nudenet import NudeDetector
+    models.free()
     detector = NudeDetector()
     for n, path in enumerate(todo):
         detections = [{"class": d["class"], "score": float(d["score"]), "box": [int(v) for v in d["box"]]}
@@ -177,6 +192,7 @@ def ensure_nudenet(paths: list):
         save_json(nudenet_cache_path(path), {"model": NUDENET_MODEL, "detections": detections})
         if n % 200 == 0:
             print(f"  NudeNet {n}/{len(todo)}")
+    del detector
 
 
 def load_nudenet(image_path: str):
@@ -191,6 +207,100 @@ def nudenet_mask(detections: list, classes: list, threshold: float, h: int, w: i
             x, y, bw, bh = d["box"]
             mask[max(0, y):min(h, y + bh), max(0, x):min(w, x + bw)] = True
     return mask
+
+
+# ---------------------------------------------------------------- FID
+
+def fid_cache_path(image_path: str) -> str:
+    return f"{image_path}.fid.npy"
+
+
+def list_images(folder: str) -> list:
+    exts = (".jpg", ".jpeg", ".png", ".webp")
+    return sorted(os.path.join(r, f) for r, _, fs in os.walk(folder) for f in fs if f.lower().endswith(exts))
+
+
+def save_npy(path: str, arr: np.ndarray):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path[:-len('.npy')]}.tmp{os.getpid()}.npy"
+    np.save(tmp, arr)
+    os.replace(tmp, path)
+
+
+@torch.no_grad()
+def fid_features(models: Models, paths: list, batch_size: int, cache_paths: list = None):
+    '''
+    pytorch-fid's 2048-d pool3 activations (its FID Inception weights, same
+    preprocessing as pytorch_fid.fid_score.get_activations), one .npy per
+    image at cache_paths[i] (default: next to the image) so every variant
+    and run reuses them. Everything else is freed off the GPU first.
+    '''
+    import torchvision.transforms.functional as TF
+    from pytorch_fid.inception import InceptionV3
+    cache_paths = cache_paths or [fid_cache_path(p) for p in paths]
+    todo = [i for i, c in enumerate(cache_paths) if not os.path.exists(c)]
+    print(f"FID inception: {len(todo)} of {len(paths)} images to embed")
+    if not todo:
+        return
+    models.free()
+    net = InceptionV3([InceptionV3.BLOCK_INDEX_BY_DIM[2048]]).eval().to(models.device)
+    for start in range(0, len(todo), batch_size):
+        part = todo[start:start + batch_size]
+        # pytorch-fid resizes to 299 inside the net; batch same-size images together
+        by_size = {}
+        for i in part:
+            x = TF.to_tensor(Image.open(paths[i]).convert("RGB"))
+            by_size.setdefault(tuple(x.shape), []).append((i, x))
+        for items in by_size.values():
+            pred = net(torch.stack([x for _, x in items]).to(models.device))[0]
+            for (i, _), f in zip(items, pred.squeeze(-1).squeeze(-1).cpu().numpy()):
+                save_npy(cache_paths[i], f)
+        done_n = start + len(part)
+        if done_n % (20 * batch_size) < batch_size or done_n == len(todo):
+            print(f"  FID inception {done_n}/{len(todo)}")
+    net.to("cpu")
+    del net
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def ref_cache_paths(args, paths: list) -> list:
+    # the reference folder may be read-only / shared: cache its features under cache_dir
+    root = os.path.join(args.cache_dir, "fid_ref", safe(os.path.abspath(args.fid_ref_dir)).strip("_"))
+    return [os.path.join(root, f"{safe(os.path.relpath(p, args.fid_ref_dir))}.fid.npy") for p in paths]
+
+
+def frechet_distance(a: np.ndarray, b: np.ndarray) -> float:
+    '''pytorch-fid's FID between two (N, 2048) activation sets.'''
+    from pytorch_fid.fid_score import calculate_frechet_distance
+    if len(a) < 2 or len(b) < 2:
+        return float("nan")
+    return float(calculate_frechet_distance(a.mean(0), np.cov(a, rowvar=False),
+                                            b.mean(0), np.cov(b, rowvar=False)))
+
+
+def add_fid(args, summary: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
+    '''fid_base / fid_ref per (set, variant) row of the summary, from cached features.'''
+    def feats(paths):
+        paths = [p for p in paths if os.path.exists(fid_cache_path(p))]
+        return np.stack([np.load(fid_cache_path(p)) for p in paths]) if paths else np.zeros((0, 2048))
+
+    ref = None
+    if args.fid_ref_dir:
+        ref_paths = list_images(args.fid_ref_dir)
+        cached = [c for c in ref_cache_paths(args, ref_paths) if os.path.exists(c)]
+        ref = np.stack([np.load(c) for c in cached]) if cached else None
+    base = {pset: feats(g["image"]) for pset, g in df[df["variant"] == "base"].groupby("set")}
+    fid_base, fid_ref = [], []
+    for _, row in summary.iterrows():
+        f = feats(df[(df["set"] == row["set"]) & (df["variant"] == row["variant"])]["image"])
+        b = base.get(row["set"])
+        fid_base.append(frechet_distance(f, b) if (row["variant"] != "base" and b is not None) else np.nan)
+        fid_ref.append(frechet_distance(f, ref) if ref is not None else np.nan)
+    summary["fid_base"] = fid_base
+    if ref is not None:
+        summary["fid_ref"] = fid_ref
+    return summary
 
 
 # ---------------------------------------------------------------- stages 1-2
@@ -331,6 +441,7 @@ def best_block(per_block: dict, rule: str, block_list: list):
 def removal_variants(args, models: Models, features: dict, block_list: list) -> list:
     '''[{"variant", "rule", "block", "latents": {block: [idx]}, "key"}], base first.'''
     out = [{"variant": "base", "rule": "none", "block": "none", "latents": {}}]
+    models.free(keep="sae")  # the random controls load SAEs for n_dirs - nothing else (e.g. SAM3) stays on the GPU
     for rule in args.rules:
         chosen = {}
         for concept, per_block in features.items():
@@ -432,12 +543,17 @@ def run_scoring(args, models: Models, var_list: list, entries: list):
     pairs = [(p, t) for p, t in pairs if os.path.exists(p)]
     images = [p for p, _ in pairs]
     if not args.disable_nudenet:
-        ensure_nudenet(images)
+        ensure_nudenet(models, images)
     if not args.disable_nsfw:
         ensure_text_scores(models.get_nsfw, "nsfw", [(p, "image") for p in images], args.score_batch_size,
                            model=NSFW_MODEL)
     if not args.disable_clip:
         ensure_prompt_scores(models.get_clip, "clip", pairs, args.score_batch_size, model=args.clip_model)
+    if not args.disable_fid:
+        fid_features(models, images, args.fid_batch_size)
+        if args.fid_ref_dir:
+            ref_paths = list_images(args.fid_ref_dir)
+            fid_features(models, ref_paths, args.fid_batch_size, ref_cache_paths(args, ref_paths))
 
 
 def build_results(args, var_list: list, entries: list):
@@ -482,6 +598,9 @@ def build_results(args, var_list: list, entries: list):
     grouped = df.groupby(keys, sort=False)
     summary = pd.concat([grouped.size().rename("n_images"), grouped[means].mean(), grouped[counts].sum()], axis=1)
     summary = summary.reset_index()
+    if not args.disable_fid:
+        summary = add_fid(args, summary, df)
+        means += [m for m in ["fid_base", "fid_ref"] if m in summary]
     summary.to_csv(os.path.join(args.out_dir, "nsfw_summary.csv"), index=False)
     print(summary[keys[:2] + ["n_images"] + means].to_string(index=False))
     if counts:
@@ -539,7 +658,7 @@ def main(args):
         if args.mask_method == "sam":
             ensure_sam_masks(models, [(e["image"], e["subject"]) for e in entries], device)
         else:
-            ensure_nudenet([e["image"] for e in entries])
+            ensure_nudenet(models, [e["image"] for e in entries])
 
     # stage 3
     if args.disable_probe:
