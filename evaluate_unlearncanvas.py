@@ -56,8 +56,7 @@
 #           target-image version is reported as CRA_target
 #   and the evaluate_sae_features metrics: SAM3 removal rate of the object
 #   (objects only), VQAScore / CLIPScore of the concept text on target
-#   images, PSNR vs the unedited image (target and non-target images), and
-#   the NSFW classifier with --use_nsfw.
+#   images, and PSNR vs the unedited image (target and non-target images).
 #   Per-image rows -> {out_dir}/uc_results.csv.gz, means per concept x
 #   method x block x rule -> {out_dir}/uc_summary.csv (with the unedited
 #   model's numbers as *_base columns) and {outputs_dir}/uc_results.csv.
@@ -72,8 +71,8 @@
 #   objects only), whether the base subject is gone, VQAScore / CLIPScore of
 #   the concept vs the unedited image, background PSNR and fore/background
 #   change - plus the UnlearnCanvas classifiers (is the edit now classified as
-#   the injected object/style, and its probability, vs the unedited image)
-#   and NSFW with --use_nsfw. Rows -> {out_dir}/inject_results.csv, means ->
+#   the injected object/style, and its probability, vs the unedited image).
+#   Rows -> {out_dir}/inject_results.csv, means ->
 #   {out_dir}/inject_summary.csv and {outputs_dir}/uc_inject_results.csv.
 #
 # Every pass skips work whose output already exists, so it can be rerun or
@@ -112,10 +111,9 @@
 #   psnr_target             pixels                    target images                    change vs the unedited image
 #   psnr_retain             pixels                    non-target images (--eval_scope  collateral change on unrelated prompts
 #                                                     all only)
-#   nsfw, nsfw_flagged      LAION NSFW classifier     every image (--use_nsfw)         NSFW probability, >= --nsfw_threshold
 #
 #   uc_summary.csv also has UA_base, CRA_base, p_target_base, sam_removed_base,
-#   vqa_base, clip_base, nsfw_base (and IRA_base / CRA_target_base where they
+#   vqa_base, clip_base (and IRA_base / CRA_target_base where they
 #   apply): the same metrics on the unedited answer set. Every row carries
 #   probe_bce / probe_loss_explained / probe_f1: how well the chosen latent
 #   separated the mask on the discovery images.
@@ -137,7 +135,6 @@
 #     (+_before, _gain)
 #   background_psnr                       pixels                 background preservation outside the mask
 #   foreground_change, background_change  pixels                 mean absolute pixel change inside / outside the mask
-#   nsfw (+_before)                       NSFW classifier        NSFW probability before/after (--use_nsfw)
 #
 #   Rows also carry probe_bce / probe_loss_explained / probe_f1.
 #
@@ -167,7 +164,7 @@ from generate_clean_inference import resize_mask_to_grid
 from grad_eclip_mask import load_clip, grad_eclip_pixel_map, top_frac_patch_mask
 from sparse_probe import select_bce_and_f1
 from evaluate_sae_features import (
-    Models, NSFW_MODEL, safe, load_json, save_json, generate, ensure_sam_masks, load_sam, sam_cache_path,
+    Models, safe, load_json, save_json, generate, ensure_sam_masks, load_sam, sam_cache_path,
     ensure_text_scores, score_cache_path, load_text_score, run_dream_sparsify, load_block_codes,
     make_zero_hook, run_remove_generate, psnr, write_outputs_results,
     run_base, run_ablate_generate, save_image, save_npz, fill_prompt, read_lines,
@@ -253,8 +250,6 @@ parser.add_argument("--clip_model", type=str, default="openai/clip-vit-large-pat
 parser.add_argument("--object_text", type=str, default="a photo of a {}", help="VQAScore/CLIPScore text for objects")
 parser.add_argument("--style_text", type=str, default="an image in {} style", help="VQAScore/CLIPScore text for styles")
 parser.add_argument("--score_batch_size", type=int, default=16)
-parser.add_argument("--use_nsfw", action="store_true")
-parser.add_argument("--nsfw_threshold", type=float, default=0.5)
 
 parser.add_argument("--base_prompt_file", type=str, default="prompt_dir/base_prompts.txt")
 parser.add_argument("--base_subject_file", type=str, default="prompt_dir/base_subjects.txt")
@@ -732,9 +727,6 @@ def run_scoring(args, models: UCModels, answers: list, var_list: list, device):
         ensure_text_scores(models.get_vqa, "vqa", text_pairs, args.score_batch_size, model=args.vqa_model)
     if not args.disable_clip:
         ensure_text_scores(models.get_clip, "clip", text_pairs, args.score_batch_size, model=args.clip_model)
-    if args.use_nsfw:
-        ensure_text_scores(models.get_nsfw, "nsfw", [(p, "image") for p in images], args.score_batch_size,
-                           model=NSFW_MODEL)
 
 
 def build_results(args, answers: list, var_list: list):
@@ -778,10 +770,6 @@ def build_results(args, answers: list, var_list: list):
             if target:
                 row["vqa"] = load_text_score(path, "vqa", text)
                 row["clip"] = load_text_score(path, "clip", text)
-            if args.use_nsfw:
-                s = load_text_score(path, "nsfw", "image")
-                row["nsfw"] = s
-                row["nsfw_flagged"] = float(s >= args.nsfw_threshold) if s is not None else None
             if not args.disable_psnr and v["kind"] != "base" and os.path.exists(a["image"]):
                 edited = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
                 original = np.asarray(Image.open(a["image"]).convert("RGB"), dtype=np.float32) / 255.0
@@ -796,7 +784,7 @@ def build_results(args, answers: list, var_list: list):
 
     keys = ["subject", "concept_type", "method", "block", "kind"]
     metrics = ["UA", "IRA", "CRA", "CRA_target", "p_target", "style_acc", "object_acc", "sam_removed", "sam_score", "sam_area",
-               "vqa", "clip", "nsfw", "nsfw_flagged", "psnr_target", "psnr_retain",
+               "vqa", "clip", "psnr_target", "psnr_retain",
                "probe_bce", "probe_loss_explained", "probe_f1"]
     metrics = [m for m in metrics if m in df]
     for m in metrics:
@@ -809,7 +797,7 @@ def build_results(args, answers: list, var_list: list):
     summary = summary.reset_index()
 
     # the unedited model's numbers next to every row of the same concept
-    base_cols = [m for m in ["UA", "IRA", "CRA", "CRA_target", "p_target", "sam_removed", "vqa", "clip", "nsfw"] if m in summary]
+    base_cols = [m for m in ["UA", "IRA", "CRA", "CRA_target", "p_target", "sam_removed", "vqa", "clip"] if m in summary]
     base = summary[summary["kind"] == "base"].set_index("subject")[base_cols].add_suffix("_base")
     summary = summary.join(base, on="subject")
     summary.to_csv(os.path.join(args.out_dir, "uc_summary.csv"), index=False)
@@ -878,9 +866,6 @@ def run_inject_scoring(args, models: UCModels, jobs: list, base_by_name: dict, d
         ensure_text_scores(models.get_vqa, "vqa", text_pairs, args.score_batch_size, model=args.vqa_model)
     if not args.disable_clip:
         ensure_text_scores(models.get_clip, "clip", text_pairs, args.score_batch_size, model=args.clip_model)
-    if args.use_nsfw:
-        ensure_text_scores(models.get_nsfw, "nsfw", [(p, "image") for p in images], args.score_batch_size,
-                           model=NSFW_MODEL)
 
 
 def uc_target(args, path: str, ctype: str, concept: str):
@@ -949,9 +934,6 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
         if hit is not None:
             row.update({"uc_classified_as": hit, "uc_classified_as_before": hit_before,
                         "uc_p_target": p, "uc_p_target_before": p_before})
-        if args.use_nsfw:
-            row["nsfw"] = load_text_score(j["image"], "nsfw", "image")
-            row["nsfw_before"] = load_text_score(base["image"], "nsfw", "image")
         for k in ["vqa_subject", "clip_subject", "uc_p_target"]:
             a, b = row.get(k), row.get(f"{k}_before")
             if k in row:
