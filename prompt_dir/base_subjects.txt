@@ -1,12 +1,8 @@
 cube
 sphere
-man
-woman
+plant
 boy
 girl
-cat
-dog
-horse
 dragon
 bicycle
 car
@@ -14,3 +10,5 @@ boat
 desk
 chair
 box
+dragon
+robot
