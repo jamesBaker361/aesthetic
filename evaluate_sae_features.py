@@ -809,11 +809,14 @@ def build_results(args, jobs: list, subjects: list, base_by_name: dict, features
 
 
 def write_outputs_results(args, df: pd.DataFrame, filename: str = "results.csv",
-                          keys: list = ("subject", "block", "kind", "strength")):
+                          keys: list = ("subject", "block", "kind", "strength"),
+                          replace_on: list = ("subject",)):
     '''
     {outputs_dir}/{filename}: one row per subject x block x feature choice
     (x strength) with the mean of every metric and the image count. Rows from
-    earlier runs are kept unless this run (same out_dir) rescored that subject.
+    earlier runs are kept unless this run (same out_dir) rescored the same
+    replace_on values (e.g. subject + method, so per-method jobs sharing an
+    out_dir keep each other's rows).
     '''
     keys = list(keys)
     skip = set(keys) | {"feature_idx", "seed", "pos_mean"}
@@ -830,7 +833,10 @@ def write_outputs_results(args, df: pd.DataFrame, filename: str = "results.csv",
     path = os.path.join(args.outputs_dir, filename)
     if os.path.exists(path):
         old = pd.read_csv(path)
-        replaced = (old["out_dir"] == args.out_dir) & old["subject"].isin(table["subject"])
+        replace_on = list(replace_on)
+        new_keys = set(map(tuple, table[replace_on].astype(str).values))
+        replaced = (old["out_dir"] == args.out_dir) & \
+            pd.Series([tuple(r) in new_keys for r in old[replace_on].astype(str).values], index=old.index)
         table = pd.concat([old[~replaced], table], ignore_index=True)
     table = table.sort_values(["out_dir"] + keys)
     table.to_csv(path, index=False)

@@ -60,8 +60,8 @@
 #   and the evaluate_sae_features metrics: SAM3 removal rate of the object
 #   (objects only), VQAScore / CLIPScore of the concept text on target
 #   images, and PSNR vs the unedited image (target and non-target images).
-#   Per-image rows -> {out_dir}/uc_results.csv.gz, means per concept x
-#   method x block x rule -> {out_dir}/uc_summary.csv (with the unedited
+#   Per-image rows -> {out_dir}/uc_results_{methods}.csv.gz, means per concept x
+#   method x block x rule -> {out_dir}/uc_summary_{methods}.csv (with the unedited
 #   model's numbers as *_base columns) and {outputs_dir}/uc_results.csv.
 #
 # stage 6 ("inject", evaluate_sae_features.py's stage 3): the base images
@@ -75,8 +75,8 @@
 #   the concept vs the unedited image, background PSNR and fore/background
 #   change - plus the UnlearnCanvas classifiers (is the edit now classified as
 #   the injected object/style, and its probability, vs the unedited image).
-#   Rows -> {out_dir}/inject_results.csv, means ->
-#   {out_dir}/inject_summary.csv and {outputs_dir}/uc_inject_results.csv.
+#   Rows -> {out_dir}/inject_results_{methods}.csv, means ->
+#   {out_dir}/inject_summary_{methods}.csv and {outputs_dir}/uc_inject_results.csv.
 #
 # Every pass skips work whose output already exists, so it can be rerun or
 # sharded with --target_objects / --target_styles.
@@ -572,6 +572,11 @@ def patch_labels(args, e: dict, ctype: str, concept: str, method: str, gh: int, 
 
 # ---------------------------------------------------------------- stage 3
 
+def run_tag(args) -> str:
+    '''Mask methods of this run, so per-method jobs sharing an out_dir write separate tables.'''
+    return "_".join(sorted(set(args.object_mask_methods) | set(args.style_mask_methods)))
+
+
 def features_path(args, concept: str, method: str) -> str:
     return os.path.join(args.out_dir, "features", f"{safe(concept)}__{method}.json")
 
@@ -809,7 +814,7 @@ def build_results(args, answers: list, var_list: list):
     if df.empty:
         print("no scored rows yet")
         return df
-    df.to_csv(os.path.join(args.out_dir, "uc_results.csv.gz"), index=False)
+    df.to_csv(os.path.join(args.out_dir, f"uc_results_{run_tag(args)}.csv.gz"), index=False)
 
     keys = ["subject", "concept_type", "method", "block", "kind"]
     metrics = ["UA", "IRA", "CRA", "CRA_target", "p_target", "style_acc", "object_acc", "sam_removed", "sam_score", "sam_area",
@@ -829,13 +834,14 @@ def build_results(args, answers: list, var_list: list):
     base_cols = [m for m in ["UA", "IRA", "CRA", "CRA_target", "p_target", "sam_removed", "vqa", "clip"] if m in summary]
     base = summary[summary["kind"] == "base"].set_index("subject")[base_cols].add_suffix("_base")
     summary = summary.join(base, on="subject")
-    summary.to_csv(os.path.join(args.out_dir, "uc_summary.csv"), index=False)
+    summary.to_csv(os.path.join(args.out_dir, f"uc_summary_{run_tag(args)}.csv"), index=False)
 
     shown = [m for m in ["UA", "IRA", "CRA", "CRA_target", "sam_removed", "vqa", "psnr_target", "psnr_retain"]
              if m in summary and summary[m].notna().any()]
     print(summary.groupby(["concept_type", "method", "kind"])[shown].mean().to_string())
 
-    write_outputs_results(args, df.drop(columns=["seed"]), filename="uc_results.csv", keys=keys)
+    write_outputs_results(args, df.drop(columns=["seed"]), filename="uc_results.csv", keys=keys,
+                          replace_on=["subject", "method"])
     return df
 
 
@@ -973,7 +979,7 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
     if df.empty:
         print("no injection rows yet")
         return df
-    df.to_csv(os.path.join(args.out_dir, "inject_results.csv"), index=False)
+    df.to_csv(os.path.join(args.out_dir, f"inject_results_{run_tag(args)}.csv"), index=False)
 
     keys = ["subject", "concept_type", "method", "block", "kind", "strength"]
     metrics = [c for c in df.columns if c not in keys and c != "feature_idx"
@@ -985,12 +991,12 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
     summary = grouped[metrics].mean()
     summary.insert(0, "n_images", grouped.size())
     summary.insert(0, "feature_idx", grouped["feature_idx"].first())
-    summary.reset_index().to_csv(os.path.join(args.out_dir, "inject_summary.csv"), index=False)
+    summary.reset_index().to_csv(os.path.join(args.out_dir, f"inject_summary_{run_tag(args)}.csv"), index=False)
 
     shown = [m for m in ["mask_iou", "base_subject_remaining", "vqa_subject_gain", "uc_classified_as",
                          "uc_p_target_gain", "background_psnr"] if m in df]
     print(df.groupby(["concept_type", "method", "kind", "strength"])[shown].mean().to_string())
-    write_outputs_results(args, df, filename="uc_inject_results.csv", keys=keys)
+    write_outputs_results(args, df, filename="uc_inject_results.csv", keys=keys, replace_on=["subject", "method"])
     return df
 
 
