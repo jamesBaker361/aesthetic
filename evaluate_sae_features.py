@@ -822,7 +822,7 @@ def write_outputs_results(args, df: pd.DataFrame, filename: str = "results.csv",
     keys = list(keys)
     skip = set(keys) | {"feature_idx", "seed", "pos_mean"}
     metrics = [c for c in df.columns if c not in skip and pd.api.types.is_numeric_dtype(df[c])]
-    grouped = df.groupby(keys)
+    grouped = df.groupby(keys, dropna=False)  # keep rows whose key is NaN (e.g. an auto-searched setting)
     table = grouped[metrics].mean()
     table.insert(0, "n_images", grouped.size())
     table.insert(0, "feature_idx", grouped["feature_idx"].agg(

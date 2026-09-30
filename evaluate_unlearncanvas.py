@@ -117,6 +117,20 @@
 # (the same for every concept; images in latent..._x{gamma}/). Both modes
 # zero the latents at gamma 0. The remove_mode column says which was used.
 #
+# --auto_gamma: gamma per edit instead of --remove_scale. A dense probe
+# (StandardScaler + L2 logistic regression) is fit on the block's un-encoded
+# activations of ~80% of the concept's discovery images (labels = its mask);
+# on the held-out ~20% the edit is applied offline exactly as the hook does,
+# and gamma in [--auto_gamma_min, 0] is bisected for the weakest one after
+# which at most --auto_gamma_target (5%) of the held-out mask patches the probe
+# called positive still are. No images are generated for the search. Random
+# controls get their concept's mean gamma at that block. remove_scale is NaN
+# for these rows; gamma holds the value used, dense_* the probe numbers
+# (recall / false positives before and after, relative change on / off the
+# mask), and the log prints each search curve. Cached in
+# {out_dir}/auto_gamma/{concept}__{method}.json. It only checks this block:
+# later blocks and the prompt can restore the concept, so confirm with UA.
+#
 # --remove_scale_preset saeuron: gamma per concept from SAeUron's Table 5
 # (App. G, p. 18; SAEURON_MULTIPLIERS): objects -5 to -30, styles -1.
 #
@@ -308,6 +322,13 @@ parser.add_argument("--remove_mode", type=str, default="saeuron", choices=["saeu
                     help="how gamma (--remove_scale) is applied to each chosen latent: 'saeuron' = activation x "
                          "(gamma x the latent's mean activation on the concept), as SAeUron; 'direct' = "
                          "activation x gamma. Identical for gamma 0")
+parser.add_argument("--auto_gamma", action="store_true",
+                    help="per edit, binary-search the weakest gamma after which at most --auto_gamma_target of "
+                         "the held-out mask patches a dense probe called positive still are (overrides "
+                         "--remove_scale / --remove_scale_preset)")
+parser.add_argument("--auto_gamma_target", type=float, default=0.05)
+parser.add_argument("--auto_gamma_min", type=float, default=-50.0, help="strongest gamma the search may use")
+parser.add_argument("--auto_gamma_steps", type=int, default=12, help="bisection steps")
 parser.add_argument("--remove_scale_preset", type=str, default="none", choices=["none", "saeuron"],
                     help="saeuron: each concept's gamma is its multiplier from SAeUron's Table 5 "
                          "(arXiv:2501.18052, App. G, p.18; SAEURON_MULTIPLIERS) - objects -5 to -30, styles -1 - "
@@ -657,7 +678,9 @@ def run_tag(args) -> str:
     if "lasso" in args.rules:
         tag += "_lasso"
     mode = "g" if args.remove_mode == "saeuron" else "x"  # g = gamma x mean activation, x = direct
-    if args.remove_scale_preset != "none":
+    if args.auto_gamma:
+        tag += f"_{mode}auto{args.auto_gamma_target:g}"
+    elif args.remove_scale_preset != "none":
         tag += f"_{mode}{args.remove_scale_preset}"
     elif args.remove_scale != [0.0]:
         tag += f"_{mode}" + "_".join(f"{x:g}" for x in args.remove_scale)
@@ -830,7 +853,7 @@ def attach_latent_means(args, entries: list, var_list: list, block_list: list):
     '''
     if args.remove_mode != "saeuron":
         return  # direct: the scale doesn't depend on the latent's activations
-    todo = [v for v in var_list if v["kind"] != "base" and v["remove_scale"] != 0.0]
+    todo = [v for v in var_list if v["kind"] != "base" and (v["gamma"] is None or v["gamma"] != 0.0)]
     for block in block_list:
         here = [v for v in todo if v["block"] == block]
         if not here:
@@ -842,8 +865,162 @@ def attach_latent_means(args, entries: list, var_list: list, block_list: list):
             v["latent_means"] = [float(np.where(idx == j, val, 0.0).sum(axis=1).mean()) for j in v["latents"]]
     for v in todo:
         means = ", ".join(f"{j}:{m:.3g}" for j, m in zip(v["latents"], v["latent_means"]))
-        print(f"  {v['subject']} {v['method']} {v['kind']} @ {v['block']} gamma {v['remove_scale']:g}: "
-              f"mean activations {means}")
+        print(f"  {v['subject']} {v['method']} {v['kind']} @ {v['block']} gamma "
+              f"{'auto' if v['gamma'] is None else format(v['gamma'], 'g')}: mean activations {means}")
+
+
+def edit_scale(args, v: dict, gamma: float):
+    '''Per-latent scale the hook applies: gamma x mean concept activation (saeuron) or gamma (direct).'''
+    if gamma != 0.0 and args.remove_mode == "saeuron":
+        return [gamma * m for m in v["latent_means"]]
+    return gamma
+
+
+def auto_gamma_path(args, concept: str, method: str) -> str:
+    return os.path.join(args.out_dir, "auto_gamma", f"{safe(concept)}__{method}.json")
+
+
+def auto_gamma_key(args, v: dict) -> str:
+    return "|".join([v["block"], v["kind"], ",".join(str(i) for i in v["latents"]), args.remove_mode,
+                     f"{args.auto_gamma_target:g}", f"{args.auto_gamma_min:g}", str(args.auto_gamma_steps),
+                     args.mode, str(args.seed)])
+
+
+@torch.no_grad()
+def run_auto_gamma(args, models: UCModels, entries: list, var_list: list, block_list: list):
+    '''
+    For every learned edit: fit a dense probe (StandardScaler + L2 logistic
+    regression) on the block's un-encoded activations (out - in with --mode
+    diff) of ~80% of the concept's discovery images, labels = its mask. On
+    the held-out images, apply the edit offline exactly as make_zero_hook does
+    (x - decoder(onehot of the chosen latents x (1 - scale))) and binary-search
+    gamma in [--auto_gamma_min, 0] for the weakest one after which at most
+    --auto_gamma_target of the held-out mask patches the probe called positive
+    before are still positive. Sets v["gamma"] and v["gamma_search"]; results
+    are cached in {out_dir}/auto_gamma/{concept}__{method}.json. Random
+    controls get the mean gamma found for their concept at their block.
+    '''
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+
+    learned = [v for v in var_list if v["kind"] != "base" and v["method"] != "random"]
+    caches = {}
+    for v in learned:
+        path = auto_gamma_path(args, v["subject"], v["method"])
+        caches.setdefault(path, load_json(path, {}))
+        hit = caches[path].get(auto_gamma_key(args, v))
+        if hit is not None:
+            v["gamma"], v["gamma_search"] = hit["gamma"], hit
+    todo = [v for v in learned if v["gamma"] is None]
+    print(f"auto-gamma: {len(todo)} of {len(learned)} edits to search")
+
+    for block in block_list:
+        here = [v for v in todo if v["block"] == block]
+        if not here:
+            continue
+        models.free(keep="sae")
+        sae = models.get_sae(block)
+        groups = {}
+        for v in here:
+            groups.setdefault((v["concept_type"], v["subject"], v["method"]), []).append(v)
+        for (ctype, concept, method), vs in groups.items():
+            images = []  # (x (h, w, C), labels (h*w,)) per discovery image of the concept
+            for n in concept_entries(args, entries, ctype, concept):
+                e = entries[n]
+                with np.load(e["embedding"]) as d:
+                    out = d[f"saved_output.{block}"][0]
+                    x = out - d[f"saved_input.{block}"][0] if args.mode == "diff" else out
+                x = x.transpose(1, 2, 0).astype(np.float32)
+                labels = patch_labels(args, e, ctype, concept, method, x.shape[0], x.shape[1]).reshape(-1)
+                images.append((x, labels.astype(bool)))
+            rng = np.random.default_rng(args.seed)
+            test_ids = set(rng.choice(len(images), max(1, int(round(0.2 * len(images)))), replace=False).tolist())
+            train = [im for i, im in enumerate(images) if i not in test_ids] or images
+            test = [im for i, im in enumerate(images) if i in test_ids]
+            Xtr = np.concatenate([x.reshape(-1, x.shape[-1]) for x, _ in train])
+            ytr = np.concatenate([y for _, y in train])
+            if ytr.all() or not ytr.any():
+                print(f"  auto-gamma: '{concept}' ({method}) @ {block}: no mask contrast - gamma 0")
+                for v in vs:
+                    v["gamma"], v["gamma_search"] = 0.0, {"gamma": 0.0, "reached": False}
+                continue
+            scaler = StandardScaler().fit(Xtr)
+            probe = LogisticRegression(C=1.0, max_iter=2000).fit(scaler.transform(Xtr), ytr)
+
+            xt = [torch.tensor(x, device=models.device) for x, _ in test]
+            codes = [sae.encode(x) for x in xt]  # (h, w, n_dirs), relu'd top-k
+            yte = np.concatenate([y for _, y in test])
+            flat = np.concatenate([x.reshape(-1, x.shape[-1]) for x, _ in test])
+            before = probe.predict(scaler.transform(flat)).astype(bool)
+            was_pos = yte & before
+
+            for v in vs:
+                latents = list(v["latents"])
+
+                def measure(gamma):
+                    keep = 1.0 - torch.as_tensor(edit_scale(args, v, gamma), dtype=torch.float32,
+                                                 device=models.device)
+                    edited, change = [], []
+                    for x, a in zip(xt, codes):
+                        onehot = torch.zeros_like(a)
+                        onehot[..., latents] = a[..., latents] * keep
+                        delta = sae.decoder(onehot)
+                        edited.append((x - delta).reshape(-1, x.shape[-1]).cpu().numpy())
+                        change.append((delta.norm(dim=-1) / x.norm(dim=-1).clamp_min(1e-6)).reshape(-1).cpu().numpy())
+                    after = probe.predict(scaler.transform(np.concatenate(edited))).astype(bool)
+                    change = np.concatenate(change)
+                    return {"still_positive": float(after[was_pos].mean()) if was_pos.any() else 0.0,
+                            "recall_after": float(after[yte].mean()) if yte.any() else float("nan"),
+                            "fp_after": float(after[~yte].mean()) if (~yte).any() else float("nan"),
+                            "change_on": float(change[yte].mean()) if yte.any() else float("nan"),
+                            "change_off": float(change[~yte].mean()) if (~yte).any() else float("nan")}
+
+                curve = {}
+
+                def at(g):
+                    g = float(f"{g:.4g}")  # 4 significant digits: keeps image folder names sane
+                    if g not in curve:
+                        curve[g] = measure(g)
+                    return g, curve[g]
+
+                target = args.auto_gamma_target
+                g0, m0 = at(0.0)
+                gmin, mmin = at(args.auto_gamma_min)
+                if m0["still_positive"] <= target:
+                    best, reached = g0, True
+                elif mmin["still_positive"] > target:
+                    best, reached = gmin, False
+                else:
+                    lo, hi = gmin, 0.0  # lo meets the target, hi doesn't
+                    for _ in range(args.auto_gamma_steps):
+                        g, m = at((lo + hi) / 2)
+                        if m["still_positive"] <= target:
+                            lo = g
+                        else:
+                            hi = g
+                    best, reached = lo, True
+                res = {"gamma": best, "reached": reached,
+                       "dense_recall_before": float(before[yte].mean()) if yte.any() else float("nan"),
+                       "dense_fp_before": float(before[~yte].mean()) if (~yte).any() else float("nan"),
+                       **curve[best],
+                       "curve": {f"{g:g}": round(m["still_positive"], 4) for g, m in sorted(curve.items())}}
+                v["gamma"], v["gamma_search"] = best, res
+                caches[auto_gamma_path(args, concept, method)][auto_gamma_key(args, v)] = res
+                print(f"  auto-gamma '{concept}' ({method}) {v['kind']} @ {block} {len(latents)} latents: "
+                      f"gamma {best:g}{'' if reached else ' (target NOT reached)'} - still positive "
+                      f"{res['still_positive']:.3f} (target {target:g}), recall {res['dense_recall_before']:.3f}"
+                      f" -> {res['recall_after']:.3f}, fp {res['dense_fp_before']:.3f} -> {res['fp_after']:.3f}, "
+                      f"rel. change on/off mask {res['change_on']:.3f}/{res['change_off']:.3f} | curve {res['curve']}")
+            path = auto_gamma_path(args, concept, method)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            save_json(path, caches[path])
+
+    # random controls: the mean gamma found for the same concept at the same block
+    for v in var_list:
+        if v["method"] == "random" and v["gamma"] is None:
+            found = [u["gamma"] for u in learned
+                     if u["subject"] == v["subject"] and u["block"] == v["block"] and u["gamma"] is not None]
+            v["gamma"] = float(f"{np.mean(found):.4g}") if found else 0.0
 
 
 def resolve_random_latents(args, models: UCModels, block_list: list) -> dict:
@@ -923,20 +1100,24 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
     for v in out:
         v["top_k"] = 0 if args.auto_k else args.top_k  # 0 = auto; n_latents has the actual count
         v["remove_mode"] = args.remove_mode
-    # one copy of every edit per --remove_scale; the unedited model is scale 1
+    # one copy of every edit per --remove_scale; the unedited model is scale 1. remove_scale is the
+    # setting (NaN = --auto_gamma), gamma the value actually used (filled in by run_auto_gamma)
     scaled = []
     for v in out:
+        v["auto_gamma_target"] = args.auto_gamma_target if args.auto_gamma else 0.0
         if v["kind"] == "base":
-            scaled.append({**v, "remove_scale": 1.0})
+            scaled.append({**v, "remove_scale": 1.0, "gamma": None})
+        elif args.auto_gamma:
+            scaled.append({**v, "remove_scale": float("nan"), "gamma": None})
         else:
-            scaled += [{**v, "remove_scale": scale} for scale in remove_scales(args, v)]
+            scaled += [{**v, "remove_scale": scale, "gamma": scale} for scale in remove_scales(args, v)]
     return scaled
 
 
 def variant_image(args, v: dict, a: dict) -> str:
     if v["kind"] == "base":
         return a["image"]
-    return os.path.join(latent_dir(args, v["block"], v["latents"], v["remove_scale"], v["subject"]), a["file"])
+    return os.path.join(latent_dir(args, v["block"], v["latents"], v["gamma"], v["subject"]), a["file"])
 
 
 def is_target(v: dict, a: dict) -> bool:
@@ -970,16 +1151,13 @@ def run_answers_generate(args, models: UCModels, answers: list, var_list: list):
             # make_zero_hook scales a list of latents as well as one
             # saeuron: each latent -> activation x (gamma x its mean activation on the concept);
             # direct: activation x gamma
-            if v["remove_scale"] != 0.0 and args.remove_mode == "saeuron":
-                scale = [v["remove_scale"] * m for m in v["latent_means"]]
-            else:
-                scale = v["remove_scale"]
+            scale = edit_scale(args, v, v["gamma"])
             jobs[path] = {"block": v["block"], "feature_idx": list(v["latents"]), "scale": scale,
                           "prompt": a["prompt"], "seed": a["seed"], "image": path}
     n_sets = len({(j["block"], tuple(j["feature_idx"]), str(j["scale"])) for j in jobs.values()})
     print(f"answers: {len(jobs)} edited images over {n_sets} distinct latent sets x scales "
-          f"(top_k={args.top_k}, remove_scale="
-          f"{args.remove_scale if args.remove_scale_preset == 'none' else args.remove_scale_preset})")
+          f"(top_k={args.top_k}, gamma="
+          f"{'auto' if args.auto_gamma else args.remove_scale if args.remove_scale_preset == 'none' else args.remove_scale_preset})")
     run_remove_generate(args, models, list(jobs.values()))
 
 
@@ -1024,7 +1202,11 @@ def build_results(args, answers: list, var_list: list):
             row = {
                 "subject": concept, "concept_type": ctype, "method": v["method"], "block": v["block"],
                 "kind": v["kind"], "feature_idx": v["feature_idx"], "top_k": v["top_k"],
-                "remove_mode": v["remove_mode"],
+                "remove_mode": v["remove_mode"], "remove_scale": v["remove_scale"],
+                "auto_gamma_target": v["auto_gamma_target"], "gamma": v["gamma"],
+                **{f"dense_{k}": v.get("gamma_search", {}).get(k) for k in
+                   ["recall_before", "recall_after", "fp_before", "fp_after", "still_positive",
+                    "change_on", "change_off"]},
                 "latents": ";".join(str(i) for i in v["latents"]),
                 "object": a["object"], "style": a["style"], "seed": a["seed"], "image": path,
                 "is_target": float(target),
@@ -1069,16 +1251,19 @@ def build_results(args, answers: list, var_list: list):
         return df
     df.to_csv(os.path.join(args.out_dir, f"uc_results_{run_tag(args)}.csv.gz"), index=False)
 
-    keys = ["subject", "concept_type", "method", "block", "kind", "top_k", "remove_mode", "remove_scale"]
+    keys = ["subject", "concept_type", "method", "block", "kind", "top_k", "remove_mode", "remove_scale",
+            "auto_gamma_target"]
     metrics = ["UA", "IRA", "CRA", "CRA_target", "p_target", "style_acc", "object_acc", "sam_removed", "sam_score", "sam_area",
                "vqa", "clip", "psnr_target", "psnr_retain",
                "probe_bce", "probe_loss_explained", "probe_f1",
-               "n_latents", "probe_score_all_latents", "probe_score_k_latents"]
+               "n_latents", "probe_score_all_latents", "probe_score_k_latents", "gamma",
+               "dense_recall_before", "dense_recall_after", "dense_fp_before", "dense_fp_after",
+               "dense_still_positive", "dense_change_on", "dense_change_off"]
     metrics = [m for m in metrics if m in df]
     for m in metrics:
         df[m] = pd.to_numeric(df[m].replace([np.inf], np.nan), errors="coerce")
     df["block"] = df["block"].fillna("none")
-    grouped = df.groupby(keys)
+    grouped = df.groupby(keys, dropna=False)  # remove_scale is NaN for --auto_gamma
     summary = grouped[metrics].mean()
     summary.insert(0, "n_images", grouped.size())
     summary.insert(0, "latents", grouped["latents"].first())
@@ -1096,8 +1281,9 @@ def build_results(args, answers: list, var_list: list):
     print(summary.groupby(["concept_type", "method", "kind"])[shown].mean().to_string())
 
     write_outputs_results(args, df.drop(columns=["seed", "latents"]), filename="uc_results.csv", keys=keys,
-                          replace_on=["subject", "method", "top_k", "remove_mode", "remove_scale"],
-                          defaults={"top_k": 1, "remove_mode": "direct",
+                          replace_on=["subject", "method", "top_k", "remove_mode", "remove_scale",
+                                      "auto_gamma_target"],
+                          defaults={"top_k": 1, "remove_mode": "direct", "auto_gamma_target": 0.0,
                                     # rows from before --remove_scale: edits zeroed (0), the unedited model is 1
                                     "remove_scale": lambda old: np.where(old["kind"] == "base", 1.0, 0.0)})
     return df
@@ -1120,7 +1306,7 @@ def save_panels(args, answers: list, var_list: list):
     for (ctype, concept), vs in by_concept.items():
         order = {"none": 0, "random": 2}  # unedited first, random controls last
         vs = sorted(vs, key=lambda v: (order.get(v["method"], 1), v["method"], v["block"], v["kind"],
-                                       v["remove_scale"]))
+                                       v["gamma"] if v["gamma"] is not None else 1.0))
         rows = [a for a in answers if a[ctype] == concept][:args.panel_rows]
         if not rows:
             continue
@@ -1130,7 +1316,7 @@ def save_panels(args, answers: list, var_list: list):
             label = "unedited" if v["kind"] == "base" else \
                 f"{v['method']} {v['kind']}\n{v['block'].replace('_blocks', '').replace('.attentions', '')} " \
                 f"#{','.join(str(i) for i in v['latents'])[:18]} " \
-                f"{'g' if args.remove_mode == 'saeuron' else 'x'}{v['remove_scale']:g}"
+                f"{'g' if args.remove_mode == 'saeuron' else 'x'}{v['gamma']:g}"
             draw.text((c * size + 3, 2), label, fill="black")
             for r, a in enumerate(rows):
                 x, y = c * size, head + r * (size + cap)
@@ -1164,7 +1350,7 @@ def inject_jobs(args, base_entries: list, var_list: list) -> list:
     usable = [e for e in base_entries if e.get("mask_area", 0) > 0]
     jobs = []
     for v in var_list:
-        if v["kind"] == "base" or v["remove_scale"] != remove_scales(args, v)[0]:
+        if v["kind"] == "base" or (not args.auto_gamma and v["remove_scale"] != remove_scales(args, v)[0]):
             continue  # injection doesn't depend on the removal scale: one copy per latent
         pos_mean = v["probe"].get("pos_mean")
         folder = f"latent{v['feature_idx']}"
@@ -1362,6 +1548,8 @@ def main(args):
     random_latents = resolve_random_latents(args, models, block_list)
     var_list = variants(args, features, random_latents, targets, block_list)
     attach_latent_means(args, entries, var_list, block_list)
+    if args.auto_gamma:  # (prepare-only: no learned edits, just gives the random controls gamma 0)
+        run_auto_gamma(args, models, entries, var_list, block_list)
     if not args.disable_answers_generate:
         run_answers_generate(args, models, answers, var_list)
 
