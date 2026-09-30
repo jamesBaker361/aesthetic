@@ -135,14 +135,141 @@ def latent_activation_stats(idx: np.ndarray, val: np.ndarray, labels: np.ndarray
     }
 
 
+def scaled_csr(idx: np.ndarray, val: np.ndarray, n_dirs: int):
+    '''The top-k codes as a (n_patches, n_dirs) CSR matrix, each latent scaled to max 1; also the scales.'''
+    from scipy.sparse import csr_matrix
+    rows, cols, z = _flatten_entries(idx, val)
+    scale = np.zeros(n_dirs)
+    np.maximum.at(scale, cols, z)
+    scale[scale == 0] = 1.0
+    return csr_matrix((z / scale[cols], (rows, cols)), shape=(len(idx), n_dirs)), scale
+
+
+def lasso_select(idx: np.ndarray, val: np.ndarray, labels: np.ndarray, n_dirs: int, k: int,
+                 log_c_range=(-4.0, 2.0), n_search: int = 14) -> dict:
+    '''
+    Joint L1-penalised logistic regression over every latent at once (the
+    sparse codes as a scipy CSR matrix, each latent scaled to max 1 so the
+    penalty treats them alike; liblinear). The penalty C is bisected on a log
+    scale for the strongest penalty that keeps >= k positive-weight latents;
+    the k with the largest weights are returned. Unlike ranking per-latent
+    probes, a latent that only repeats another one's information gets no weight.
+    Returns {"idx": [...], "coef": [...], "C", "n_selected"} (fewer than k
+    latents if even the weakest penalty doesn't give k).
+    '''
+    from sklearn.linear_model import LogisticRegression
+
+    X, scale = scaled_csr(idx, val, n_dirs)
+    y = labels.astype(int)
+
+    import sklearn
+    # sklearn >= 1.8 deprecates penalty= in favour of l1_ratio
+    new_api = tuple(int(x) for x in sklearn.__version__.split(".")[:2]) >= (1, 8)
+    l1 = {"l1_ratio": 1.0} if new_api else {"penalty": "l1"}
+
+    def positive(log_c):
+        # intercept_scaling: liblinear penalises the intercept too - make that negligible
+        m = LogisticRegression(C=10.0 ** log_c, solver="liblinear", intercept_scaling=100.0,
+                               max_iter=500, tol=1e-4, **l1)
+        m.fit(X, y)
+        coef = m.coef_[0]
+        return coef, int((coef > 0).sum())
+
+    lo, hi = log_c_range
+    best_c, (best_coef, n_hi) = hi, positive(hi)
+    if n_hi >= k:
+        for _ in range(n_search):
+            mid = (lo + hi) / 2
+            coef, n = positive(mid)
+            if n >= k:
+                hi, best_c, best_coef = mid, mid, coef
+            else:
+                lo = mid
+    order = [int(j) for j in np.argsort(-best_coef) if best_coef[j] > 0][:k]
+    return {"idx": order, "coef": [float(best_coef[j] / scale[j]) for j in order],
+            "C": float(10.0 ** best_c), "n_selected": int((best_coef > 0).sum())}
+
+
+def smallest_k(idx: np.ndarray, val: np.ndarray, labels: np.ndarray, groups: np.ndarray, n_dirs: int,
+               order: list, frac: float = 0.95, metric: str = "accuracy", test_frac: float = 0.2,
+               seed: int = 0, C: float = 1.0) -> dict:
+    '''
+    Fewest leading latents of `order` (most important first) whose joint
+    logistic regression classifies the patches at least frac x as well as one
+    on EVERY latent. Both are L2 logistic regressions (liblinear, latents
+    scaled to max 1, same C), fit on the patches of ~80% of the images
+    (groups = image id per patch) and scored on the held-out rest. k is found
+    by binary search over 1..len(order), which assumes the score rises with k
+    (every evaluated k is kept in "curve" to check that).
+    Returns {"k", "latents", "full", "target", "score", "curve", "metric"}.
+    '''
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
+
+    score_fn = {"accuracy": accuracy_score, "balanced_accuracy": balanced_accuracy_score,
+                "f1": f1_score}[metric]
+    X, _ = scaled_csr(idx, val, n_dirs)
+    X = X.tocsc()
+    y = labels.astype(int)
+    rng = np.random.default_rng(seed)
+    ids = np.unique(groups)
+    if len(ids) >= 2:
+        test_ids = rng.choice(ids, max(1, int(round(test_frac * len(ids)))), replace=False)
+        test = np.isin(groups, test_ids)
+    else:  # one image: hold out random patches instead
+        test = rng.random(len(y)) < test_frac
+    train = ~test
+
+    def score(cols) -> float:
+        if len(np.unique(y[train])) < 2:
+            return float("nan")
+        Xc = X[:, cols] if cols is not None else X
+        m = LogisticRegression(C=C, solver="liblinear", max_iter=500)
+        m.fit(Xc[train], y[train])
+        return float(score_fn(y[test], m.predict(Xc[test])))
+
+    full = score(None)
+    target = frac * full
+    curve = {}
+
+    def at(k):
+        if k not in curve:
+            curve[k] = score(list(order[:k]))
+        return curve[k]
+
+    lo, hi = 1, len(order)
+    if hi == 0:
+        return {"k": 0, "latents": [], "full": full, "target": target, "score": float("nan"), "curve": {},
+                "metric": metric}
+    if not at(hi) >= target:
+        lo = hi  # even every candidate misses the target: use them all
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if at(mid) >= target:
+            hi = mid
+        else:
+            lo = mid + 1
+    return {"k": lo, "latents": [int(j) for j in order[:lo]], "full": full, "target": target,
+            "score": at(lo), "curve": {str(k): v for k, v in sorted(curve.items())}, "metric": metric}
+
+
 def select_bce_and_f1(idx: np.ndarray, val: np.ndarray, labels: np.ndarray, n_dirs: int,
-                      ridge: float = 1e-8, n_newton_steps: int = 30, top_k: int = 1) -> dict:
+                      ridge: float = 1e-8, n_newton_steps: int = 30, top_k: int = 1,
+                      lasso: bool = False, auto: dict = None) -> dict:
     '''
     Fits every latent's probe once and returns both the lowest-BCE latent
     and the highest-F1 latent, each with its BCE, loss explained, F1,
     precision, recall and activation stats. With top_k > 1 also returns
     "bce_top" / "f1_top": the best top_k latents per rule (the top-1 above,
     then the next best with a positive probe weight, i.e. active ON the mask).
+    With lasso, also "lasso_by_k": {str(top_k): {"top": [describe(j) + its
+    lasso_coef], "C", "n_selected"}} from lasso_select - keyed by k, since
+    the penalty that keeps 3 latents is not the one that keeps 10.
+    With auto = {"rules", "groups", "frac", "metric", "max_k", "seed"}, also
+    "auto": {rule: smallest_k(...) + "top": [describe(j)]}, where each rule
+    orders the latents by importance - "bce": per-latent BCE, "f1": per-latent
+    F1 (both only positive-weight latents), "lasso": lasso_select's weights -
+    and the smallest k reaching frac of the all-latent classifier is kept.
     '''
     w, b, loss = fit_sparse_1d_ridge_logistic(idx, val, labels, n_dirs, ridge, n_newton_steps)
     tp, fp, fn = sparse_per_latent_confusion(idx, val, labels, w, b)
@@ -183,4 +310,22 @@ def select_bce_and_f1(idx: np.ndarray, val: np.ndarray, labels: np.ndarray, n_di
         out["top_k"] = top_k
         out["bce_top"] = [describe(j) for j in top(np.argsort(loss), bce_idx)]
         out["f1_top"] = [describe(j) for j in top(np.argsort(-f1), f1_idx)]
+    if auto:
+        out["auto"] = {}
+        for rule in auto["rules"]:
+            if rule == "bce":
+                order = [int(j) for j in np.argsort(loss) if w[j] > 0 and loss[j] < base]
+            elif rule == "f1":
+                order = [int(j) for j in np.argsort(-f1) if w[j] > 0 and f1[j] > 0]
+            else:
+                order = lasso_select(idx, val, labels, n_dirs, auto["max_k"])["idx"]
+            res = smallest_k(idx, val, labels, auto["groups"], n_dirs, order[:auto["max_k"]],
+                             frac=auto["frac"], metric=auto["metric"], seed=auto["seed"])
+            res["top"] = [describe(j) for j in res["latents"]]
+            out["auto"][rule] = res
+    if lasso:
+        sel = lasso_select(idx, val, labels, n_dirs, top_k)
+        out["lasso_by_k"] = {str(top_k): {
+            "top": [{**describe(j), "lasso_coef": c} for j, c in zip(sel["idx"], sel["coef"])],
+            "C": sel["C"], "n_selected": sel["n_selected"]}}
     return out

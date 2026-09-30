@@ -817,7 +817,7 @@ def write_outputs_results(args, df: pd.DataFrame, filename: str = "results.csv",
     earlier runs are kept unless this run (same out_dir) rescored the same
     replace_on values (e.g. subject + method, so per-method jobs sharing an
     out_dir keep each other's rows). defaults fills columns that rows from
-    older runs don't have (e.g. {"top_k": 1}).
+    older runs don't have (e.g. {"top_k": 1}), or a function of the old rows.
     '''
     keys = list(keys)
     skip = set(keys) | {"feature_idx", "seed", "pos_mean"}
@@ -836,7 +836,7 @@ def write_outputs_results(args, df: pd.DataFrame, filename: str = "results.csv",
         old = pd.read_csv(path)
         for col, value in (defaults or {}).items():
             if col not in old:
-                old[col] = value
+                old[col] = value(old) if callable(value) else value
         replace_on = list(replace_on)
         new_keys = set(map(tuple, table[replace_on].astype(str).values))
         replaced = (old["out_dir"] == args.out_dir) & \
@@ -867,14 +867,20 @@ def save_panels(jobs: list, base_by_name: dict):
 
 # ---------------------------------------------------------------- stage 4
 
-def make_zero_hook(sae, feature_idx: int, mode: str, start_step: int, end_step: int, device):
+def make_zero_hook(sae, feature_idx: int, mode: str, start_step: int, end_step: int, device,
+                   scale=0.0):
     '''
-    Sets one latent to 0 at every patch and leaves everything else as is:
-    encode the block's diff (or output), take that latent's activation, and
-    subtract its decoded contribution (no pre_bias - it's a delta) from the
-    block's output. Patches where the latent wasn't in the top-k are untouched.
+    Sets one latent (or a list of them) to scale x its value at every patch -
+    0 by default, i.e. removed - and leaves everything else as is: encode the
+    block's diff (or output), take the latents' activations, and subtract
+    (1 - scale) x their decoded contribution (no pre_bias - it's a delta) from
+    the block's output. scale is one number or one per latent in feature_idx
+    (e.g. SAeUron's gamma x each latent's mean concept activation); -1 flips
+    a latent, 1 is a no-op. Patches where a latent wasn't in the top-k are
+    untouched.
     '''
     step_counter = {"step": 0}
+    keep = 1.0 - torch.as_tensor(scale, dtype=torch.float32, device=device)  # () or (len(feature_idx),)
 
     def hook_fn(module, input, output):
         step = step_counter["step"]
@@ -885,7 +891,7 @@ def make_zero_hook(sae, feature_idx: int, mode: str, start_step: int, end_step: 
             x = x.permute(0, 2, 3, 1).float()
             latents = sae.encode(x)
             onehot = torch.zeros_like(latents)
-            onehot[..., feature_idx] = latents[..., feature_idx]
+            onehot[..., feature_idx] = latents[..., feature_idx] * keep
             delta = sae.decoder(onehot).permute(0, 3, 1, 2)
             out = (out.float() - delta).to(device=device, dtype=orig_dtype)
             output = (out, *output[1:]) if isinstance(output, tuple) else out
@@ -980,7 +986,8 @@ def run_remove_generate(args, models: Models, jobs: list):
     pipe = models.get_pipe()
     for n, job in enumerate(todo):
         sae = models.get_sae(job["block"])
-        hook = make_zero_hook(sae, job["feature_idx"], args.mode, args.start_step, args.end_step, models.device)
+        hook = make_zero_hook(sae, job["feature_idx"], args.mode, args.start_step, args.end_step, models.device,
+                              scale=job.get("scale", 0.0))
         os.makedirs(os.path.dirname(job["image"]), exist_ok=True)
         save_image(generate(pipe, job["prompt"], job["seed"], args, {f"unet.{job['block']}": hook}), job["image"])
         if n % 200 == 0:

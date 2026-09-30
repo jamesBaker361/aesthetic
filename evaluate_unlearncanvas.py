@@ -85,6 +85,41 @@
 # tables carry top_k and the latent set, and per-run files get a _k{k} tag.
 # Injection (stage 6) adds one latent's direction, so it only runs with k=1.
 #
+# --rules lasso: instead of ranking per-latent probes, fit ONE L1-penalised
+# logistic regression over every latent jointly (sparse_probe.lasso_select;
+# latents scaled to max 1, liblinear) and bisect the penalty for the strongest
+# one that keeps >= --top_k positive-weight latents; the top_k largest weights
+# are zeroed together (kind "lasso"). Redundant latents get no weight, so the
+# set is k different pieces of the mask. Picks are stored per k in the
+# features json ("lasso_by_k"); per-run files get a _lasso tag.
+#
+# --auto_k: instead of a fixed k, per concept x method x block x rule the
+# latents are ordered by importance (the rule: per-latent BCE, per-latent F1,
+# or lasso weight) and a binary search finds the fewest leading ones whose
+# joint logistic regression classifies the mask patches at least
+# --auto_k_frac (0.95) as well as one on every latent (sparse_probe.smallest_k;
+# --auto_k_metric on held-out discovery images, ~20% of them). That set is
+# zeroed; n_latents says how many, probe_score_all_latents / _k_latents the
+# two scores, and the log prints every k the search tried. top_k is 0 in the
+# tables, per-run files get an _auto{frac} tag, no random controls or injection.
+#
+# Removal, as in SAeUron (arXiv:2501.18052, utils/hooks.py): each chosen
+# latent j is set to activation x (gamma x m_j), where m_j is j's mean
+# activation over every patch of the concept's own discovery images (zeros
+# included) and gamma is --remove_scale (the remove_scale column). gamma 0
+# (default) zeroes the latents; negative gamma pushes them the other way, in
+# proportion to how strongly they fire on the concept. Several gammas are a
+# sweep. Unlike SAeUron it applies at every patch where the latent is active
+# (no mask against its mean over other concepts). Images for gamma != 0 go to
+# answers/{block}/latent..._g{gamma}_{concept}/ - m_j depends on the concept.
+#
+# --remove_mode direct: instead, each chosen latent becomes activation x gamma
+# (the same for every concept; images in latent..._x{gamma}/). Both modes
+# zero the latents at gamma 0. The remove_mode column says which was used.
+#
+# --remove_scale_preset saeuron: gamma per concept from SAeUron's Table 5
+# (App. G, p. 18; SAEURON_MULTIPLIERS): objects -5 to -30, styles -1.
+#
 # --n_objects N: only the first N objects of --object_list, for discovery,
 # the answer grid (so IRA is over those N) and the targets. --limit only cuts
 # the targets.
@@ -239,8 +274,10 @@ parser.add_argument("--style_mask_methods", nargs="*", default=["attention", "gr
 parser.add_argument("--frac", type=float, default=0.25,
                     help="top fraction of patches that count as positive for the attention / grad_eclip masks")
 parser.add_argument("--attn_map_size", type=int, default=64, help="grid every cross-attention map is resized to")
-parser.add_argument("--rules", nargs="*", default=["bce", "f1"], choices=["bce", "f1"],
-                    help="which probe rule(s) pick the latent that gets zeroed/injected")
+parser.add_argument("--rules", nargs="*", default=["bce", "f1"], choices=["bce", "f1", "lasso"],
+                    help="which probe rule(s) pick the latent(s) that get zeroed/injected: lowest per-latent "
+                         "BCE, highest per-latent F1, or 'lasso' - the --top_k latents a joint L1 logistic "
+                         "regression over every latent keeps (sparse_probe.lasso_select)")
 parser.add_argument("--negatives", type=str, default="own", choices=["own", "all"],
                     help="'own': negatives are the non-mask patches of the concept's images; "
                          "'all': plus every patch of the discovery images without the concept")
@@ -255,6 +292,26 @@ parser.add_argument("--mode", type=str, default="diff", choices=["diff", "out"])
 parser.add_argument("--bce_ridge", type=float, default=1e-8)
 parser.add_argument("--bce_newton_steps", type=int, default=30)
 parser.add_argument("--n_random_controls", type=int, default=1)
+parser.add_argument("--auto_k", action="store_true",
+                    help="per concept x method x block x rule, the fewest most-important latents whose joint "
+                         "classifier reaches --auto_k_frac of the all-latent one (binary search; overrides --top_k)")
+parser.add_argument("--auto_k_frac", type=float, default=0.95)
+parser.add_argument("--auto_k_max", type=int, default=64, help="most latents the search may keep")
+parser.add_argument("--auto_k_metric", type=str, default="accuracy",
+                    choices=["accuracy", "balanced_accuracy", "f1"],
+                    help="held-out patch classification score the search compares")
+parser.add_argument("--remove_scale", nargs="*", type=float, default=[0.0],
+                    help="gamma: removal sets each chosen latent to activation x (gamma x its mean activation on "
+                         "the concept), as SAeUron does. 0 = zero it (default); negative = push it the other way. "
+                         "Several values = a sweep, each scored separately (the remove_scale column)")
+parser.add_argument("--remove_mode", type=str, default="saeuron", choices=["saeuron", "direct"],
+                    help="how gamma (--remove_scale) is applied to each chosen latent: 'saeuron' = activation x "
+                         "(gamma x the latent's mean activation on the concept), as SAeUron; 'direct' = "
+                         "activation x gamma. Identical for gamma 0")
+parser.add_argument("--remove_scale_preset", type=str, default="none", choices=["none", "saeuron"],
+                    help="saeuron: each concept's gamma is its multiplier from SAeUron's Table 5 "
+                         "(arXiv:2501.18052, App. G, p.18; SAEURON_MULTIPLIERS) - objects -5 to -30, styles -1 - "
+                         "instead of --remove_scale")
 parser.add_argument("--top_k", type=int, default=1,
                     help="zero each concept's best k latents per method x block x rule together (and k random "
                          "latents per block as the control). Injection (stage 6) only runs with top_k 1")
@@ -597,7 +654,63 @@ def patch_labels(args, e: dict, ctype: str, concept: str, method: str, gh: int, 
 def run_tag(args) -> str:
     '''Mask methods of this run, so per-method jobs sharing an out_dir write separate tables.'''
     tag = "_".join(sorted(set(args.object_mask_methods) | set(args.style_mask_methods)))
+    if "lasso" in args.rules:
+        tag += "_lasso"
+    mode = "g" if args.remove_mode == "saeuron" else "x"  # g = gamma x mean activation, x = direct
+    if args.remove_scale_preset != "none":
+        tag += f"_{mode}{args.remove_scale_preset}"
+    elif args.remove_scale != [0.0]:
+        tag += f"_{mode}" + "_".join(f"{x:g}" for x in args.remove_scale)
+    if args.auto_k:
+        return f"{tag}_auto{args.auto_k_frac:g}"
     return tag if args.top_k == 1 else f"{tag}_k{args.top_k}"
+
+
+# SAeUron (Cywiński & Deja, arXiv:2501.18052) Table 5, Appendix G (p. 18): per-object multiplier
+# gamma_c (their number of selected features tau_c is in the comments). Styles: tau_c = 1, gamma_c = -1.
+# Applied like SAeUron: latent * (gamma_c * the latent's mean activation on the concept) - see
+# attach_latent_means - but at every active patch (SAeUron masks to patches above the all-concept mean).
+SAEURON_MULTIPLIERS = {
+    "Architectures": -20.0,  # tau 20
+    "Bears": -30.0,          # tau 10
+    "Birds": -10.0,          # tau 20
+    "Butterfly": -15.0,      # tau 3
+    "Cats": -15.0,           # tau 1
+    "Dogs": -20.0,           # tau 2
+    "Fishes": -30.0,         # tau 2
+    "Flame": -25.0,          # tau 3
+    "Flowers": -20.0,        # tau 20
+    "Frogs": -5.0,           # tau 5
+    "Horses": -25.0,         # tau 25
+    "Human": -20.0,          # tau 25
+    "Jellyfish": -15.0,      # tau 25
+    "Rabbits": -30.0,        # tau 4
+    "Sandwiches": -15.0,     # tau 20
+    "Sea": -30.0,            # tau 15
+    "Statues": -30.0,        # tau 20
+    "Towers": -20.0,         # tau 25
+    "Trees": -25.0,          # tau 30
+    "Waterfalls": -30.0,     # tau 30
+}
+SAEURON_STYLE_MULTIPLIER = -1.0
+
+
+def remove_scales(args, v: dict) -> list:
+    '''The removal scale(s) an edit of this concept is generated with.'''
+    if args.remove_scale_preset == "saeuron":
+        if v["concept_type"] == "style":
+            return [SAEURON_STYLE_MULTIPLIER]
+        return [SAEURON_MULTIPLIERS[v["subject"]]]
+    return list(args.remove_scale)
+
+
+def auto_key(args) -> str:
+    '''The auto-k results in a features json are keyed by the search settings.'''
+    return f"{args.auto_k_metric}_{args.auto_k_frac:g}_max{args.auto_k_max}"
+
+
+def auto_rules(args) -> list:
+    return [r for r in ["bce", "f1", "lasso"] if r in args.rules]
 
 
 def features_path(args, concept: str, method: str) -> str:
@@ -636,7 +749,12 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
     for block in block_list:
         todo = [(t, c, m) for t, c in targets for m in concept_methods(args, t)
                 if block not in features[c]["methods"].get(m, {})
-                or features[c]["methods"][m][block].get("top_k", 1) < args.top_k]
+                or features[c]["methods"][m][block].get("top_k", 1) < args.top_k
+                or (not args.auto_k and "lasso" in args.rules
+                    and str(args.top_k) not in features[c]["methods"][m][block].get("lasso_by_k", {}))
+                or (args.auto_k and not all(
+                    r in features[c]["methods"][m][block].get("auto_by_key", {}).get(auto_key(args), {})
+                    for r in auto_rules(args)))]
         if not todo:
             continue
         idx_all, val_all, owner, (gh, gw), n_dirs = load_block_codes(entries, block)
@@ -651,13 +769,33 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
             if n_pos == 0 or n_pos == len(labels):
                 print(f"  skipped {ctype} '{concept}' ({method}) @ {block}: no positive/negative contrast")
                 continue
+            auto = None
+            if args.auto_k:
+                auto = {"rules": auto_rules(args), "groups": owner[rows], "frac": args.auto_k_frac,
+                        "metric": args.auto_k_metric, "max_k": args.auto_k_max, "seed": args.seed}
             result = select_bce_and_f1(idx_all[rows], val_all[rows], labels, n_dirs,
-                                       args.bce_ridge, args.bce_newton_steps, top_k=args.top_k)
+                                       args.bce_ridge, args.bce_newton_steps, top_k=args.top_k,
+                                       lasso="lasso" in args.rules and not args.auto_k, auto=auto)
             result["n_images"] = len(own)
+            # keep lasso picks for other k, and auto-k searches with other settings, from earlier runs
+            old = features[concept]["methods"].get(method, {}).get(block, {})
+            result["lasso_by_k"] = {**old.get("lasso_by_k", {}), **result.get("lasso_by_k", {})}
+            result["auto_by_key"] = old.get("auto_by_key", {})
+            if auto:
+                result["auto_by_key"][auto_key(args)] = {
+                    **result["auto_by_key"].get(auto_key(args), {}), **result.pop("auto")}
+            if result.get("top_k", 1) < old.get("top_k", 1):
+                result.update({k: old[k] for k in ["top_k", "bce_top", "f1_top"] if k in old})
             features[concept]["methods"].setdefault(method, {})[block] = result
             print(f"{ctype} '{concept}' ({method}) @ {block}: bce latent {result['bce']['idx']} "
                   f"(bce={result['bce']['bce']:.4f}, explained={result['bce']['loss_explained']:.3f}) | "
-                  f"f1 latent {result['f1']['idx']} (f1={result['f1']['f1']:.3f})")
+                  f"f1 latent {result['f1']['idx']} (f1={result['f1']['f1']:.3f})"
+                  + (f" | lasso latents {[d['idx'] for d in result['lasso_by_k'][str(args.top_k)]['top']]}"
+                     if "lasso" in args.rules and not args.auto_k else ""))
+            if args.auto_k:
+                for rule, a in result["auto_by_key"][auto_key(args)].items():
+                    print(f"    auto-k {rule}: k={a['k']} ({a['metric']} {a['score']:.3f} vs all latents "
+                          f"{a['full']:.3f}, target {a['target']:.3f}) curve {a['curve']}")
         for ctype, concept, method in todo:
             save_json(features_path(args, concept, method), features[concept]["methods"].get(method, {}))
     return features
@@ -672,10 +810,40 @@ def answer_entries(args) -> list:
             for s in args.eval_styles for o in args.eval_objects for seed in args.eval_seeds]
 
 
-def latent_dir(args, block: str, latents: list) -> str:
-    # one latent keeps the old "latent{idx}" folder, so earlier top-1 images are reused
+def latent_dir(args, block: str, latents: list, gamma: float = 0.0, concept: str = None) -> str:
+    # one latent keeps the old "latent{idx}" folder, so earlier top-1 images are reused. gamma 0 zeroes the
+    # latents in either mode, whatever the concept (no suffix, shared). direct: the scale is gamma itself
+    # (shared across concepts); saeuron: gamma x the concept's mean activation, so per concept
     name = f"latent{latents[0]}" if len(latents) == 1 else "latents" + "_".join(str(i) for i in sorted(latents))
+    if gamma != 0.0 and args.remove_mode == "direct":
+        name += f"_x{gamma:g}"
+    elif gamma != 0.0:
+        name += f"_g{gamma:g}_{safe(concept)}"
     return os.path.join(args.cache_dir, "answers", safe(block.replace(".", "_")), name)
+
+
+def attach_latent_means(args, entries: list, var_list: list, block_list: list):
+    '''
+    v["latent_means"]: each latent's mean activation over every patch of the
+    concept's own discovery images (SAeUron's avg_acts), for the edits with
+    gamma != 0. Uses the cached top-k codes, one block at a time.
+    '''
+    if args.remove_mode != "saeuron":
+        return  # direct: the scale doesn't depend on the latent's activations
+    todo = [v for v in var_list if v["kind"] != "base" and v["remove_scale"] != 0.0]
+    for block in block_list:
+        here = [v for v in todo if v["block"] == block]
+        if not here:
+            continue
+        idx_all, val_all, owner, _, _ = load_block_codes(entries, block)
+        for v in here:
+            rows = np.isin(owner, concept_entries(args, entries, v["concept_type"], v["subject"]))
+            idx, val = idx_all[rows], val_all[rows]
+            v["latent_means"] = [float(np.where(idx == j, val, 0.0).sum(axis=1).mean()) for j in v["latents"]]
+    for v in todo:
+        means = ", ".join(f"{j}:{m:.3g}" for j, m in zip(v["latents"], v["latent_means"]))
+        print(f"  {v['subject']} {v['method']} {v['kind']} @ {v['block']} gamma {v['remove_scale']:g}: "
+              f"mean activations {means}")
 
 
 def resolve_random_latents(args, models: UCModels, block_list: list) -> dict:
@@ -716,30 +884,59 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
                 info = per_block.get(block)
                 if info is None:
                     continue
+                if args.auto_k:
+                    found = info.get("auto_by_key", {}).get(auto_key(args), {})
+                    found = {r: a for r, a in found.items() if r in args.rules and a["latents"]}
+                    same = "bce" in found and "f1" in found and sorted(found["bce"]["latents"]) == sorted(found["f1"]["latents"])
+                    rules = (["bce+f1"] if same else []) + [r for r in found if not (same and r in ("bce", "f1"))]
+                    for rule in rules:
+                        a = found["bce" if rule == "bce+f1" else rule]
+                        out.append({**common, "method": method, "block": block, "kind": rule,
+                                    "feature_idx": a["latents"][0], "latents": a["latents"], "probe": a["top"][0],
+                                    "auto": {"full": a["full"], "score": a["score"], "k": a["k"]}})
+                    continue
                 if args.top_k == 1:
                     picks = {r: [info[r]["idx"]] for r in ["bce", "f1"]}
                 else:
                     picks = {r: [d["idx"] for d in info[f"{r}_top"][:args.top_k]] for r in ["bce", "f1"]}
                 same = sorted(picks["bce"]) == sorted(picks["f1"])
-                rules = ["bce+f1"] if same else [r for r in ["bce", "f1"] if r in args.rules]
+                ranked = [r for r in ["bce", "f1"] if r in args.rules]
+                rules = (["bce+f1"] if same else ranked) if ranked else []
                 for rule in rules:
                     key = "f1" if rule == "f1" else "bce"
                     chosen = info[key]  # top-1: its probe stats go in the tables
                     out.append({**common, "method": method, "block": block, "kind": rule,
                                 "feature_idx": chosen["idx"], "latents": picks[key], "probe": chosen})
-        for block in block_list:
+                lasso = info.get("lasso_by_k", {}).get(str(args.top_k), {}).get("top", [])
+                if "lasso" in args.rules and lasso:
+                    out.append({**common, "method": method, "block": block, "kind": "lasso",
+                                "feature_idx": lasso[0]["idx"], "latents": [d["idx"] for d in lasso],
+                                "probe": lasso[0]})
+        for block in block_list if not args.auto_k else []:  # auto-k: k differs per variant, no random match
             for r in range(args.n_random_controls):
                 key = f"{block}__random{r}" + ("" if args.top_k == 1 else f"__k{args.top_k}")
                 latents = random_latents[key] if args.top_k > 1 else [random_latents[key]]
                 out.append({**common, "method": "random", "block": block, "kind": f"random{r}",
                             "feature_idx": latents[0], "latents": latents, "probe": {}})
+    if args.auto_k and args.n_random_controls:
+        print("--auto_k: no random controls (each variant keeps a different number of latents)")
     for v in out:
-        v["top_k"] = args.top_k
-    return out
+        v["top_k"] = 0 if args.auto_k else args.top_k  # 0 = auto; n_latents has the actual count
+        v["remove_mode"] = args.remove_mode
+    # one copy of every edit per --remove_scale; the unedited model is scale 1
+    scaled = []
+    for v in out:
+        if v["kind"] == "base":
+            scaled.append({**v, "remove_scale": 1.0})
+        else:
+            scaled += [{**v, "remove_scale": scale} for scale in remove_scales(args, v)]
+    return scaled
 
 
 def variant_image(args, v: dict, a: dict) -> str:
-    return a["image"] if v["kind"] == "base" else os.path.join(latent_dir(args, v["block"], v["latents"]), a["file"])
+    if v["kind"] == "base":
+        return a["image"]
+    return os.path.join(latent_dir(args, v["block"], v["latents"], v["remove_scale"], v["subject"]), a["file"])
 
 
 def is_target(v: dict, a: dict) -> bool:
@@ -770,11 +967,19 @@ def run_answers_generate(args, models: UCModels, answers: list, var_list: list):
             continue
         for a in scored_answers(args, v, answers):
             path = variant_image(args, v, a)
-            # make_zero_hook zeroes a list of latents as well as one
-            jobs[path] = {"block": v["block"], "feature_idx": list(v["latents"]), "prompt": a["prompt"],
-                          "seed": a["seed"], "image": path}
-    n_sets = len({(j["block"], tuple(j["feature_idx"])) for j in jobs.values()})
-    print(f"answers: {len(jobs)} zeroed-latent images over {n_sets} distinct latent sets (top_k={args.top_k})")
+            # make_zero_hook scales a list of latents as well as one
+            # saeuron: each latent -> activation x (gamma x its mean activation on the concept);
+            # direct: activation x gamma
+            if v["remove_scale"] != 0.0 and args.remove_mode == "saeuron":
+                scale = [v["remove_scale"] * m for m in v["latent_means"]]
+            else:
+                scale = v["remove_scale"]
+            jobs[path] = {"block": v["block"], "feature_idx": list(v["latents"]), "scale": scale,
+                          "prompt": a["prompt"], "seed": a["seed"], "image": path}
+    n_sets = len({(j["block"], tuple(j["feature_idx"]), str(j["scale"])) for j in jobs.values()})
+    print(f"answers: {len(jobs)} edited images over {n_sets} distinct latent sets x scales "
+          f"(top_k={args.top_k}, remove_scale="
+          f"{args.remove_scale if args.remove_scale_preset == 'none' else args.remove_scale_preset})")
     run_remove_generate(args, models, list(jobs.values()))
 
 
@@ -819,11 +1024,15 @@ def build_results(args, answers: list, var_list: list):
             row = {
                 "subject": concept, "concept_type": ctype, "method": v["method"], "block": v["block"],
                 "kind": v["kind"], "feature_idx": v["feature_idx"], "top_k": v["top_k"],
+                "remove_mode": v["remove_mode"],
                 "latents": ";".join(str(i) for i in v["latents"]),
                 "object": a["object"], "style": a["style"], "seed": a["seed"], "image": path,
                 "is_target": float(target),
                 "probe_bce": v["probe"].get("bce"), "probe_loss_explained": v["probe"].get("loss_explained"),
                 "probe_f1": v["probe"].get("f1"),
+                "n_latents": len(v["latents"]),
+                "probe_score_all_latents": v.get("auto", {}).get("full"),
+                "probe_score_k_latents": v.get("auto", {}).get("score"),
             }
             uc = load_uc(path) if not args.disable_uc else None
             if uc is not None and uc.get("model") == uc_model_id(args):
@@ -860,10 +1069,11 @@ def build_results(args, answers: list, var_list: list):
         return df
     df.to_csv(os.path.join(args.out_dir, f"uc_results_{run_tag(args)}.csv.gz"), index=False)
 
-    keys = ["subject", "concept_type", "method", "block", "kind", "top_k"]
+    keys = ["subject", "concept_type", "method", "block", "kind", "top_k", "remove_mode", "remove_scale"]
     metrics = ["UA", "IRA", "CRA", "CRA_target", "p_target", "style_acc", "object_acc", "sam_removed", "sam_score", "sam_area",
                "vqa", "clip", "psnr_target", "psnr_retain",
-               "probe_bce", "probe_loss_explained", "probe_f1"]
+               "probe_bce", "probe_loss_explained", "probe_f1",
+               "n_latents", "probe_score_all_latents", "probe_score_k_latents"]
     metrics = [m for m in metrics if m in df]
     for m in metrics:
         df[m] = pd.to_numeric(df[m].replace([np.inf], np.nan), errors="coerce")
@@ -886,7 +1096,10 @@ def build_results(args, answers: list, var_list: list):
     print(summary.groupby(["concept_type", "method", "kind"])[shown].mean().to_string())
 
     write_outputs_results(args, df.drop(columns=["seed", "latents"]), filename="uc_results.csv", keys=keys,
-                          replace_on=["subject", "method", "top_k"], defaults={"top_k": 1})
+                          replace_on=["subject", "method", "top_k", "remove_mode", "remove_scale"],
+                          defaults={"top_k": 1, "remove_mode": "direct",
+                                    # rows from before --remove_scale: edits zeroed (0), the unedited model is 1
+                                    "remove_scale": lambda old: np.where(old["kind"] == "base", 1.0, 0.0)})
     return df
 
 
@@ -906,7 +1119,8 @@ def save_panels(args, answers: list, var_list: list):
         by_concept.setdefault((v["concept_type"], v["subject"]), []).append(v)
     for (ctype, concept), vs in by_concept.items():
         order = {"none": 0, "random": 2}  # unedited first, random controls last
-        vs = sorted(vs, key=lambda v: (order.get(v["method"], 1), v["method"], v["block"], v["kind"]))
+        vs = sorted(vs, key=lambda v: (order.get(v["method"], 1), v["method"], v["block"], v["kind"],
+                                       v["remove_scale"]))
         rows = [a for a in answers if a[ctype] == concept][:args.panel_rows]
         if not rows:
             continue
@@ -915,7 +1129,8 @@ def save_panels(args, answers: list, var_list: list):
         for c, v in enumerate(vs):
             label = "unedited" if v["kind"] == "base" else \
                 f"{v['method']} {v['kind']}\n{v['block'].replace('_blocks', '').replace('.attentions', '')} " \
-                f"#{','.join(str(i) for i in v['latents'])[:24]}"
+                f"#{','.join(str(i) for i in v['latents'])[:18]} " \
+                f"{'g' if args.remove_mode == 'saeuron' else 'x'}{v['remove_scale']:g}"
             draw.text((c * size + 3, 2), label, fill="black")
             for r, a in enumerate(rows):
                 x, y = c * size, head + r * (size + cap)
@@ -949,8 +1164,8 @@ def inject_jobs(args, base_entries: list, var_list: list) -> list:
     usable = [e for e in base_entries if e.get("mask_area", 0) > 0]
     jobs = []
     for v in var_list:
-        if v["kind"] == "base":
-            continue
+        if v["kind"] == "base" or v["remove_scale"] != remove_scales(args, v)[0]:
+            continue  # injection doesn't depend on the removal scale: one copy per latent
         pos_mean = v["probe"].get("pos_mean")
         folder = f"latent{v['feature_idx']}"
         if args.inject_value == "pos_mean" and pos_mean is not None:
@@ -1146,6 +1361,7 @@ def main(args):
     answers = answer_entries(args)
     random_latents = resolve_random_latents(args, models, block_list)
     var_list = variants(args, features, random_latents, targets, block_list)
+    attach_latent_means(args, entries, var_list, block_list)
     if not args.disable_answers_generate:
         run_answers_generate(args, models, answers, var_list)
 
@@ -1158,8 +1374,9 @@ def main(args):
         save_panels(args, answers, var_list)
 
     # stage 6
-    if not args.disable_inject and args.top_k > 1:
-        print(f"skipping injection (stage 6): it adds one latent's direction, and --top_k is {args.top_k}")
+    if not args.disable_inject and (args.top_k > 1 or args.auto_k):
+        print(f"skipping injection (stage 6): it adds one latent's direction, and this run zeroes sets "
+              f"(--top_k {args.top_k}, --auto_k {args.auto_k})")
     elif not args.disable_inject:
         # run_base writes {out_dir}/base - point it at the shared cache
         cache_args = argparse.Namespace(**{**vars(args), "out_dir": args.cache_dir})
