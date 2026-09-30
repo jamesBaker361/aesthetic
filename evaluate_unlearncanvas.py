@@ -78,6 +78,21 @@
 #   Rows -> {out_dir}/inject_results_{methods}.csv, means ->
 #   {out_dir}/inject_summary_{methods}.csv and {outputs_dir}/uc_inject_results.csv.
 #
+# --top_k k: the probe keeps each rule's best k latents (the top-1, then the
+# next best with a positive probe weight) and stage 4 zeroes all k together,
+# with k random latents per block as the control. Images go to
+# answers/{block}/latents{a}_{b}_.../ (k=1 keeps answers/{block}/latent{idx}/),
+# tables carry top_k and the latent set, and per-run files get a _k{k} tag.
+# Injection (stage 6) adds one latent's direction, so it only runs with k=1.
+#
+# --n_objects N: only the first N objects of --object_list, for discovery,
+# the answer grid (so IRA is over those N) and the targets. --limit only cuts
+# the targets.
+#
+# Panels: {out_dir}/panels/{concept}_{methods}.jpg - the first --panel_rows
+# target prompts x every variant (unedited, each method/block/rule, random),
+# captioned with the classifiers' object / style predictions.
+#
 # Every pass skips work whose output already exists, so it can be rerun or
 # sharded with --target_objects / --target_styles.
 #
@@ -156,7 +171,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.argprint import print_args
@@ -188,6 +203,8 @@ STYLES = [t for t in THEMES if t != "Seed_Images"]
 parser = default_parser({"repo_id": "jlbaker361/nsfw"})
 
 parser.add_argument("--object_list", nargs="*", default=None, help="UnlearnCanvas objects used (default: all 20)")
+parser.add_argument("--n_objects", type=int, default=0,
+                    help="only the first N of --object_list (0 = all): discovery, the answer grid and the targets")
 parser.add_argument("--style_list", nargs="*", default=None, help="UnlearnCanvas styles used (default: all 50)")
 parser.add_argument("--target_objects", nargs="*", default=None,
                     help="objects to unlearn (default: --object_list); pass nothing after the flag for none")
@@ -238,6 +255,9 @@ parser.add_argument("--mode", type=str, default="diff", choices=["diff", "out"])
 parser.add_argument("--bce_ridge", type=float, default=1e-8)
 parser.add_argument("--bce_newton_steps", type=int, default=30)
 parser.add_argument("--n_random_controls", type=int, default=1)
+parser.add_argument("--top_k", type=int, default=1,
+                    help="zero each concept's best k latents per method x block x rule together (and k random "
+                         "latents per block as the control). Injection (stage 6) only runs with top_k 1")
 parser.add_argument("--seed", type=int, default=0, help="picks the random control latents")
 parser.add_argument("--start_step", type=int, default=0)
 parser.add_argument("--end_step", type=int, default=1000)
@@ -257,13 +277,15 @@ parser.add_argument("--score_batch_size", type=int, default=16)
 parser.add_argument("--base_prompt_file", type=str, default="prompt_dir/base_prompts.txt")
 parser.add_argument("--base_subject_file", type=str, default="prompt_dir/base_subjects.txt")
 parser.add_argument("--placeholder", type=str, default="<sks>")
+parser.add_argument("--panel_rows", type=int, default=6, help="target prompts (rows) per concept panel")
+parser.add_argument("--panel_size", type=int, default=160, help="side of each panel cell in pixels")
 parser.add_argument("--strength_list", nargs="*", type=float, default=[10.0])
 parser.add_argument("--inject_value", type=str, default="checkpoint_mean", choices=["checkpoint_mean", "pos_mean"],
                     help="activation placed on the latent before * strength: the SAE checkpoint's mean.pt "
                          "or its mean over the concept's positive discovery patches")
 
 for flag in ["discover_generate", "sparsify", "masks", "probe", "answers_generate", "answer_masks",
-             "uc", "vqa", "clip", "psnr", "summary",
+             "uc", "vqa", "clip", "psnr", "summary", "panels",
              "inject", "base", "inject_generate", "inject_masks", "inject_summary"]:
     parser.add_argument(f"--disable_{flag}", action="store_true")
 
@@ -574,7 +596,8 @@ def patch_labels(args, e: dict, ctype: str, concept: str, method: str, gh: int, 
 
 def run_tag(args) -> str:
     '''Mask methods of this run, so per-method jobs sharing an out_dir write separate tables.'''
-    return "_".join(sorted(set(args.object_mask_methods) | set(args.style_mask_methods)))
+    tag = "_".join(sorted(set(args.object_mask_methods) | set(args.style_mask_methods)))
+    return tag if args.top_k == 1 else f"{tag}_k{args.top_k}"
 
 
 def features_path(args, concept: str, method: str) -> str:
@@ -612,7 +635,8 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
 
     for block in block_list:
         todo = [(t, c, m) for t, c in targets for m in concept_methods(args, t)
-                if block not in features[c]["methods"].get(m, {})]
+                if block not in features[c]["methods"].get(m, {})
+                or features[c]["methods"][m][block].get("top_k", 1) < args.top_k]
         if not todo:
             continue
         idx_all, val_all, owner, (gh, gw), n_dirs = load_block_codes(entries, block)
@@ -628,7 +652,7 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
                 print(f"  skipped {ctype} '{concept}' ({method}) @ {block}: no positive/negative contrast")
                 continue
             result = select_bce_and_f1(idx_all[rows], val_all[rows], labels, n_dirs,
-                                       args.bce_ridge, args.bce_newton_steps)
+                                       args.bce_ridge, args.bce_newton_steps, top_k=args.top_k)
             result["n_images"] = len(own)
             features[concept]["methods"].setdefault(method, {})[block] = result
             print(f"{ctype} '{concept}' ({method}) @ {block}: bce latent {result['bce']['idx']} "
@@ -648,8 +672,10 @@ def answer_entries(args) -> list:
             for s in args.eval_styles for o in args.eval_objects for seed in args.eval_seeds]
 
 
-def latent_dir(args, block: str, idx: int) -> str:
-    return os.path.join(args.cache_dir, "answers", safe(block.replace(".", "_")), f"latent{idx}")
+def latent_dir(args, block: str, latents: list) -> str:
+    # one latent keeps the old "latent{idx}" folder, so earlier top-1 images are reused
+    name = f"latent{latents[0]}" if len(latents) == 1 else "latents" + "_".join(str(i) for i in sorted(latents))
+    return os.path.join(args.cache_dir, "answers", safe(block.replace(".", "_")), name)
 
 
 def resolve_random_latents(args, models: UCModels, block_list: list) -> dict:
@@ -661,6 +687,12 @@ def resolve_random_latents(args, models: UCModels, block_list: list) -> dict:
             key = f"{block}__random{r}"
             if key not in chosen:
                 chosen[key] = int(rng.integers(models.get_sae(block).n_dirs))
+            if args.top_k > 1 and f"{key}__k{args.top_k}" not in chosen:
+                # the top-1 random latent plus k-1 more, so k random latents per block
+                n_dirs = models.get_sae(block).n_dirs
+                pool = np.setdiff1d(np.arange(n_dirs), [chosen[key]])
+                extra = np.random.default_rng([args.seed, r, args.top_k]).choice(pool, args.top_k - 1, replace=False)
+                chosen[f"{key}__k{args.top_k}"] = [chosen[key]] + [int(i) for i in extra]
     os.makedirs(args.cache_dir, exist_ok=True)
     save_json(path, chosen)
     return chosen
@@ -676,7 +708,7 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
     for ctype, concept in targets:
         common = {"subject": concept, "concept_type": ctype}
         out.append({**common, "method": "none", "block": "none", "kind": "base", "feature_idx": None,
-                    "probe": {}})
+                    "latents": [], "probe": {}})
         for method, per_block in features.get(concept, {}).get("methods", {}).items():
             if method not in concept_methods(args, ctype):
                 continue  # only the mask methods this run was asked to test
@@ -684,20 +716,30 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
                 info = per_block.get(block)
                 if info is None:
                     continue
-                rules = ["bce+f1"] if info["same_feature"] else [r for r in ["bce", "f1"] if r in args.rules]
+                if args.top_k == 1:
+                    picks = {r: [info[r]["idx"]] for r in ["bce", "f1"]}
+                else:
+                    picks = {r: [d["idx"] for d in info[f"{r}_top"][:args.top_k]] for r in ["bce", "f1"]}
+                same = sorted(picks["bce"]) == sorted(picks["f1"])
+                rules = ["bce+f1"] if same else [r for r in ["bce", "f1"] if r in args.rules]
                 for rule in rules:
-                    chosen = info["f1" if rule == "f1" else "bce"]
+                    key = "f1" if rule == "f1" else "bce"
+                    chosen = info[key]  # top-1: its probe stats go in the tables
                     out.append({**common, "method": method, "block": block, "kind": rule,
-                                "feature_idx": chosen["idx"], "probe": chosen})
+                                "feature_idx": chosen["idx"], "latents": picks[key], "probe": chosen})
         for block in block_list:
             for r in range(args.n_random_controls):
+                key = f"{block}__random{r}" + ("" if args.top_k == 1 else f"__k{args.top_k}")
+                latents = random_latents[key] if args.top_k > 1 else [random_latents[key]]
                 out.append({**common, "method": "random", "block": block, "kind": f"random{r}",
-                            "feature_idx": random_latents[f"{block}__random{r}"], "probe": {}})
+                            "feature_idx": latents[0], "latents": latents, "probe": {}})
+    for v in out:
+        v["top_k"] = args.top_k
     return out
 
 
 def variant_image(args, v: dict, a: dict) -> str:
-    return a["image"] if v["kind"] == "base" else os.path.join(latent_dir(args, v["block"], v["feature_idx"]), a["file"])
+    return a["image"] if v["kind"] == "base" else os.path.join(latent_dir(args, v["block"], v["latents"]), a["file"])
 
 
 def is_target(v: dict, a: dict) -> bool:
@@ -728,10 +770,11 @@ def run_answers_generate(args, models: UCModels, answers: list, var_list: list):
             continue
         for a in scored_answers(args, v, answers):
             path = variant_image(args, v, a)
-            jobs[path] = {"block": v["block"], "feature_idx": v["feature_idx"], "prompt": a["prompt"],
+            # make_zero_hook zeroes a list of latents as well as one
+            jobs[path] = {"block": v["block"], "feature_idx": list(v["latents"]), "prompt": a["prompt"],
                           "seed": a["seed"], "image": path}
-    n_latents = len({(j["block"], j["feature_idx"]) for j in jobs.values()})
-    print(f"answers: {len(jobs)} zeroed-latent images over {n_latents} distinct latents")
+    n_sets = len({(j["block"], tuple(j["feature_idx"])) for j in jobs.values()})
+    print(f"answers: {len(jobs)} zeroed-latent images over {n_sets} distinct latent sets (top_k={args.top_k})")
     run_remove_generate(args, models, list(jobs.values()))
 
 
@@ -775,7 +818,8 @@ def build_results(args, answers: list, var_list: list):
             target = is_target(v, a)
             row = {
                 "subject": concept, "concept_type": ctype, "method": v["method"], "block": v["block"],
-                "kind": v["kind"], "feature_idx": v["feature_idx"],
+                "kind": v["kind"], "feature_idx": v["feature_idx"], "top_k": v["top_k"],
+                "latents": ";".join(str(i) for i in v["latents"]),
                 "object": a["object"], "style": a["style"], "seed": a["seed"], "image": path,
                 "is_target": float(target),
                 "probe_bce": v["probe"].get("bce"), "probe_loss_explained": v["probe"].get("loss_explained"),
@@ -816,7 +860,7 @@ def build_results(args, answers: list, var_list: list):
         return df
     df.to_csv(os.path.join(args.out_dir, f"uc_results_{run_tag(args)}.csv.gz"), index=False)
 
-    keys = ["subject", "concept_type", "method", "block", "kind"]
+    keys = ["subject", "concept_type", "method", "block", "kind", "top_k"]
     metrics = ["UA", "IRA", "CRA", "CRA_target", "p_target", "style_acc", "object_acc", "sam_removed", "sam_score", "sam_area",
                "vqa", "clip", "psnr_target", "psnr_retain",
                "probe_bce", "probe_loss_explained", "probe_f1"]
@@ -827,6 +871,7 @@ def build_results(args, answers: list, var_list: list):
     grouped = df.groupby(keys)
     summary = grouped[metrics].mean()
     summary.insert(0, "n_images", grouped.size())
+    summary.insert(0, "latents", grouped["latents"].first())
     summary.insert(0, "feature_idx", grouped["feature_idx"].first())
     summary = summary.reset_index()
 
@@ -840,9 +885,56 @@ def build_results(args, answers: list, var_list: list):
              if m in summary and summary[m].notna().any()]
     print(summary.groupby(["concept_type", "method", "kind"])[shown].mean().to_string())
 
-    write_outputs_results(args, df.drop(columns=["seed"]), filename="uc_results.csv", keys=keys,
-                          replace_on=["subject", "method"])
+    write_outputs_results(args, df.drop(columns=["seed", "latents"]), filename="uc_results.csv", keys=keys,
+                          replace_on=["subject", "method", "top_k"], defaults={"top_k": 1})
     return df
+
+
+def save_panels(args, answers: list, var_list: list):
+    '''
+    {out_dir}/panels/{concept}_{methods}.jpg: one row per target prompt (first
+    --panel_rows), one column per variant - unedited, then each mask method x
+    block x rule, then the random controls. Every cell is captioned with the
+    UnlearnCanvas classifiers' object / style prediction (red = the removed
+    concept is still predicted). Only uses images already in the cache.
+    '''
+    d = os.path.join(args.out_dir, "panels")
+    os.makedirs(d, exist_ok=True)
+    size, head, cap = args.panel_size, 34, 14
+    by_concept = {}
+    for v in var_list:
+        by_concept.setdefault((v["concept_type"], v["subject"]), []).append(v)
+    for (ctype, concept), vs in by_concept.items():
+        order = {"none": 0, "random": 2}  # unedited first, random controls last
+        vs = sorted(vs, key=lambda v: (order.get(v["method"], 1), v["method"], v["block"], v["kind"]))
+        rows = [a for a in answers if a[ctype] == concept][:args.panel_rows]
+        if not rows:
+            continue
+        grid = Image.new("RGB", (size * len(vs), head + (size + cap) * len(rows)), "white")
+        draw = ImageDraw.Draw(grid)
+        for c, v in enumerate(vs):
+            label = "unedited" if v["kind"] == "base" else \
+                f"{v['method']} {v['kind']}\n{v['block'].replace('_blocks', '').replace('.attentions', '')} " \
+                f"#{','.join(str(i) for i in v['latents'])[:24]}"
+            draw.text((c * size + 3, 2), label, fill="black")
+            for r, a in enumerate(rows):
+                x, y = c * size, head + r * (size + cap)
+                path = variant_image(args, v, a)
+                if not os.path.exists(path):
+                    draw.rectangle([x, y, x + size - 1, y + size - 1], fill="lightgray")
+                    continue
+                grid.paste(Image.open(path).convert("RGB").resize((size, size)), (x, y))
+                uc = load_uc(path) if not args.disable_uc else None
+                if uc is not None and uc.get("model") == uc_model_id(args):
+                    pred = uc["class_pred"] if ctype == "object" else uc["style_pred"]
+                    draw.text((x + 3, y + size), f"{uc['class_pred']} / {uc['style_pred']}"[:30],
+                              fill="red" if pred == concept else "black")
+        # row labels: the other half of each prompt (the style for objects, the object for styles)
+        other = "style" if ctype == "object" else "object"
+        for r, a in enumerate(rows):
+            draw.text((3, head + r * (size + cap) + 3), a[other], fill="yellow")
+        save_image(grid, os.path.join(d, f"{safe(concept)}_{run_tag(args)}.jpg"))
+    print(f"panels -> {d}")
 
 
 # ---------------------------------------------------------------- stage 6
@@ -1014,6 +1106,9 @@ def main(args):
         args.style_mask_methods = ["attention", "grad_eclip"]
 
     args.object_list = args.object_list or list(CLASSES)
+    if args.n_objects > 0:
+        args.object_list = args.object_list[:args.n_objects]
+        print(f"--n_objects {args.n_objects}: objects {args.object_list}")
     args.style_list = args.style_list or list(STYLES)
     for name in args.object_list:
         assert name in CLASSES, f"'{name}' is not an UnlearnCanvas object: {CLASSES}"
@@ -1059,9 +1154,13 @@ def main(args):
         run_scoring(args, models, answers, var_list, device)
     if not args.disable_summary and not args.prepare_only:
         build_results(args, answers, var_list)
+    if not args.disable_panels and not args.prepare_only:
+        save_panels(args, answers, var_list)
 
     # stage 6
-    if not args.disable_inject:
+    if not args.disable_inject and args.top_k > 1:
+        print(f"skipping injection (stage 6): it adds one latent's direction, and --top_k is {args.top_k}")
+    elif not args.disable_inject:
         # run_base writes {out_dir}/base - point it at the shared cache
         cache_args = argparse.Namespace(**{**vars(args), "out_dir": args.cache_dir})
         if args.disable_base:

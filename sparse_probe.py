@@ -136,11 +136,13 @@ def latent_activation_stats(idx: np.ndarray, val: np.ndarray, labels: np.ndarray
 
 
 def select_bce_and_f1(idx: np.ndarray, val: np.ndarray, labels: np.ndarray, n_dirs: int,
-                      ridge: float = 1e-8, n_newton_steps: int = 30) -> dict:
+                      ridge: float = 1e-8, n_newton_steps: int = 30, top_k: int = 1) -> dict:
     '''
     Fits every latent's probe once and returns both the lowest-BCE latent
     and the highest-F1 latent, each with its BCE, loss explained, F1,
-    precision, recall and activation stats.
+    precision, recall and activation stats. With top_k > 1 also returns
+    "bce_top" / "f1_top": the best top_k latents per rule (the top-1 above,
+    then the next best with a positive probe weight, i.e. active ON the mask).
     '''
     w, b, loss = fit_sparse_1d_ridge_logistic(idx, val, labels, n_dirs, ridge, n_newton_steps)
     tp, fp, fn = sparse_per_latent_confusion(idx, val, labels, w, b)
@@ -166,7 +168,7 @@ def select_bce_and_f1(idx: np.ndarray, val: np.ndarray, labels: np.ndarray, n_di
 
     bce_idx = int(np.argmin(loss))
     f1_idx = int(np.argmax(f1))
-    return {
+    out = {
         "n_patches": int(len(labels)),
         "n_pos": int(labels.sum()),
         "baseline_bce": base,
@@ -174,3 +176,11 @@ def select_bce_and_f1(idx: np.ndarray, val: np.ndarray, labels: np.ndarray, n_di
         "f1": describe(f1_idx),
         "same_feature": bce_idx == f1_idx,
     }
+    if top_k > 1:
+        def top(order, first):
+            rest = [int(j) for j in order if j != first and w[j] > 0 and (loss[j] < base or f1[j] > 0)]
+            return [first] + rest[:top_k - 1]
+        out["top_k"] = top_k
+        out["bce_top"] = [describe(j) for j in top(np.argsort(loss), bce_idx)]
+        out["f1_top"] = [describe(j) for j in top(np.argsort(-f1), f1_idx)]
+    return out
