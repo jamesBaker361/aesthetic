@@ -91,6 +91,16 @@
 # largest weight at the strongest penalty that keeps one is used (kind
 # "lasso"). Per-run files get a _lasso tag.
 #
+# --rules attribution: rank latents by their effect on the UnlearnCanvas
+# classifier instead of by a mask. For every concept x block, the concept's
+# discovery prompts are regenerated with the block's SAE code spliced in as a
+# differentiable leaf (forward pass unchanged), and gradient x activation of
+# log p(concept) under the object (or style) classifier is summed over patches
+# and averaged over images (run_attribution -> {out_dir}/attribution/). The
+# top latent is used (kind "attribution"); with --auto_k the attribution order
+# feeds the same smallest-k search. Needs the classifier checkpoints; SDXL, the
+# SAE and the classifier share the GPU for that step only.
+#
 # --auto_k: instead of a fixed k, per concept x method x block x rule the
 # latents are ordered by importance (the rule: per-latent BCE, per-latent F1,
 # or lasso weight) and a binary search finds the fewest leading ones whose
@@ -229,7 +239,7 @@ from experiment_helpers.init_helpers import default_parser, repo_api_init
 from attribution import DEFAULT_BLOCK_LIST
 from generate_clean_inference import resize_mask_to_grid
 from grad_eclip_mask import load_clip, grad_eclip_pixel_map, top_frac_patch_mask
-from sparse_probe import select_bce_and_f1
+from sparse_probe import select_bce_and_f1, smallest_k, latent_activation_stats
 from evaluate_sae_features import (
     Models, safe, load_json, save_json, generate, ensure_sam_masks, load_sam, sam_cache_path,
     ensure_text_scores, score_cache_path, load_text_score, run_dream_sparsify, load_block_codes,
@@ -288,10 +298,14 @@ parser.add_argument("--style_mask_methods", nargs="*", default=["attention", "gr
 parser.add_argument("--frac", type=float, default=0.25,
                     help="top fraction of patches that count as positive for the attention / grad_eclip masks")
 parser.add_argument("--attn_map_size", type=int, default=64, help="grid every cross-attention map is resized to")
-parser.add_argument("--rules", nargs="*", default=["bce", "f1"], choices=["bce", "f1", "lasso"],
+parser.add_argument("--rules", nargs="*", default=["bce", "f1"], choices=["bce", "f1", "lasso", "attribution"],
                     help="which probe rule(s) pick the latent(s) that get zeroed/injected: lowest per-latent "
                          "BCE, highest per-latent F1, or 'lasso' - the latents a joint L1 logistic "
                          "regression over every latent keeps (sparse_probe.lasso_select)")
+parser.add_argument("--attribution_keep", type=int, default=512,
+                    help="--rules attribution: how many top-attribution latents per concept x block to store")
+parser.add_argument("--attribution_images", type=int, default=0,
+                    help="--rules attribution: discovery images per concept to average over (0 = all)")
 parser.add_argument("--negatives", type=str, default="own", choices=["own", "all"],
                     help="'own': negatives are the non-mask patches of the concept's images; "
                          "'all': plus every patch of the discovery images without the concept")
@@ -359,7 +373,7 @@ parser.add_argument("--inject_value", type=str, default="checkpoint_mean", choic
                     help="activation placed on the latent before * strength: the SAE checkpoint's mean.pt "
                          "or its mean over the concept's positive discovery patches")
 
-for flag in ["discover_generate", "sparsify", "masks", "probe", "answers_generate", "answer_masks",
+for flag in ["discover_generate", "sparsify", "masks", "attribution", "probe", "answers_generate", "answer_masks",
              "uc", "vqa", "clip", "psnr", "summary", "panels",
              "inject", "base", "inject_generate", "inject_masks", "inject_summary"]:
     parser.add_argument(f"--disable_{flag}", action="store_true")
@@ -667,6 +681,132 @@ def patch_labels(args, e: dict, ctype: str, concept: str, method: str, gh: int, 
         return top_frac_patch_mask(d["pixel_map"].astype(np.float32), gh, gw, args.frac)
 
 
+# ---------------------------------------------------------------- attribution
+
+def attribution_path(args, concept: str) -> str:
+    return os.path.join(args.out_dir, "attribution", f"{safe(concept)}.json")
+
+
+def attribution_key(args) -> str:
+    '''Attribution results are cached per these settings.'''
+    return "|".join([uc_model_id(args), args.mode, str(args.num_inference_steps), f"{args.guidance_scale:g}",
+                     str(args.size), str(args.attribution_images), ",".join(map(str, args.discover_seeds)),
+                     str(args.object_discover_prompt_file)])
+
+
+def load_attribution(args, concept: str) -> dict:
+    '''{block: {"order", "scores", "n_images"}} for the current settings (empty if not computed).'''
+    return load_json(attribution_path(args, concept), {}).get(attribution_key(args), {})
+
+
+def uc_head(ckpt: str, n: int, device):
+    '''One UnlearnCanvas ViT-L/16 classifier (as UCClassifiers), frozen, for backprop.'''
+    import timm
+    m = timm.create_model("vit_large_patch16_224.augreg_in21k", pretrained=False)
+    m.head = torch.nn.Linear(1024, n)
+    m.load_state_dict(torch.load(ckpt, map_location="cpu")["model_state_dict"])
+    return m.to(device).eval().requires_grad_(False)
+
+
+def run_attribution(args, models: UCModels, entries: list, targets: list, block_list: list):
+    '''
+    Gradient x activation of every SAE latent on the UnlearnCanvas classifier's
+    log-probability of the concept. For each concept's discovery prompts (same
+    prompt + seed as discovery), the block's SAE code a is spliced in as a leaf:
+    output + decoder(a) - decoder(a).detach(), so the forward pass is unchanged
+    but d/da flows through the rest of the UNet, the VAE decoder and the
+    classifier (224px, as UCClassifiers). a * da summed over patches and
+    averaged over images is a first-order estimate of how much log p(concept)
+    drops if that latent is zeroed; latents are ranked by it (positive first)
+    -> {out_dir}/attribution/{concept}.json. SDXL, the SAE and the classifier
+    share the GPU for this step only (gradient checkpointing on the UNet + VAE).
+    '''
+    todo = [(t, c) for t, c in targets
+            if not all(b in load_attribution(args, c) for b in block_list)]
+    print(f"attribution: {len(todo)} of {len(targets)} concepts to compute")
+    if not todo:
+        return
+    if not (os.path.exists(args.style_ckpt) and os.path.exists(args.class_ckpt)):
+        raise FileNotFoundError(f"--rules attribution needs the UnlearnCanvas classifiers: {args.class_ckpt}")
+    device = models.device
+    pipe = models.get_pipe()
+    sd = pipe.pipe
+    call = getattr(type(sd).__call__, "__wrapped__", type(sd).__call__)  # the pipeline call without its no_grad
+    unet, vae = sd.unet, sd.vae
+    unet.requires_grad_(False); vae.requires_grad_(False)
+    unet.enable_gradient_checkpointing(); vae.enable_gradient_checkpointing()
+    unet.train(); vae.train()  # some diffusers versions only checkpoint in train mode (no dropout in either)
+    upcast = vae.dtype == torch.float16 and getattr(vae.config, "force_upcast", False)
+    if upcast:
+        vae.to(torch.float32)
+    heads = {}
+    try:
+        for ctype, concept in todo:
+            if ctype not in heads:
+                heads[ctype] = (uc_head(args.class_ckpt, len(CLASSES), device) if ctype == "object"
+                                else uc_head(args.style_ckpt, len(THEMES), device))
+            head = heads[ctype]
+            label = (CLASSES if ctype == "object" else THEMES).index(concept)
+            own = concept_entries(args, entries, ctype, concept)
+            if args.attribution_images > 0:
+                own = own[:args.attribution_images]
+            result = load_json(attribution_path(args, concept), {})
+            mine = result.setdefault(attribution_key(args), {})
+            for block in block_list:
+                if block in mine:
+                    continue
+                sae = models.get_sae(block).requires_grad_(False)
+                store = {}
+
+                def hook(module, inp, out):
+                    o = out[0] if isinstance(out, tuple) else out
+                    x = o - inp[0] if args.mode == "diff" else o
+                    a = sae.encode(x.permute(0, 2, 3, 1).float()).detach().requires_grad_(True)
+                    store["a"] = a
+                    d = sae.decoder(a)
+                    o = o + (d - d.detach()).permute(0, 3, 1, 2).to(o.dtype)  # same value, gradient to a
+                    return (o, *out[1:]) if isinstance(out, tuple) else o
+
+                handle = unet.get_submodule(block).register_forward_hook(hook)
+                total, logps = None, []
+                try:
+                    for n in own:
+                        e = entries[n]
+                        with torch.enable_grad():
+                            lat = call(sd, prompt=e["prompt"], num_inference_steps=args.num_inference_steps,
+                                       guidance_scale=args.guidance_scale, height=args.size, width=args.size,
+                                       generator=torch.Generator().manual_seed(e["seed"]), output_type="latent").images
+                            lat = lat.to(vae.dtype) / vae.config.scaling_factor
+                            img = (vae.decode(lat, return_dict=False)[0] / 2 + 0.5).clamp(0, 1)
+                            img = F.interpolate(img.float(), size=(224, 224), mode="bilinear", antialias=True)
+                            logp = F.log_softmax(head((img - 0.5) / 0.5).float(), dim=-1)[0, label]
+                            logp.backward()
+                        a = store.pop("a")
+                        attr = (a.detach() * a.grad).sum(dim=tuple(range(a.dim() - 1))).double().cpu()
+                        total = attr if total is None else total + attr
+                        logps.append(float(logp.detach()))
+                        del a, lat, img, logp
+                finally:
+                    handle.remove()
+                scores = (total / len(own)).numpy()
+                order = [int(j) for j in np.argsort(-scores) if scores[j] > 0][:args.attribution_keep]
+                mine[block] = {"order": order, "scores": [float(scores[j]) for j in order],
+                               "n_images": len(own), "mean_logp": float(np.mean(logps))}
+                print(f"  attribution {ctype} '{concept}' @ {block}: log p = {np.mean(logps):.3f}, "
+                      f"top latents {order[:8]} ({[round(float(scores[j]), 4) for j in order[:8]]})")
+                os.makedirs(os.path.dirname(attribution_path(args, concept)), exist_ok=True)
+                save_json(attribution_path(args, concept), result)
+    finally:
+        for head in heads.values():
+            head.to("cpu")
+        heads.clear()
+        unet.disable_gradient_checkpointing(); vae.disable_gradient_checkpointing()
+        unet.eval(); vae.eval()
+        if upcast:
+            vae.to(torch.float16)
+        models.free()
+
+
 # ---------------------------------------------------------------- stage 3
 
 def run_tag(args) -> str:
@@ -674,6 +814,8 @@ def run_tag(args) -> str:
     tag = "_".join(sorted(set(args.object_mask_methods) | set(args.style_mask_methods)))
     if "lasso" in args.rules:
         tag += "_lasso"
+    if "attribution" in args.rules:
+        tag += "_attr"
     mode = "g" if args.remove_mode == "saeuron" else "x"  # g = gamma x mean activation, x = direct
     if args.auto_gamma:
         tag += f"_{mode}auto{args.auto_gamma_target:g}"
@@ -778,7 +920,9 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
                     and "1" not in features[c]["methods"][m][block].get("lasso_by_k", {}))
                 or (args.auto_k and not all(
                     r in features[c]["methods"][m][block].get("auto_by_key", {}).get(auto_key(args), {})
-                    for r in auto_rules(args)))]
+                    for r in auto_rules(args) + (["attribution"] if "attribution" in args.rules else [])))
+                or (not args.auto_k and "attribution" in args.rules
+                    and features[c]["methods"][m][block].get("attribution", {}).get("key") != attribution_key(args))]
         if not todo:
             continue
         idx_all, val_all, owner, (gh, gw), n_dirs = load_block_codes(entries, block)
@@ -808,6 +952,24 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
             if auto:
                 result["auto_by_key"][auto_key(args)] = {
                     **result["auto_by_key"].get(auto_key(args), {}), **result.pop("auto")}
+            if "attribution" in args.rules:
+                attr = load_attribution(args, concept).get(block)
+                if attr is None:
+                    print(f"  ! no attribution for '{concept}' @ {block} - run without --disable_attribution")
+                else:
+                    def describe(j, score):
+                        return {"idx": int(j), "attribution": score,
+                                **latent_activation_stats(idx_all[rows], val_all[rows], labels, j)}
+                    if args.auto_k:
+                        # fewest top-attribution latents whose mask classifier reaches --auto_k_frac of all latents
+                        order = attr["order"][:args.auto_k_max]
+                        res = smallest_k(idx_all[rows], val_all[rows], labels, owner[rows], n_dirs, order,
+                                         frac=args.auto_k_frac, metric=args.auto_k_metric, seed=args.seed)
+                        res["top"] = [describe(j, attr["scores"][i]) for i, j in enumerate(res["latents"])]
+                        result["auto_by_key"].setdefault(auto_key(args), {})["attribution"] = res
+                    elif attr["order"]:
+                        result["attribution"] = {"key": attribution_key(args),
+                                                 "top": [describe(attr["order"][0], attr["scores"][0])]}
             features[concept]["methods"].setdefault(method, {})[block] = result
             print(f"{ctype} '{concept}' ({method}) @ {block}: bce latent {result['bce']['idx']} "
                   f"(bce={result['bce']['bce']:.4f}, explained={result['bce']['loss_explained']:.3f}) | "
@@ -1081,6 +1243,10 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
                     out.append({**common, "method": method, "block": block, "kind": "lasso",
                                 "feature_idx": lasso[0]["idx"], "latents": [d["idx"] for d in lasso],
                                 "probe": lasso[0]})
+                attr = info.get("attribution", {}).get("top", [])
+                if "attribution" in args.rules and attr:
+                    out.append({**common, "method": method, "block": block, "kind": "attribution",
+                                "feature_idx": attr[0]["idx"], "latents": [attr[0]["idx"]], "probe": attr[0]})
         for block in block_list if not args.auto_k else []:  # auto-k: k differs per variant, no random match
             for r in range(args.n_random_controls):
                 latents = [random_latents[f"{block}__random{r}"]]
@@ -1533,6 +1699,8 @@ def main(args):
         run_dream_sparsify(args, models, entries, block_list)
     if not args.disable_masks:
         run_masks(args, models, entries, targets, device)
+    if "attribution" in args.rules and not args.prepare_only and not args.disable_attribution:
+        run_attribution(args, models, entries, targets, block_list)
     if args.prepare_only:
         features = {}  # -> only the unedited answers and the random controls below
     elif args.disable_probe:
