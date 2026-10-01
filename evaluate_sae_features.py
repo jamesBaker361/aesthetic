@@ -835,18 +835,25 @@ def write_outputs_results(args, df: pd.DataFrame, filename: str = "results.csv",
 
     os.makedirs(args.outputs_dir, exist_ok=True)
     path = os.path.join(args.outputs_dir, filename)
-    if os.path.exists(path):
-        old = pd.read_csv(path)
-        for col, value in (defaults or {}).items():
-            if col not in old:
-                old[col] = value(old) if callable(value) else value
-        replace_on = list(replace_on)
-        new_keys = set(map(tuple, table[replace_on].astype(str).values))
-        replaced = (old["out_dir"] == args.out_dir) & \
-            pd.Series([tuple(r) in new_keys for r in old[replace_on].astype(str).values], index=old.index)
-        table = pd.concat([old[~replaced], table], ignore_index=True)
-    table = table.sort_values(["out_dir"] + keys)
-    table.to_csv(path, index=False)
+    # read-merge-write under an exclusive lock: parallel jobs finishing together would otherwise each
+    # read the same old file and the last writer would drop the others' rows
+    import fcntl
+    with open(f"{path}.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if os.path.exists(path):
+            old = pd.read_csv(path)
+            for col, value in (defaults or {}).items():
+                if col not in old:
+                    old[col] = value(old) if callable(value) else value
+            replace_on = list(replace_on)
+            new_keys = set(map(tuple, table[replace_on].astype(str).values))
+            replaced = (old["out_dir"] == args.out_dir) & \
+                pd.Series([tuple(r) in new_keys for r in old[replace_on].astype(str).values], index=old.index)
+            table = pd.concat([old[~replaced], table], ignore_index=True)
+        table = table.sort_values(["out_dir"] + keys)
+        tmp = f"{path}.tmp{os.getpid()}"
+        table.to_csv(tmp, index=False)
+        os.replace(tmp, path)
     print(f"wrote {len(table)} rows to {path}")
 
 
