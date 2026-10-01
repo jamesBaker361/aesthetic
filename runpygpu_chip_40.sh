@@ -48,25 +48,25 @@ export HPS_ROOT="/umbc/rs/pi_donengel/users/jbaker15/hps-cache"
 export IMAGE_REWARD_PATH="/umbc/rs/pi_donengel/users/jbaker15/reward-blob"
 export IMAGE_REWARD_CONFIG="/umbc/rs/pi_donengel/users/jbaker15/ImageReward/med_config.json"
 export BRAIN_DATA_DIR='/umbc/rs/pi_donengel/users/jbaker15/brain-diffuser/data'
-export CLIP_CACHE="/umbc/rs/pi_donengel/users/jbaker15/clip_cache"
 export CUDA_LAUNCH_BLOCKING="1"
 export SCIKIT_LEARN_DATA="/umbc/rs/pi_donengel/users/jbaker15/scikit-learn-data"
 export BRAIN_DATA_DIR="/umbc/rs/pi_donengel/users/jbaker15/brain/data"
 export TORCH_DISTRIBUTED_DEBUG="DETAIL"
 export NCCL_DEBUG="INFO"
-export TMPDIR="/umbc/rs/pi_donengel/users/jbaker15/tmp"
 export NCCL_DEBUG_SUBSYS="ALL"
 export TORCH_LOCAL_DIR="/umbc/rs/pi_donengel/users/jbaker15/local_torch"
 export KAGGLEHUB_CACHE="/umbc/rs/pi_donengel/users/jbaker15/kaggle_cache"
 export KAGGLE_CONFIG_DIR="/umbc/rs/pi_donengel/users/jbaker15/kaggle_config"
+export CLIP_CACHE="/umbc/rs/pi_donengel/users/jbaker15/clip_cache"
 export SDL_VIDEODRIVER=dummy
 export XDG_RUNTIME_DIR="/umbc/rs/pi_donengel/users/jbaker15/xdg_runtime"
+export TMPDIR="/umbc/rs/pi_donengel/users/jbaker15/tmp"
 echo "Running on: $(hostname)"
 echo "Allocated GPUs:"
 nvidia-smi
 echo "version"
 nvcc --version
-srun --constraint=L40S python   $@
+srun python   $@
 echo "Running on: $(hostname)"
 echo "Allocated GPUs:"
 nvidia-smi
