@@ -175,8 +175,11 @@ def load_json(path: str, default):
 
 
 def save_json(path: str, obj):
-    with open(path, "w") as f:
+    # write-then-rename, so a job sharing the file never reads it half-written
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
         json.dump(obj, f, indent=2)
+    os.replace(tmp, path)
 
 
 def save_image(image: Image.Image, path: str):
