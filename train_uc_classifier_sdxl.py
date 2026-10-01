@@ -116,11 +116,11 @@ def generate():
     for b in range(0, len(jobs), args.gen_batch_size):
         part = jobs[b:b + args.gen_batch_size]
         images=[]
-        for s, o, _ in part:
+        for s, o, i in part:
             
             image = pipe(prompt=prompt(s, o), height=args.size, width=args.size,
                       num_inference_steps=args.num_inference_steps, guidance_scale=args.guidance_scale,
-                      generator=[torch.Generator().manual_seed(args.seed_offset + i) for _, _, i in part]).images[0]
+                      generator=torch.Generator().manual_seed(args.seed_offset + i)).images[0]
             images.append(image)
         for (s, o, i), im in zip(part, images):
             path = image_path(s, o, i)
