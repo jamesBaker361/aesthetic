@@ -357,6 +357,9 @@ parser.add_argument("--size", type=int, default=512)
 
 parser.add_argument("--style_ckpt", type=str, default="UnlearnCanvas/ckpts/cls_model/style50-001.pth")
 parser.add_argument("--class_ckpt", type=str, default="UnlearnCanvas/ckpts/cls_model/style50_cls.pth")
+parser.add_argument("--tag", type=str, default="",
+                    help="suffix for this run's tables in out_dir (e.g. 'sdxlcls' when re-scoring with other "
+                         "classifiers), so they don't overwrite an earlier run's")
 parser.add_argument("--vqa_model", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct")
 parser.add_argument("--clip_model", type=str, default="openai/clip-vit-large-patch14")
 parser.add_argument("--object_text", type=str, default="a photo of a {}", help="VQAScore/CLIPScore text for objects")
@@ -825,6 +828,8 @@ def run_tag(args) -> str:
         tag += f"_{mode}" + "_".join(f"{x:g}" for x in args.remove_scale)
     if args.auto_k:
         tag += f"_auto{args.auto_k_frac:g}"
+    if args.tag:
+        tag += f"_{args.tag}"
     return tag
 
 
