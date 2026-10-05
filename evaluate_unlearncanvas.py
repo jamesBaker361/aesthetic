@@ -77,6 +77,10 @@
 #   Rows -> {out_dir}/inject_results_{methods}.csv, means ->
 #   {out_dir}/inject_summary_{methods}.csv and {outputs_dir}/uc_inject_results.csv.
 #
+# Injection (stage 6) adds a concept's whole latent set (one latent, or the --auto_k set) inside the
+# base subject's SAM mask: each latent at --inject_value x strength. Images in {out_dir}/inject/...,
+# panels (base | each block x rule x strength) in {out_dir}/panels_inject/{concept}_{tag}.jpg.
+#
 # Edited images: {out_dir}/answers/{method}/{rule}_{metric}/{concept}/{block}/
 # {style}_{object}_seed{seed}.jpg - rule = the variant's kind (bce, f1,
 # bce+f1, lasso, random0), metric = --auto_k_metric with --auto_k, else
@@ -90,6 +94,15 @@
 # latents scaled to max 1, liblinear); without --auto_k the latent with the
 # largest weight at the strongest penalty that keeps one is used (kind
 # "lasso"). Per-run files get a _lasso tag.
+#
+# --rules saeuron: SAeUron's own feature selection as a baseline (arXiv:2501.18052,
+# SAE/unlearning_utils.compute_feature_importance): each discovery image's SAE code is averaged over
+# its patches, and a latent's score is its share of the total mean activation on the concept's images
+# minus its share on all other concepts' images. The top tau_c latents are kept (Table 5, SAEURON_TAU;
+# --saeuron_tau to override; with --auto_k the score order feeds the smallest-k search instead).
+# The full SAeUron recipe adds --remove_scale_preset saeuron --remove_mode saeuron --saeuron_mask:
+# their per-object multiplier, scaled by the latent's mean concept activation, applied only where the
+# latent beats its mean over all concepts. (Their tau / gamma were tuned for their SD-1.5 SAE.)
 #
 # --rules attribution: rank latents by their effect on the UnlearnCanvas
 # classifier instead of by a mask. For every concept x block, the concept's
@@ -298,10 +311,16 @@ parser.add_argument("--style_mask_methods", nargs="*", default=["attention", "gr
 parser.add_argument("--frac", type=float, default=0.25,
                     help="top fraction of patches that count as positive for the attention / grad_eclip masks")
 parser.add_argument("--attn_map_size", type=int, default=64, help="grid every cross-attention map is resized to")
-parser.add_argument("--rules", nargs="*", default=["bce", "f1"], choices=["bce", "f1", "lasso", "attribution"],
+parser.add_argument("--rules", nargs="*", default=["bce", "f1"], choices=["bce", "f1", "lasso", "attribution", "saeuron"],
                     help="which probe rule(s) pick the latent(s) that get zeroed/injected: lowest per-latent "
                          "BCE, highest per-latent F1, or 'lasso' - the latents a joint L1 logistic "
                          "regression over every latent keeps (sparse_probe.lasso_select)")
+parser.add_argument("--saeuron_tau", type=int, default=0,
+                    help="--rules saeuron: latents kept per concept; 0 = SAeUron's Table 5 value per object "
+                         "(SAEURON_TAU; styles 1). Ignored with --auto_k")
+parser.add_argument("--saeuron_mask", action="store_true",
+                    help="SAeUron's patch mask for removal: only edit a latent where it is above its mean activation "
+                         "over all concepts' discovery images (works with any rule)")
 parser.add_argument("--attribution_keep", type=int, default=512,
                     help="--rules attribution: how many top-attribution latents per concept x block to store")
 parser.add_argument("--attribution_images", type=int, default=0,
@@ -372,13 +391,16 @@ parser.add_argument("--placeholder", type=str, default="<sks>")
 parser.add_argument("--panel_rows", type=int, default=6, help="target prompts (rows) per concept panel")
 parser.add_argument("--panel_size", type=int, default=160, help="side of each panel cell in pixels")
 parser.add_argument("--strength_list", nargs="*", type=float, default=[10.0])
-parser.add_argument("--inject_value", type=str, default="checkpoint_mean", choices=["checkpoint_mean", "pos_mean"],
-                    help="activation placed on the latent before * strength: the SAE checkpoint's mean.pt "
-                         "or its mean over the concept's positive discovery patches")
+parser.add_argument("--inject_value", type=str, default="checkpoint_mean",
+                    choices=["checkpoint_mean", "pos_mean", "concept_mean"],
+                    help="activation placed on each injected latent before * strength: the SAE checkpoint's "
+                         "mean.pt, its mean over the concept's positive (mask) discovery patches, or its mean over "
+                         "every patch of the concept's discovery images (SAeUron's avg_acts)")
+parser.add_argument("--inject_panel_bases", type=int, default=6, help="base images (rows) per injection panel")
 
 for flag in ["discover_generate", "sparsify", "masks", "attribution", "probe", "answers_generate", "answer_masks",
              "uc", "vqa", "clip", "psnr", "summary", "panels",
-             "inject", "base", "inject_generate", "inject_masks", "inject_summary"]:
+             "inject", "base", "inject_generate", "inject_masks", "inject_summary", "inject_panels"]:
     parser.add_argument(f"--disable_{flag}", action="store_true")
 
 
@@ -819,6 +841,10 @@ def run_tag(args) -> str:
         tag += "_lasso"
     if "attribution" in args.rules:
         tag += "_attr"
+    if "saeuron" in args.rules:
+        tag += "_saeuron"
+    if args.saeuron_mask:
+        tag += "_mask"
     mode = "g" if args.remove_mode == "saeuron" else "x"  # g = gamma x mean activation, x = direct
     if args.auto_gamma:
         tag += f"_{mode}auto{args.auto_gamma_target:g}"
@@ -865,6 +891,50 @@ SAEURON_MULTIPLIERS = {
     "Waterfalls": -30.0,     # tau 30
 }
 SAEURON_STYLE_MULTIPLIER = -1.0
+SAEURON_TAU = {  # Table 5: number of selected features tau_c per object; styles use 1
+    "Architectures": 20, "Bears": 10, "Birds": 20, "Butterfly": 3, "Cats": 1, "Dogs": 2, "Fishes": 2,
+    "Flame": 3, "Flowers": 20, "Frogs": 5, "Horses": 25, "Human": 25, "Jellyfish": 25, "Rabbits": 4,
+    "Sandwiches": 20, "Sea": 15, "Statues": 20, "Towers": 25, "Trees": 30, "Waterfalls": 30,
+}
+
+
+def saeuron_tau(args, ctype: str, concept: str) -> int:
+    if args.saeuron_tau > 0:
+        return args.saeuron_tau
+    return SAEURON_TAU.get(concept, 1) if ctype == "object" else 1
+
+
+def image_mean_codes(idx_all, val_all, owner, n_images: int, n_dirs: int) -> np.ndarray:
+    '''(n_images, n_dirs): each discovery image's SAE code averaged over its patches (SAeUron's sae_out.mean(1)).'''
+    sums = np.zeros((n_images, n_dirs), dtype=np.float64)
+    rows = np.repeat(owner, idx_all.shape[1])
+    np.add.at(sums, (rows, idx_all.reshape(-1)), np.maximum(val_all.reshape(-1), 0.0))
+    return sums / np.maximum(np.bincount(owner, minlength=n_images), 1)[:, None]
+
+
+def same_kind_concepts(args, entries: list, ctype: str, concept: str) -> dict:
+    '''{other concept: its discovery image indices}, from the same discovery source as `concept`.'''
+    source = entries[concept_entries(args, entries, ctype, concept)[0]]["source"]
+    out = {}
+    for n, e in enumerate(entries):
+        if e["source"] == source and e[ctype] is not None:
+            out.setdefault(e[ctype], []).append(n)
+    return out
+
+
+def saeuron_scores(args, entries: list, means: np.ndarray, ctype: str, concept: str, eps: float = 1e-8):
+    '''
+    SAeUron's compute_feature_importance on our discovery images: each latent's share of the total mean
+    activation on the concept's images minus its share on every other concept's images. Returns the
+    latents with a positive score, best first, and their scores.
+    '''
+    groups = same_kind_concepts(args, entries, ctype, concept)
+    mean_x = means[groups[concept]].mean(axis=0)
+    others = [n for c, ns in groups.items() if c != concept for n in ns]
+    mean_o = means[others].mean(axis=0) if others else np.zeros_like(mean_x)
+    scores = mean_x / (mean_x.sum() + eps) - mean_o / (mean_o.sum() + eps)
+    order = [int(j) for j in np.argsort(-scores) if scores[j] > 0]
+    return order, scores
 
 
 def remove_scales(args, v: dict) -> list:
@@ -927,10 +997,15 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
                     r in features[c]["methods"][m][block].get("auto_by_key", {}).get(auto_key(args), {})
                     for r in auto_rules(args) + (["attribution"] if "attribution" in args.rules else [])))
                 or (not args.auto_k and "attribution" in args.rules
-                    and features[c]["methods"][m][block].get("attribution", {}).get("key") != attribution_key(args))]
+                    and features[c]["methods"][m][block].get("attribution", {}).get("key") != attribution_key(args))
+                or (args.auto_k and "saeuron" in args.rules and "saeuron" not in
+                    features[c]["methods"][m][block].get("auto_by_key", {}).get(auto_key(args), {}))
+                or (not args.auto_k and "saeuron" in args.rules
+                    and features[c]["methods"][m][block].get("saeuron", {}).get("tau") != saeuron_tau(args, t, c))]
         if not todo:
             continue
         idx_all, val_all, owner, (gh, gw), n_dirs = load_block_codes(entries, block)
+        means = image_mean_codes(idx_all, val_all, owner, len(entries), n_dirs) if "saeuron" in args.rules else None
         for ctype, concept, method in todo:
             own = concept_entries(args, entries, ctype, concept)
             labels = np.zeros(len(owner), dtype=bool)
@@ -975,6 +1050,22 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
                     elif attr["order"]:
                         result["attribution"] = {"key": attribution_key(args),
                                                  "top": [describe(attr["order"][0], attr["scores"][0])]}
+            if "saeuron" in args.rules:
+                order, scores = saeuron_scores(args, entries, means, ctype, concept)
+
+                def describe_s(j):
+                    return {"idx": int(j), "saeuron_score": float(scores[j]),
+                            **latent_activation_stats(idx_all[rows], val_all[rows], labels, j)}
+                if args.auto_k:
+                    res = smallest_k(idx_all[rows], val_all[rows], labels, owner[rows], n_dirs,
+                                     order[:args.auto_k_max], frac=args.auto_k_frac, metric=args.auto_k_metric,
+                                     seed=args.seed)
+                    res["top"] = [describe_s(j) for j in res["latents"]]
+                    result["auto_by_key"].setdefault(auto_key(args), {})["saeuron"] = res
+                elif order:
+                    tau = saeuron_tau(args, ctype, concept)
+                    result["saeuron"] = {"tau": tau, "top": [describe_s(j) for j in order[:tau]]}
+                    print(f"    saeuron: tau {tau}, latents {order[:tau]}")
             features[concept]["methods"].setdefault(method, {})[block] = result
             print(f"{ctype} '{concept}' ({method}) @ {block}: bce latent {result['bce']['idx']} "
                   f"(bce={result['bce']['bce']:.4f}, explained={result['bce']['loss_explained']:.3f}) | "
@@ -1017,18 +1108,26 @@ def attach_latent_means(args, entries: list, var_list: list, block_list: list):
     concept's own discovery images (SAeUron's avg_acts), for the edits with
     gamma != 0. Uses the cached top-k codes, one block at a time.
     '''
-    if args.remove_mode != "saeuron":
+    need_inject = args.inject_value == "concept_mean" and not args.disable_inject
+    if args.remove_mode != "saeuron" and not need_inject and not args.saeuron_mask:
         return  # direct: the scale doesn't depend on the latent's activations
-    todo = [v for v in var_list if v["kind"] != "base" and (v["gamma"] is None or v["gamma"] != 0.0)]
+    todo = [v for v in var_list if v["kind"] != "base" and (need_inject or args.saeuron_mask
+                                                             or v["gamma"] is None or v["gamma"] != 0.0)]
     for block in block_list:
         here = [v for v in todo if v["block"] == block]
         if not here:
             continue
-        idx_all, val_all, owner, _, _ = load_block_codes(entries, block)
+        idx_all, val_all, owner, _, n_dirs = load_block_codes(entries, block)
+        means = image_mean_codes(idx_all, val_all, owner, len(entries), n_dirs) if args.saeuron_mask else None
         for v in here:
             rows = np.isin(owner, concept_entries(args, entries, v["concept_type"], v["subject"]))
             idx, val = idx_all[rows], val_all[rows]
             v["latent_means"] = [float(np.where(idx == j, val, 0.0).sum(axis=1).mean()) for j in v["latents"]]
+            if args.saeuron_mask:
+                # SAeUron's all_concept_avg_acts: the mean over concepts of each concept's mean image code
+                groups = same_kind_concepts(args, entries, v["concept_type"], v["subject"])
+                thr = np.mean([means[ns].mean(axis=0) for ns in groups.values()], axis=0)
+                v["thresholds"] = [float(thr[j]) for j in v["latents"]]
     for v in todo:
         means = ", ".join(f"{j}:{m:.3g}" for j, m in zip(v["latents"], v["latent_means"]))
         print(f"  {v['subject']} {v['method']} {v['kind']} @ {v['block']} gamma "
@@ -1129,7 +1228,12 @@ def run_auto_gamma(args, models: UCModels, entries: list, var_list: list, block_
                     edited, change = [], []
                     for x, a in zip(xt, codes):
                         onehot = torch.zeros_like(a)
-                        onehot[..., latents] = a[..., latents] * keep
+                        sel = a[..., latents]
+                        if v.get("thresholds") is not None:  # SAeUron's mask, as the hook applies it
+                            thr = torch.tensor(v["thresholds"], dtype=sel.dtype, device=sel.device)
+                            onehot[..., latents] = torch.where(sel > thr, sel * keep, torch.zeros_like(sel))
+                        else:
+                            onehot[..., latents] = sel * keep
                         delta = sae.decoder(onehot)
                         edited.append((x - delta).reshape(-1, x.shape[-1]).cpu().numpy())
                         change.append((delta.norm(dim=-1) / x.norm(dim=-1).clamp_min(1e-6)).reshape(-1).cpu().numpy())
@@ -1232,6 +1336,7 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
                         a = found["bce" if rule == "bce+f1" else rule]
                         out.append({**common, "method": method, "block": block, "kind": rule,
                                     "feature_idx": a["latents"][0], "latents": a["latents"], "probe": a["top"][0],
+                                    "latent_stats": a["top"],
                                     "auto": {"full": a["full"], "score": a["score"], "k": a["k"]}})
                     continue
                 picks = {r: [info[r]["idx"]] for r in ["bce", "f1"]}
@@ -1248,6 +1353,11 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
                     out.append({**common, "method": method, "block": block, "kind": "lasso",
                                 "feature_idx": lasso[0]["idx"], "latents": [d["idx"] for d in lasso],
                                 "probe": lasso[0]})
+                sae_top = info.get("saeuron", {}).get("top", [])
+                if "saeuron" in args.rules and sae_top:
+                    out.append({**common, "method": method, "block": block, "kind": "saeuron",
+                                "feature_idx": sae_top[0]["idx"], "latents": [d["idx"] for d in sae_top],
+                                "probe": sae_top[0], "latent_stats": sae_top})
                 attr = info.get("attribution", {}).get("top", [])
                 if "attribution" in args.rules and attr:
                     out.append({**common, "method": method, "block": block, "kind": "attribution",
@@ -1315,12 +1425,14 @@ def run_answers_generate(args, models: UCModels, answers: list, var_list: list):
             # direct: activation x gamma
             scale = edit_scale(args, v, v["gamma"])
             jobs[path] = {"block": v["block"], "feature_idx": list(v["latents"]), "scale": scale,
+                          "thresholds": v.get("thresholds"),
                           "prompt": a["prompt"], "seed": a["seed"], "image": path}
     # every edit folder records the latents + scale its images were made with; a folder made with
     # different ones (the probe or gamma changed) is emptied so its images are regenerated
     specs = {}
     for j in jobs.values():
-        specs[os.path.dirname(j["image"])] = {"block": j["block"], "latents": j["feature_idx"], "scale": j["scale"]}
+        specs[os.path.dirname(j["image"])] = {"block": j["block"], "latents": j["feature_idx"], "scale": j["scale"],
+                                              "thresholds": j["thresholds"]}
     for folder, spec in specs.items():
         manifest = os.path.join(folder, "latents.json")
         if os.path.exists(manifest) and load_json(manifest, None) != json.loads(json.dumps(spec)):
@@ -1525,14 +1637,58 @@ def inject_jobs(args, base_entries: list, var_list: list) -> list:
         if v["kind"] == "base" or (not args.auto_gamma and v["remove_scale"] != remove_scales(args, v)[0]):
             continue  # injection doesn't depend on the removal scale: one copy per latent
         pos_mean = v["probe"].get("pos_mean")
+        latents = list(v["latents"])
+        # each latent's value (x strength): None = the checkpoint mean (filled in by run_ablate_generate)
+        if args.inject_value == "pos_mean":
+            stats = {d["idx"]: d for d in v.get("latent_stats", [v["probe"]])}
+            values = [stats.get(j, {}).get("pos_mean") for j in latents]
+        elif args.inject_value == "concept_mean":
+            values = v.get("latent_means")
+        else:
+            values = None
         for strength in args.strength_list:
             for e in usable:
                 jobs.append({
                     **{k: v[k] for k in ["subject", "concept_type", "method", "block", "kind", "feature_idx"]},
+                    "latents": latents, "values": values, "n_latents": len(latents),
                     "probe": v["probe"], "pos_mean": pos_mean, "strength": strength, "base": e["name"],
                     "image": os.path.join(edit_dir(args, v, root="inject"), f"s{strength:g}", f"{e['name']}.jpg"),
                 })
     return jobs
+
+
+def save_inject_panels(args, jobs: list, base_by_name: dict):
+    '''
+    {out_dir}/panels_inject/{concept}_{tag}.jpg: rows = the first --inject_panel_bases base images,
+    columns = the unedited base, then every block x rule x strength with the concept's latent set added
+    inside the base subject's mask. Only uses images already generated.
+    '''
+    d = os.path.join(args.out_dir, "panels_inject")
+    os.makedirs(d, exist_ok=True)
+    size, head = args.panel_size, 34
+    by_concept = {}
+    for j in jobs:
+        by_concept.setdefault(j["subject"], []).append(j)
+    for concept, js in by_concept.items():
+        bases = sorted({j["base"] for j in js})[:args.inject_panel_bases]
+        cols = sorted({(j["block"], j["kind"], j["strength"], j["n_latents"]) for j in js})
+        image_of = {(j["block"], j["kind"], j["strength"], j["base"]): j["image"] for j in js}
+        grid = Image.new("RGB", (size * (len(cols) + 1), head + size * len(bases)), "white")
+        draw = ImageDraw.Draw(grid)
+        draw.text((3, 2), "unedited", fill="black")
+        for c, (block, kind, strength, k) in enumerate(cols, start=1):
+            short = block.replace("_blocks", "").replace(".attentions", "")
+            draw.text((c * size + 3, 2), f"{kind} {short}\nk={k} x{strength:g}", fill="black")
+        for r, b in enumerate(bases):
+            y = head + r * size
+            paths = [base_by_name[b]["image"]] + [image_of.get((bl, kd, st, b)) for bl, kd, st, _ in cols]
+            for c, path in enumerate(paths):
+                if path and os.path.exists(path):
+                    grid.paste(Image.open(path).convert("RGB").resize((size, size)), (c * size, y))
+                else:
+                    draw.rectangle([c * size, y, c * size + size - 1, y + size - 1], fill="lightgray")
+        save_image(grid, os.path.join(d, f"{safe(concept)}_{run_tag(args)}.jpg"))
+    print(f"injection panels -> {d}")
 
 
 def run_inject_scoring(args, models: UCModels, jobs: list, base_by_name: dict, device):
@@ -1596,7 +1752,8 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
         diff = np.abs(edited - original).mean(axis=-1)
 
         row = {
-            **{k: j[k] for k in ["subject", "concept_type", "method", "block", "kind", "feature_idx", "strength"]},
+            **{k: j[k] for k in ["subject", "concept_type", "method", "block", "kind", "feature_idx", "strength",
+                                 "n_latents"]},
             "base": base["name"], "base_subject": base["subject"], "base_prompt": base["prompt"],
             "image": j["image"],
             "probe_bce": j["probe"].get("bce"), "probe_loss_explained": j["probe"].get("loss_explained"),
@@ -1732,9 +1889,7 @@ def main(args):
         save_panels(args, answers, var_list)
 
     # stage 6
-    if not args.disable_inject and args.auto_k:
-        print("skipping injection (stage 6): it adds one latent's direction, and --auto_k zeroes sets")
-    elif not args.disable_inject:
+    if not args.disable_inject:
         # run_base writes {out_dir}/base - point it at the shared cache
         cache_args = argparse.Namespace(**{**vars(args), "out_dir": args.cache_dir})
         if args.disable_base:
@@ -1746,6 +1901,8 @@ def main(args):
         if not args.disable_inject_generate:
             unique = list({j["image"]: j for j in i_jobs}.values())
             run_ablate_generate(args, models, unique, base_by_name, device)
+        if not args.disable_inject_panels:
+            save_inject_panels(args, i_jobs, base_by_name)
         if args.prepare_only:
             print("prepared cache in", args.cache_dir)
             return

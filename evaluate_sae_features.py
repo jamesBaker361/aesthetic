@@ -690,16 +690,22 @@ def run_ablate_generate(args, models: Models, jobs: list, base_by_name: dict, de
         if base["name"] not in masks:
             masks[base["name"]], _ = load_sam(base["image"], base["subject"])
         sae = models.get_sae(job["block"])
-        idx = job["feature_idx"]
-
-        if args.inject_value == "pos_mean" and job["pos_mean"] is not None:
-            value = job["pos_mean"]
-        elif args.sae_source == "local":
-            value = load_feature_mean(job["block"], idx, device)
-        else:
-            value = job["pos_mean"] or 1.0
+        idx = job.get("latents", job["feature_idx"])  # one latent, or a set injected together
         to_vec = torch.zeros(sae.n_dirs, device=device, dtype=torch.float32)
-        to_vec[idx] = value
+        if isinstance(idx, (list, tuple)):
+            # a set: job["values"] gives each latent's value; None -> the SAE checkpoint's mean.pt
+            values = job.get("values") or [None] * len(idx)
+            values = [v if v is not None else (load_feature_mean(job["block"], i, device) if args.sae_source == "local"
+                                               else 1.0) for i, v in zip(idx, values)]
+            to_vec[list(idx)] = torch.tensor(values, device=device, dtype=torch.float32)
+        else:
+            if args.inject_value == "pos_mean" and job["pos_mean"] is not None:
+                value = job["pos_mean"]
+            elif args.sae_source == "local":
+                value = load_feature_mean(job["block"], idx, device)
+            else:
+                value = job["pos_mean"] or 1.0
+            to_vec[idx] = value
 
         hook_dict = make_add_position_hook_dict({job["block"]: sae}, {job["block"]: to_vec},
                                                 args.start_step, args.end_step, job["strength"],
@@ -878,7 +884,7 @@ def save_panels(jobs: list, base_by_name: dict):
 # ---------------------------------------------------------------- stage 4
 
 def make_zero_hook(sae, feature_idx: int, mode: str, start_step: int, end_step: int, device,
-                   scale=0.0):
+                   scale=0.0, thresholds=None):
     '''
     Sets one latent (or a list of them) to scale x its value at every patch -
     0 by default, i.e. removed - and leaves everything else as is: encode the
@@ -887,10 +893,12 @@ def make_zero_hook(sae, feature_idx: int, mode: str, start_step: int, end_step: 
     the block's output. scale is one number or one per latent in feature_idx
     (e.g. SAeUron's gamma x each latent's mean concept activation); -1 flips
     a latent, 1 is a no-op. Patches where a latent wasn't in the top-k are
-    untouched.
+    untouched. thresholds (one per latent): only patches where the latent is
+    above it are edited - SAeUron's mask (its mean over all concepts).
     '''
     step_counter = {"step": 0}
     keep = 1.0 - torch.as_tensor(scale, dtype=torch.float32, device=device)  # () or (len(feature_idx),)
+    thr = None if thresholds is None else torch.as_tensor(thresholds, dtype=torch.float32, device=device)
 
     def hook_fn(module, input, output):
         step = step_counter["step"]
@@ -901,7 +909,8 @@ def make_zero_hook(sae, feature_idx: int, mode: str, start_step: int, end_step: 
             x = x.permute(0, 2, 3, 1).float()
             latents = sae.encode(x)
             onehot = torch.zeros_like(latents)
-            onehot[..., feature_idx] = latents[..., feature_idx] * keep
+            a = latents[..., feature_idx]
+            onehot[..., feature_idx] = a * (keep if thr is None else torch.where(a > thr, keep, torch.zeros_like(a)))
             delta = sae.decoder(onehot).permute(0, 3, 1, 2)
             out = (out.float() - delta).to(device=device, dtype=orig_dtype)
             output = (out, *output[1:]) if isinstance(output, tuple) else out
@@ -997,7 +1006,7 @@ def run_remove_generate(args, models: Models, jobs: list):
     for n, job in enumerate(todo):
         sae = models.get_sae(job["block"])
         hook = make_zero_hook(sae, job["feature_idx"], args.mode, args.start_step, args.end_step, models.device,
-                              scale=job.get("scale", 0.0))
+                              scale=job.get("scale", 0.0), thresholds=job.get("thresholds"))
         os.makedirs(os.path.dirname(job["image"]), exist_ok=True)
         save_image(generate(pipe, job["prompt"], job["seed"], args, {f"unet.{job['block']}": hook}), job["image"])
         if n % 200 == 0:
