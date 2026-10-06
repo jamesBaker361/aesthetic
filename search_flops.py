@@ -29,23 +29,31 @@
 #     --discover_seeds 0 --eval_seeds 188 --cache_dir evaluation/uc/cache \
 #     --out_dir evaluation/uc_auto/f1_all_autok_accuracy_autog --object_mask_methods sam --rules f1 \
 #     --eval_scope all --n_random_controls 0 --auto_k --auto_k_metric accuracy --auto_gamma --remove_mode saeuron
-# Writes {out_dir}/search_flops.json.
+# scripts/uc_search_flops.sh does this for every run of uc_top6 / uc_rest6 / uc_saeuron_baseline_all_objects.sh.
+# A run without --auto_k / --auto_gamma (SAeUron's paper recipe, --remove_scale_preset saeuron) is costed as
+# the grid itself, since its per-concept tau / gamma are what that grid search picks.
+#
+# Writes {out_dir}/search_flops.json and one row per edit to {outputs_dir}/uc_search_flops.csv (merged across
+# runs like uc_results.csv; compared in uc_results_viz.ipynb). The per-image GPU costs are measured once per
+# pipeline setting and cached in {cache_dir}/search_flops_gpu.json.
 
 import os
-import json
 from contextlib import contextmanager
 
 import numpy as np
+import pandas as pd
 import torch
 from PIL import Image
 from torch.utils.flop_counter import FlopCounterMode
 
 from attribution import DEFAULT_BLOCK_LIST
-from evaluate_sae_features import generate, make_zero_hook, load_block_codes, load_json, sam_mask
+from evaluate_sae_features import (
+    generate, make_zero_hook, load_block_codes, load_json, save_json, sam_mask, write_outputs_results,
+)
 from evaluate_unlearncanvas import (
     parser, CLASSES, STYLES, UCModels, discover_entries, concept_entries, concept_methods,
     answer_entries, load_features, variants, auto_gamma_path, auto_gamma_key, auto_rules,
-    saeuron_scores, image_mean_codes, top_n, patch_labels, sam_query, load_attribution,
+    saeuron_scores, image_mean_codes, top_n, patch_labels, sam_query, load_attribution, k_metric,
 )
 from sparse_probe import select_bce_and_f1, smallest_k
 
@@ -118,28 +126,47 @@ def gpu_flops(fn) -> float:
     return float(fc.get_total_flops())
 
 
-def measure_gpu(args, models, entries, targets, block_list):
+def gpu_key(args) -> str:
+    '''Per-image GPU costs depend only on the pipeline, so they are measured once and shared by every run.'''
+    return "|".join(map(str, [args.size, args.num_inference_steps, f"{args.guidance_scale:g}", args.mode,
+                              args.sae_source, args.mixed_precision, args.style_ckpt, args.class_ckpt]))
+
+
+def measure_gpu(args, device, entries, targets, block_list):
+    '''{"gen": {block: FLOPs}, "cls", "sam"}, cached in {cache_dir}/search_flops_gpu.json per gpu_key.'''
+    path = os.path.join(args.cache_dir, "search_flops_gpu.json")
+    cache = load_json(path, {})
+    out = cache.get(gpu_key(args), {"gen": {}})
+    need_sam = any("sam" in concept_methods(args, t) for t, _ in targets) and "sam" not in out
+    todo = [b for b in block_list if b not in out["gen"]]
+    if not todo and "cls" in out and not need_sam:
+        return out
+    models = UCModels(args, device)
     e = entries[concept_entries(args, entries, *targets[0])[0]]
     prompt = answer_entries(args)[0]["prompt"]
-    out = {"gen": {}}
-    pipe = models.get_pipe()
-    for block in block_list:
-        sae = models.get_sae(block)
-        hook = make_zero_hook(sae, [0, 1, 2], args.mode, args.start_step, args.end_step, models.device, scale=-10.0)
-        with torch.no_grad():
-            out["gen"][block] = gpu_flops(lambda: generate(pipe, prompt, 0, args, {f"unet.{block}": hook}))
-    uc = models.get_uc()
-    out["cls"] = gpu_flops(lambda: uc.batch([e["image"]]))
-    out["sam"] = None
-    if any("sam" in concept_methods(args, t) for t, _ in targets):
+    if todo:
+        pipe = models.get_pipe()
+        for block in todo:
+            sae = models.get_sae(block)
+            hook = make_zero_hook(sae, [0, 1, 2], args.mode, args.start_step, args.end_step, device, scale=-10.0)
+            with torch.no_grad():
+                out["gen"][block] = gpu_flops(lambda: generate(pipe, prompt, 0, args, {f"unet.{block}": hook}))
+    if "cls" not in out:
+        uc = models.get_uc()
+        out["cls"] = gpu_flops(lambda: uc.batch([e["image"]]))
+    if need_sam:
+        out["sam"] = None
         try:
             sam = models.get_sam()
             image = Image.open(e["image"]).convert("RGB")
             with torch.no_grad():
-                out["sam"] = gpu_flops(lambda: sam_mask(sam, image, sam_query(targets[0][1]), models.device))
+                out["sam"] = gpu_flops(lambda: sam_mask(sam, image, sam_query(targets[0][1]), device))
         except Exception as err:  # SAM3 ops FlopCounterMode can't trace
             print(f"! could not measure SAM3 ({err!r}) - mask cost left out")
     models.free()
+    cache = load_json(path, {})  # re-read: another run's job may have added its own settings meanwhile
+    cache[gpu_key(args)] = out
+    save_json(path, cache)
     return out
 
 
@@ -258,56 +285,60 @@ def main(args):
         targets = targets[:args.limit]
     entries = discover_entries(args, args.object_list, args.style_list,
                                style_targets=any(t == "style" for t, _ in targets))
-    assert args.auto_k and args.auto_gamma, "cost a run made with --auto_k --auto_gamma"
+    assert args.auto_k == args.auto_gamma, "cost a run with both --auto_k and --auto_gamma, or neither"
+    auto = args.auto_k
     if "attribution" in args.rules:
         print("! attribution rule: its ranking (gradients through SDXL + classifier) is not counted, only the search")
     if any(m == "grad_eclip" for t, _ in targets for m in concept_methods(args, t)):
         print("! grad_eclip masks are not counted")
 
     var_list = variants(args, load_features(args, targets), {}, targets, block_list)
-    gpu = measure_gpu(args, UCModels(args, device), entries, targets, block_list)
-    ak = auto_k_flops(args, entries, targets, block_list)
-    ag = auto_gamma_flops(args, entries, var_list, block_list)
+    learned = [v for v in var_list if v["kind"] != "base" and v["method"] != "random"]
+    gpu = measure_gpu(args, device, entries, targets, block_list)
+    ak = auto_k_flops(args, entries, targets, block_list) if auto else {}
+    ag = auto_gamma_flops(args, entries, var_list, block_list) if auto else {}
 
     grid = len(args.sweep_gammas) * len(args.sweep_percentiles)
     n_answer = len(answer_entries(args))
-    keys = sorted(set(ak) | set(ag))
-    sam_per_key = {}
-    if gpu["sam"]:
-        for concept, method, block in keys:
-            if method == "sam":
-                n_img = len(concept_entries(args, entries, *next(t for t in targets if t[1] == concept)))
-                sam_per_key[(concept, method, block)] = n_img * gpu["sam"] / len(block_list)
-    # SAeUron needs no masks: one grid search per concept x block (summed over the run's mask methods here,
-    # as our side is, so a run with two mask methods compares two searches with two)
+    keys = sorted(set(ak) | set(ag) | {(v["subject"], v["method"], v["block"]) for v in learned})
+    n_img = {c: len(concept_entries(args, entries, t, c)) for t, c in targets}
+    sam_per_key = {k: n_img[k[0]] * gpu["sam"] / len(block_list)
+                   for k in keys if auto and k[1] == "sam" and gpu.get("sam")}
+    # SAeUron needs no masks: one grid search per concept x block (per mask method too, as our side is)
     saeuron = {k: grid * n_answer * (gpu["gen"][k[2]] + gpu["cls"]) for k in keys}
-    ours = {k: ak.get(k, 0.0) + ag.get(k, 0.0) + sam_per_key.get(k, 0.0) for k in keys}
+    # without --auto_k / --auto_gamma (SAeUron's paper recipe: tau and gamma from its Table 5) the per-concept
+    # settings are what the grid search picks, so that run's search is the grid itself
+    ours = {k: ak.get(k, 0.0) + ag.get(k, 0.0) + sam_per_key.get(k, 0.0) if auto else saeuron[k] for k in keys}
     tot = {"saeuron_grid": sum(saeuron.values()), "auto_k": sum(ak.values()), "auto_gamma": sum(ag.values()),
            "sam_masks": sum(sam_per_key.values()), "ours": sum(ours.values())}
     n = len(keys)
 
-    print(f"\nlike-for-like search cost - {n} edits (concept x mask method x block), rules {args.rules}")
+    print(f"\nlike-for-like search cost - {n} edits (concept x mask method x block), rules {args.rules}, "
+          f"k metric {k_metric(args)}, search {'auto-k + auto-γ' if auto else 'grid (preset)'}")
     print(f"pipeline: sdxl-turbo {args.size}px, {args.num_inference_steps} step(s), guidance {args.guidance_scale:g}; "
           f"one grid setting = {n_answer} answer images; per image: generate "
-          + ", ".join(f"{b.replace('_blocks', '').replace('.attentions', '')} {fmt(f)}" for b, f in gpu["gen"].items())
-          + f", classifiers {fmt(gpu['cls'])}" + (f", SAM3 {fmt(gpu['sam'])}" if gpu["sam"] else ""))
+          + ", ".join(f"{b.replace('_blocks', '').replace('.attentions', '')} {fmt(gpu['gen'][b])}" for b in block_list)
+          + f", classifiers {fmt(gpu['cls'])}" + (f", SAM3 {fmt(gpu['sam'])}" if gpu.get("sam") else ""))
     rows = [(f"SAeUron grid ({len(args.sweep_gammas)} γ x {len(args.sweep_percentiles)} τ = {grid} settings)",
              tot["saeuron_grid"]),
-            ("ours: auto-k", tot["auto_k"]), ("ours: auto-γ", tot["auto_gamma"]),
-            ("ours: SAM masks", tot["sam_masks"]), ("ours: total", tot["ours"])]
+            ("this run: auto-k", tot["auto_k"]), ("this run: auto-γ", tot["auto_gamma"]),
+            ("this run: SAM masks", tot["sam_masks"]), ("this run: total", tot["ours"])]
     print(f"\n{'':52s}{'per edit':>14s}{'run total':>14s}")
     for name, f in rows:
         print(f"{name:52s}{fmt(f / n):>14s}{fmt(f):>14s}")
-    print(f"\nSAeUron grid / ours: {tot['saeuron_grid'] / tot['ours']:.3g}x  "
-          f"(without masks: {tot['saeuron_grid'] / (tot['auto_k'] + tot['auto_gamma']):.3g}x)")
+    print(f"\nSAeUron grid / this run: {tot['saeuron_grid'] / tot['ours']:.3g}x")
 
+    # one row per edit in {outputs_dir}/uc_search_flops.csv, next to uc_results.csv (same out_dir keying)
+    kind = "+".join(args.rules)
+    df = pd.DataFrame([{"subject": k[0], "method": k[1], "block": k[2], "kind": kind, "k_metric": k_metric(args),
+                        "feature_idx": np.nan, "auto": int(auto), "grid_size": grid, "n_answer": n_answer,
+                        "saeuron_grid": saeuron[k], "auto_k": ak.get(k, 0.0), "auto_gamma": ag.get(k, 0.0),
+                        "sam_masks": sam_per_key.get(k, 0.0), "search": ours[k]} for k in keys])
+    write_outputs_results(args, df, filename="uc_search_flops.csv",
+                          keys=["subject", "method", "block", "kind", "k_metric"], replace_on=["subject", "method"])
     path = os.path.join(args.out_dir, "search_flops.json")
-    with open(path, "w") as f:
-        json.dump({"totals": tot, "n_edits": n, "grid": grid, "n_answer": n_answer, "per_image": gpu,
-                   "per_edit": {"|".join(k): {"saeuron_grid": saeuron[k], "auto_k": ak.get(k, 0.0),
-                                              "auto_gamma": ag.get(k, 0.0), "sam_masks": sam_per_key.get(k, 0.0)}
-                                for k in keys}}, f, indent=1)
-    print("wrote", path)
+    save_json(path, {"totals": tot, "n_edits": n, "grid": grid, "n_answer": n_answer, "per_image": gpu})
+    print("wrote", path, "and", os.path.join(args.outputs_dir, "uc_search_flops.csv"))
 
 
 if __name__ == "__main__":
