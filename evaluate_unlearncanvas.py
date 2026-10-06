@@ -80,6 +80,10 @@
 # Injection (stage 6) adds a concept's whole latent set (one latent, or the --auto_k set) inside the
 # base subject's SAM mask: each latent at --inject_value x strength. Images in {out_dir}/inject/...,
 # panels (base | each block x rule x strength) in {out_dir}/panels_inject/{concept}_{tag}.jpg.
+# --inject_top_k 1 3 5 (with --auto_k) also injects the first k latents of the ranking the auto-k
+# search ran over, for each k: images in {out_dir}/inject/{method}/{rule}_top{k}/..., rows with
+# k_metric "top{k}" next to the searched set's (k_metric = --auto_k_metric). uc_inject_compare_k.ipynb
+# compares them.
 #
 # Edited images: {out_dir}/answers/{method}/{rule}_{metric}/{concept}/{block}/
 # {style}_{object}_seed{seed}.jpg - rule = the variant's kind (bce, f1,
@@ -94,6 +98,10 @@
 # latents scaled to max 1, liblinear); without --auto_k the latent with the
 # largest weight at the strongest penalty that keeps one is used (kind
 # "lasso"). Per-run files get a _lasso tag.
+#
+# FID (stage 5, --disable_fid to skip): pytorch-fid features of every scored image are cached next to
+# it ({image}.fid.npy); per edit, fid / fid_target / fid_retain compare its images with the unedited
+# images of the same prompts (all / with the concept / other objects - the last needs --eval_scope all).
 #
 # --rules saeuron: SAeUron's own feature selection as a baseline (arXiv:2501.18052,
 # SAE/unlearning_utils.compute_feature_importance): each discovery image's SAE code is averaged over
@@ -259,6 +267,7 @@ from evaluate_sae_features import (
     make_zero_hook, run_remove_generate, psnr, write_outputs_results,
     run_base, run_ablate_generate, save_image, save_npz, fill_prompt, read_lines,
 )
+from evaluate_nsfw import fid_features, fid_cache_path, frechet_distance  # pytorch-fid, features cached per image
 
 
 def load_uc_constants(path: str):
@@ -384,6 +393,7 @@ parser.add_argument("--clip_model", type=str, default="openai/clip-vit-large-pat
 parser.add_argument("--object_text", type=str, default="a photo of a {}", help="VQAScore/CLIPScore text for objects")
 parser.add_argument("--style_text", type=str, default="an image in {} style", help="VQAScore/CLIPScore text for styles")
 parser.add_argument("--score_batch_size", type=int, default=16)
+parser.add_argument("--fid_batch_size", type=int, default=64)
 
 parser.add_argument("--base_prompt_file", type=str, default="prompt_dir/base_prompts.txt")
 parser.add_argument("--base_subject_file", type=str, default="prompt_dir/base_subjects.txt")
@@ -397,9 +407,12 @@ parser.add_argument("--inject_value", type=str, default="checkpoint_mean",
                          "mean.pt, its mean over the concept's positive (mask) discovery patches, or its mean over "
                          "every patch of the concept's discovery images (SAeUron's avg_acts)")
 parser.add_argument("--inject_panel_bases", type=int, default=6, help="base images (rows) per injection panel")
+parser.add_argument("--inject_top_k", nargs="*", type=int, default=[],
+                    help="with --auto_k, also inject the first k latents of each auto-k ranking for every k "
+                         "listed (e.g. 1 3 5), to compare a fixed k with the searched one; injection only")
 
 for flag in ["discover_generate", "sparsify", "masks", "attribution", "probe", "answers_generate", "answer_masks",
-             "uc", "vqa", "clip", "psnr", "summary", "panels",
+             "uc", "vqa", "clip", "psnr", "fid", "summary", "panels",
              "inject", "base", "inject_generate", "inject_masks", "inject_summary", "inject_panels"]:
     parser.add_argument(f"--disable_{flag}", action="store_true")
 
@@ -860,8 +873,13 @@ def run_tag(args) -> str:
 
 
 def k_metric(args) -> str:
-    '''The metric half of the image folder name / k_metric column.'''
-    return args.auto_k_metric if args.auto_k else "single"
+    '''
+    The metric half of the image folder name / k_metric column: --auto_k_metric with --auto_k; without it,
+    "paper" for the SAeUron baseline (its own tau per concept, Table 5) and "single" for one latent per rule.
+    '''
+    if args.auto_k:
+        return args.auto_k_metric
+    return "paper" if "saeuron" in args.rules else "single"
 
 
 # SAeUron (Cywiński & Deja, arXiv:2501.18052) Table 5, Appendix G (p. 18): per-object multiplier
@@ -955,6 +973,16 @@ def auto_rules(args) -> list:
     return [r for r in ["bce", "f1", "lasso"] if r in args.rules]
 
 
+def top_n(args) -> int:
+    '''How many leading latents of each auto-k ranking are kept with their stats (for --inject_top_k).'''
+    return max(args.inject_top_k, default=0)
+
+
+def has_top_k(args, a: dict) -> bool:
+    '''Whether a stored auto-k search kept enough of its ranking for --inject_top_k.'''
+    return "order" in a and len(a.get("order_top", [])) >= min(top_n(args), len(a["order"]))
+
+
 def features_path(args, concept: str, method: str) -> str:
     return os.path.join(args.out_dir, "features", f"{safe(concept)}__{method}.json")
 
@@ -1001,7 +1029,10 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
                 or (args.auto_k and "saeuron" in args.rules and "saeuron" not in
                     features[c]["methods"][m][block].get("auto_by_key", {}).get(auto_key(args), {}))
                 or (not args.auto_k and "saeuron" in args.rules
-                    and features[c]["methods"][m][block].get("saeuron", {}).get("tau") != saeuron_tau(args, t, c))]
+                    and features[c]["methods"][m][block].get("saeuron", {}).get("tau") != saeuron_tau(args, t, c))
+                or (args.auto_k and args.inject_top_k and not all(
+                    has_top_k(args, a) for a in features[c]["methods"][m][block].get("auto_by_key", {})
+                    .get(auto_key(args), {}).values()))]
         if not todo:
             continue
         idx_all, val_all, owner, (gh, gw), n_dirs = load_block_codes(entries, block)
@@ -1020,7 +1051,8 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
             auto = None
             if args.auto_k:
                 auto = {"rules": auto_rules(args), "groups": owner[rows], "frac": args.auto_k_frac,
-                        "metric": args.auto_k_metric, "max_k": args.auto_k_max, "seed": args.seed}
+                        "metric": args.auto_k_metric, "max_k": args.auto_k_max, "seed": args.seed,
+                        "top_n": top_n(args)}
             result = select_bce_and_f1(idx_all[rows], val_all[rows], labels, n_dirs,
                                        args.bce_ridge, args.bce_newton_steps,
                                        lasso="lasso" in args.rules and not args.auto_k, auto=auto)
@@ -1046,6 +1078,8 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
                         res = smallest_k(idx_all[rows], val_all[rows], labels, owner[rows], n_dirs, order,
                                          frac=args.auto_k_frac, metric=args.auto_k_metric, seed=args.seed)
                         res["top"] = [describe(j, attr["scores"][i]) for i, j in enumerate(res["latents"])]
+                        res["order_top"] = [describe(j, attr["scores"][i])
+                                            for i, j in enumerate(res["order"][:top_n(args)])]
                         result["auto_by_key"].setdefault(auto_key(args), {})["attribution"] = res
                     elif attr["order"]:
                         result["attribution"] = {"key": attribution_key(args),
@@ -1061,6 +1095,7 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
                                      order[:args.auto_k_max], frac=args.auto_k_frac, metric=args.auto_k_metric,
                                      seed=args.seed)
                     res["top"] = [describe_s(j) for j in res["latents"]]
+                    res["order_top"] = [describe_s(j) for j in res["order"][:top_n(args)]]
                     result["auto_by_key"].setdefault(auto_key(args), {})["saeuron"] = res
                 elif order:
                     tau = saeuron_tau(args, ctype, concept)
@@ -1095,7 +1130,7 @@ def edit_dir(args, v: dict, root: str = "answers") -> str:
     {out_dir}/{root}/{method}/{rule}_{metric}/{concept}/{block}: no latent ids in the path. A gamma sweep
     (several --remove_scale values) adds a g{gamma} level so the sweep's images don't share a folder.
     '''
-    parts = [args.out_dir, root, v["method"], f"{v['kind']}_{k_metric(args)}", safe(v["subject"]),
+    parts = [args.out_dir, root, v["method"], f"{v['kind']}_{v.get('k_metric', k_metric(args))}", safe(v["subject"]),
              safe(v["block"].replace(".", "_"))]
     if len(args.remove_scale) > 1 and not args.auto_gamma and args.remove_scale_preset == "none":
         parts.append(f"g{v['gamma']:g}")
@@ -1386,6 +1421,43 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
     return scaled
 
 
+def top_k_variants(args, features: dict, targets: list, block_list: list) -> list:
+    '''
+    --inject_top_k: for every auto-k variant, the first k latents of the same ranking the search ran over
+    (per-latent BCE / F1, lasso weight, attribution or SAeUron score), for each k listed. kind is the rule
+    (bce+f1 when both rankings give the same set), k_metric "top{k}", so images go to
+    {rule}_top{k}/ next to the searched {rule}_{metric}/. Injection only - no removal images.
+    '''
+    if not (args.auto_k and args.inject_top_k):
+        return []
+    out = []
+    for ctype, concept in targets:
+        common = {"subject": concept, "concept_type": ctype}
+        for method, per_block in features.get(concept, {}).get("methods", {}).items():
+            if method not in concept_methods(args, ctype):
+                continue
+            for block in block_list:
+                found = (per_block.get(block) or {}).get("auto_by_key", {}).get(auto_key(args), {})
+                found = {r: a for r, a in found.items() if r in args.rules and a.get("order_top")}
+                for k in args.inject_top_k:
+                    picks = {r: a["order_top"][:k] for r, a in found.items() if len(a["order_top"]) >= k}
+                    same = "bce" in picks and "f1" in picks and \
+                        [d["idx"] for d in picks["bce"]] == [d["idx"] for d in picks["f1"]]
+                    rules = (["bce+f1"] if same else []) + [r for r in picks if not (same and r in ("bce", "f1"))]
+                    for rule in rules:
+                        top = picks["bce" if rule == "bce+f1" else rule]
+                        out.append({**common, "method": method, "block": block, "kind": rule,
+                                    "feature_idx": top[0]["idx"], "latents": [d["idx"] for d in top],
+                                    "probe": top[0], "latent_stats": top, "k_metric": f"top{k}",
+                                    "remove_mode": args.remove_mode,
+                                    "auto_gamma_target": args.auto_gamma_target if args.auto_gamma else 0.0})
+    for v in out:  # same scale fields as the first --remove_scale copy of a variant, which inject_jobs keeps
+        scale = float("nan") if args.auto_gamma else remove_scales(args, v)[0]
+        v.update({"remove_scale": scale, "gamma": None if args.auto_gamma else scale})
+    print(f"--inject_top_k {args.inject_top_k}: {len(out)} fixed-k injection variants")
+    return out
+
+
 def variant_image(args, v: dict, a: dict) -> str:
     if v["kind"] == "base":
         return a["image"]
@@ -1473,6 +1545,31 @@ def run_scoring(args, models: UCModels, answers: list, var_list: list, device):
         ensure_text_scores(models.get_vqa, "vqa", text_pairs, args.score_batch_size, model=args.vqa_model)
     if not args.disable_clip:
         ensure_text_scores(models.get_clip, "clip", text_pairs, args.score_batch_size, model=args.clip_model)
+    if not args.disable_fid:
+        base = sorted({a["image"] for a in answers if os.path.exists(a["image"])})
+        fid_features(models, sorted(set(images) | set(base)), args.fid_batch_size)
+
+
+def add_fid(args, df: pd.DataFrame, keys: list) -> pd.DataFrame:
+    '''
+    Per edit (one keys group): pytorch-fid FID of its images against the unedited images of the same
+    prompts - fid (all), fid_target (images with the concept), fid_retain (the others, --eval_scope all
+    only). Written on every row of the group, so means / summaries carry it. FID from a few dozen images
+    is biased upward - compare edits with the same image counts, not to published values.
+    '''
+    def feats(paths):
+        paths = [p for p in paths if os.path.exists(fid_cache_path(p))]
+        return np.stack([np.load(fid_cache_path(p)) for p in paths]) if paths else np.zeros((0, 2048))
+
+    df = df.copy()
+    for col in ["fid", "fid_target", "fid_retain"]:
+        df[col] = np.nan
+    for _, g in df[df["kind"] != "base"].groupby(keys, dropna=False):
+        for col, part in [("fid", g), ("fid_target", g[g["is_target"] == 1]), ("fid_retain", g[g["is_target"] == 0])]:
+            if len(part) >= 2:
+                df.loc[part.index if col != "fid" else g.index, col] = frechet_distance(
+                    feats(part["image"]), feats(part["base_image"]))
+    return df
 
 
 def build_results(args, answers: list, var_list: list):
@@ -1494,7 +1591,7 @@ def build_results(args, answers: list, var_list: list):
                    ["recall_before", "recall_after", "fp_before", "fp_after", "still_positive",
                     "change_on", "change_off"]},
                 "latents": ";".join(str(i) for i in v["latents"]),
-                "object": a["object"], "style": a["style"], "seed": a["seed"], "image": path,
+                "object": a["object"], "style": a["style"], "seed": a["seed"], "image": path, "base_image": a["image"],
                 "is_target": float(target),
                 "probe_bce": v["probe"].get("bce"), "probe_loss_explained": v["probe"].get("loss_explained"),
                 "probe_f1": v["probe"].get("f1"),
@@ -1535,6 +1632,10 @@ def build_results(args, answers: list, var_list: list):
     if df.empty:
         print("no scored rows yet")
         return df
+    fid_keys = ["subject", "concept_type", "method", "block", "kind", "k_metric", "remove_mode", "remove_scale",
+                "auto_gamma_target"]
+    if not args.disable_fid:
+        df = add_fid(args, df, fid_keys)
     df.to_csv(os.path.join(args.out_dir, f"uc_results_{run_tag(args)}.csv.gz"), index=False)
 
     keys = ["subject", "concept_type", "method", "block", "kind", "k_metric", "remove_mode", "remove_scale",
@@ -1542,7 +1643,7 @@ def build_results(args, answers: list, var_list: list):
     metrics = ["UA", "IRA", "CRA", "CRA_target", "p_target", "style_acc", "object_acc", "sam_removed", "sam_score", "sam_area",
                "vqa", "clip", "psnr_target", "psnr_retain",
                "probe_bce", "probe_loss_explained", "probe_f1",
-               "n_latents", "probe_score_all_latents", "probe_score_k_latents", "gamma",
+               "n_latents", "probe_score_all_latents", "probe_score_k_latents", "gamma", "fid", "fid_target", "fid_retain",
                "dense_recall_before", "dense_recall_after", "dense_fp_before", "dense_fp_after",
                "dense_still_positive", "dense_change_on", "dense_change_off"]
     metrics = [m for m in metrics if m in df]
@@ -1566,7 +1667,7 @@ def build_results(args, answers: list, var_list: list):
              if m in summary and summary[m].notna().any()]
     print(summary.groupby(["concept_type", "method", "kind"])[shown].mean().to_string())
 
-    write_outputs_results(args, df.drop(columns=["seed", "latents"]), filename="uc_results.csv", keys=keys,
+    write_outputs_results(args, df.drop(columns=["seed", "latents", "base_image"]), filename="uc_results.csv", keys=keys,
                           replace_on=["subject", "method", "k_metric", "remove_mode", "remove_scale",
                                       "auto_gamma_target"],
                           defaults={"k_metric": "single", "remove_mode": "direct", "auto_gamma_target": 0.0,
@@ -1649,7 +1750,8 @@ def inject_jobs(args, base_entries: list, var_list: list) -> list:
         for strength in args.strength_list:
             for e in usable:
                 jobs.append({
-                    **{k: v[k] for k in ["subject", "concept_type", "method", "block", "kind", "feature_idx"]},
+                    **{k: v[k] for k in ["subject", "concept_type", "method", "block", "kind", "feature_idx",
+                                         "k_metric"]},
                     "latents": latents, "values": values, "n_latents": len(latents),
                     "probe": v["probe"], "pos_mean": pos_mean, "strength": strength, "base": e["name"],
                     "image": os.path.join(edit_dir(args, v, root="inject"), f"s{strength:g}", f"{e['name']}.jpg"),
@@ -1671,17 +1773,17 @@ def save_inject_panels(args, jobs: list, base_by_name: dict):
         by_concept.setdefault(j["subject"], []).append(j)
     for concept, js in by_concept.items():
         bases = sorted({j["base"] for j in js})[:args.inject_panel_bases]
-        cols = sorted({(j["block"], j["kind"], j["strength"], j["n_latents"]) for j in js})
-        image_of = {(j["block"], j["kind"], j["strength"], j["base"]): j["image"] for j in js}
+        cols = sorted({(j["block"], j["kind"], j["k_metric"], j["strength"], j["n_latents"]) for j in js})
+        image_of = {(j["block"], j["kind"], j["k_metric"], j["strength"], j["base"]): j["image"] for j in js}
         grid = Image.new("RGB", (size * (len(cols) + 1), head + size * len(bases)), "white")
         draw = ImageDraw.Draw(grid)
         draw.text((3, 2), "unedited", fill="black")
-        for c, (block, kind, strength, k) in enumerate(cols, start=1):
+        for c, (block, kind, metric, strength, k) in enumerate(cols, start=1):
             short = block.replace("_blocks", "").replace(".attentions", "")
-            draw.text((c * size + 3, 2), f"{kind} {short}\nk={k} x{strength:g}", fill="black")
+            draw.text((c * size + 3, 2), f"{kind} {short} {metric}\nk={k} x{strength:g}", fill="black")
         for r, b in enumerate(bases):
             y = head + r * size
-            paths = [base_by_name[b]["image"]] + [image_of.get((bl, kd, st, b)) for bl, kd, st, _ in cols]
+            paths = [base_by_name[b]["image"]] + [image_of.get((bl, kd, km, st, b)) for bl, kd, km, st, _ in cols]
             for c, path in enumerate(paths):
                 if path and os.path.exists(path):
                     grid.paste(Image.open(path).convert("RGB").resize((size, size)), (c * size, y))
@@ -1752,8 +1854,8 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
         diff = np.abs(edited - original).mean(axis=-1)
 
         row = {
-            **{k: j[k] for k in ["subject", "concept_type", "method", "block", "kind", "feature_idx", "strength",
-                                 "n_latents"]},
+            **{k: j[k] for k in ["subject", "concept_type", "method", "block", "kind", "k_metric", "feature_idx",
+                                 "strength", "n_latents"]},
             "base": base["name"], "base_subject": base["subject"], "base_prompt": base["prompt"],
             "image": j["image"],
             "probe_bce": j["probe"].get("bce"), "probe_loss_explained": j["probe"].get("loss_explained"),
@@ -1799,7 +1901,7 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
         return df
     df.to_csv(os.path.join(args.out_dir, f"inject_results_{run_tag(args)}.csv"), index=False)
 
-    keys = ["subject", "concept_type", "method", "block", "kind", "strength"]
+    keys = ["subject", "concept_type", "method", "block", "kind", "k_metric", "strength"]
     metrics = [c for c in df.columns if c not in keys and c != "feature_idx"
                and pd.api.types.is_numeric_dtype(pd.to_numeric(df[c], errors="coerce"))
                and df[c].notna().any() and c not in ["base", "base_subject", "base_prompt", "image"]]
@@ -1813,7 +1915,7 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
 
     shown = [m for m in ["mask_iou", "base_subject_remaining", "vqa_subject_gain", "uc_classified_as",
                          "uc_p_target_gain", "background_psnr"] if m in df]
-    print(df.groupby(["concept_type", "method", "kind", "strength"])[shown].mean().to_string())
+    print(df.groupby(["concept_type", "method", "kind", "k_metric", "strength"])[shown].mean().to_string())
     write_outputs_results(args, df, filename="uc_inject_results.csv", keys=keys, replace_on=["subject", "method"])
     return df
 
@@ -1897,7 +1999,10 @@ def main(args):
         else:
             base_entries = run_base(cache_args, models, device)
         base_by_name = {e["name"]: e for e in base_entries}
-        i_jobs = inject_jobs(args, base_entries, var_list)
+        top_k = top_k_variants(args, features, targets, block_list)
+        if args.inject_value == "concept_mean":
+            attach_latent_means(args, entries, top_k, block_list)
+        i_jobs = inject_jobs(args, base_entries, var_list + top_k)
         if not args.disable_inject_generate:
             unique = list({j["image"]: j for j in i_jobs}.values())
             run_ablate_generate(args, models, unique, base_by_name, device)
