@@ -201,7 +201,8 @@ def smallest_k(idx: np.ndarray, val: np.ndarray, labels: np.ndarray, groups: np.
     (groups = image id per patch) and scored on the held-out rest. k is found
     by binary search over 1..len(order), which assumes the score rises with k
     (every evaluated k is kept in "curve" to check that).
-    Returns {"k", "latents", "full", "target", "score", "curve", "metric"}.
+    Returns {"k", "latents", "full", "target", "score", "curve", "metric", "order"} - "order" is the
+    ranking searched, so a fixed top-k of the same ranking can be compared with the k found.
     '''
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
@@ -240,7 +241,7 @@ def smallest_k(idx: np.ndarray, val: np.ndarray, labels: np.ndarray, groups: np.
     lo, hi = 1, len(order)
     if hi == 0:
         return {"k": 0, "latents": [], "full": full, "target": target, "score": float("nan"), "curve": {},
-                "metric": metric}
+                "metric": metric, "order": []}
     if not at(hi) >= target:
         lo = hi  # even every candidate misses the target: use them all
     while lo < hi:
@@ -250,7 +251,8 @@ def smallest_k(idx: np.ndarray, val: np.ndarray, labels: np.ndarray, groups: np.
         else:
             lo = mid + 1
     return {"k": lo, "latents": [int(j) for j in order[:lo]], "full": full, "target": target,
-            "score": at(lo), "curve": {str(k): v for k, v in sorted(curve.items())}, "metric": metric}
+            "score": at(lo), "curve": {str(k): v for k, v in sorted(curve.items())}, "metric": metric,
+            "order": [int(j) for j in order]}
 
 
 def select_bce_and_f1(idx: np.ndarray, val: np.ndarray, labels: np.ndarray, n_dirs: int,
@@ -270,6 +272,8 @@ def select_bce_and_f1(idx: np.ndarray, val: np.ndarray, labels: np.ndarray, n_di
     orders the latents by importance - "bce": per-latent BCE, "f1": per-latent
     F1 (both only positive-weight latents), "lasso": lasso_select's weights -
     and the smallest k reaching frac of the all-latent classifier is kept.
+    auto["top_n"] (optional) also describes the first top_n latents of each
+    ranking as "order_top", for fixed top-k sets of the same ranking.
     '''
     w, b, loss = fit_sparse_1d_ridge_logistic(idx, val, labels, n_dirs, ridge, n_newton_steps)
     tp, fp, fn = sparse_per_latent_confusion(idx, val, labels, w, b)
@@ -322,6 +326,7 @@ def select_bce_and_f1(idx: np.ndarray, val: np.ndarray, labels: np.ndarray, n_di
             res = smallest_k(idx, val, labels, auto["groups"], n_dirs, order[:auto["max_k"]],
                              frac=auto["frac"], metric=auto["metric"], seed=auto["seed"])
             res["top"] = [describe(j) for j in res["latents"]]
+            res["order_top"] = [describe(j) for j in res["order"][:auto.get("top_n", 0)]]
             out["auto"][rule] = res
     if lasso:
         sel = lasso_select(idx, val, labels, n_dirs, top_k)
