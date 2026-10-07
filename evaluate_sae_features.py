@@ -689,27 +689,32 @@ def run_ablate_generate(args, models: Models, jobs: list, base_by_name: dict, de
         base = base_by_name[job["base"]]
         if base["name"] not in masks:
             masks[base["name"]], _ = load_sam(base["image"], base["subject"])
-        sae = models.get_sae(job["block"])
-        idx = job.get("latents", job["feature_idx"])  # one latent, or a set injected together
-        to_vec = torch.zeros(sae.n_dirs, device=device, dtype=torch.float32)
-        if isinstance(idx, (list, tuple)):
-            # a set: job["values"] gives each latent's value; None -> the SAE checkpoint's mean.pt
-            values = job.get("values") or [None] * len(idx)
-            values = [v if v is not None else (load_feature_mean(job["block"], i, device) if args.sae_source == "local"
-                                               else 1.0) for i, v in zip(idx, values)]
-            to_vec[list(idx)] = torch.tensor(values, device=device, dtype=torch.float32)
-        else:
-            if args.inject_value == "pos_mean" and job["pos_mean"] is not None:
-                value = job["pos_mean"]
-            elif args.sae_source == "local":
-                value = load_feature_mean(job["block"], idx, device)
+        # job["parts"] = {block: {"latents", "values"}} injects at several blocks at once
+        parts = job.get("parts") or {job["block"]: {"latents": job.get("latents", job["feature_idx"]),
+                                                    "values": job.get("values")}}
+        sae_dict, vec_dict = {}, {}
+        for block, part in parts.items():
+            sae = models.get_sae(block)
+            idx = part["latents"]  # one latent, or a set injected together
+            to_vec = torch.zeros(sae.n_dirs, device=device, dtype=torch.float32)
+            if isinstance(idx, (list, tuple)):
+                # a set: each latent's value; None -> the SAE checkpoint's mean.pt
+                values = part.get("values") or [None] * len(idx)
+                values = [v if v is not None else (load_feature_mean(block, i, device) if args.sae_source == "local"
+                                                   else 1.0) for i, v in zip(idx, values)]
+                to_vec[list(idx)] = torch.tensor(values, device=device, dtype=torch.float32)
             else:
-                value = job["pos_mean"] or 1.0
-            to_vec[idx] = value
+                if args.inject_value == "pos_mean" and job["pos_mean"] is not None:
+                    value = job["pos_mean"]
+                elif args.sae_source == "local":
+                    value = load_feature_mean(block, idx, device)
+                else:
+                    value = job["pos_mean"] or 1.0
+                to_vec[idx] = value
+            sae_dict[block], vec_dict[block] = sae, to_vec
 
-        hook_dict = make_add_position_hook_dict({job["block"]: sae}, {job["block"]: to_vec},
-                                                args.start_step, args.end_step, job["strength"],
-                                                device, masks[base["name"]])
+        hook_dict = make_add_position_hook_dict(sae_dict, vec_dict, args.start_step, args.end_step,
+                                                job["strength"], device, masks[base["name"]])
         os.makedirs(os.path.dirname(job["image"]), exist_ok=True)
         save_image(generate(pipe, base["prompt"], base["seed"], args, hook_dict), job["image"])
         if n % 200 == 0:
@@ -1004,11 +1009,16 @@ def run_remove_generate(args, models: Models, jobs: list):
         return
     pipe = models.get_pipe()
     for n, job in enumerate(todo):
-        sae = models.get_sae(job["block"])
-        hook = make_zero_hook(sae, job["feature_idx"], args.mode, args.start_step, args.end_step, models.device,
-                              scale=job.get("scale", 0.0), thresholds=job.get("thresholds"))
+        # job["parts"] = {block: {"latents", "scale", "thresholds"}} edits several blocks at once;
+        # otherwise one block: job["block"] / "feature_idx" / "scale" / "thresholds"
+        parts = job.get("parts") or {job["block"]: {"latents": job["feature_idx"], "scale": job.get("scale", 0.0),
+                                                    "thresholds": job.get("thresholds")}}
+        hooks = {f"unet.{block}": make_zero_hook(models.get_sae(block), p["latents"], args.mode, args.start_step,
+                                                 args.end_step, models.device, scale=p.get("scale", 0.0),
+                                                 thresholds=p.get("thresholds"))
+                 for block, p in parts.items()}
         os.makedirs(os.path.dirname(job["image"]), exist_ok=True)
-        save_image(generate(pipe, job["prompt"], job["seed"], args, {f"unet.{job['block']}": hook}), job["image"])
+        save_image(generate(pipe, job["prompt"], job["seed"], args, hooks), job["image"])
         if n % 200 == 0:
             print(f"  remove {n}/{len(todo)}")
 

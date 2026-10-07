@@ -103,6 +103,14 @@
 # it ({image}.fid.npy); per edit, fid / fid_target / fid_retain compare its images with the unedited
 # images of the same prompts (all / with the concept / other objects - the last needs --eval_scope all).
 #
+# --joint_blocks: instead of choosing latents block by block (and then needing a per-concept block
+# choice), every rule works on one feature space - all --block_list blocks side by side (at 512 px the
+# four default blocks share a 16x16 patch grid, so each patch has a code at every block; joint latent id
+# = block offset + latent). bce / f1 rank all of them, lasso / auto-k fit across them, saeuron scores
+# them together, attribution merges the per-block rankings. The chosen set is edited at every block it
+# spans in the same pass (one hook per block); auto-gamma pools its probe check over those blocks.
+# Tables show block "joint"; per-run files get a _joint tag.
+#
 # --rules saeuron: SAeUron's own feature selection as a baseline (arXiv:2501.18052,
 # SAE/unlearning_utils.compute_feature_importance): each discovery image's SAE code is averaged over
 # its patches, and a latent's score is its share of the total mean activation on the concept's images
@@ -324,6 +332,11 @@ parser.add_argument("--rules", nargs="*", default=["bce", "f1"], choices=["bce",
                     help="which probe rule(s) pick the latent(s) that get zeroed/injected: lowest per-latent "
                          "BCE, highest per-latent F1, or 'lasso' - the latents a joint L1 logistic "
                          "regression over every latent keeps (sparse_probe.lasso_select)")
+parser.add_argument("--joint_blocks", action="store_true",
+                    help="choose latents from all --block_list blocks at once (one feature space of block x latent, "
+                         "patches aligned - every block must share the patch grid): every rule ranks / searches "
+                         "across blocks, so no per-block choice is needed; the chosen set is edited at every "
+                         "block it spans together (block 'joint' in the tables)")
 parser.add_argument("--saeuron_tau", type=int, default=0,
                     help="--rules saeuron: latents kept per concept; 0 = SAeUron's Table 5 value per object "
                          "(SAEURON_TAU; styles 1). Ignored with --auto_k")
@@ -858,6 +871,8 @@ def run_tag(args) -> str:
         tag += "_saeuron"
     if args.saeuron_mask:
         tag += "_mask"
+    if args.joint_blocks:
+        tag += "_joint"
     mode = "g" if args.remove_mode == "saeuron" else "x"  # g = gamma x mean activation, x = direct
     if args.auto_gamma:
         tag += f"_{mode}auto{args.auto_gamma_target:g}"
@@ -920,6 +935,60 @@ def saeuron_tau(args, ctype: str, concept: str) -> int:
     if args.saeuron_tau > 0:
         return args.saeuron_tau
     return SAEURON_TAU.get(concept, 1) if ctype == "object" else 1
+
+
+JOINT = "joint"  # the pseudo-block of --joint_blocks
+
+
+def joint_offsets(entries: list, block_list: list) -> list:
+    """[(block, offset, n_dirs)]: joint latent id = offset + the block's own latent id."""
+    out, offset = [], 0
+    with np.load(entries[0]["sparse"]) as d:
+        for block in block_list:
+            n = int(d[f"{block}__n_dirs"])
+            out.append((block, offset, n))
+            offset += n
+    return out
+
+
+def load_joint_codes(entries: list, block_list: list):
+    """
+    load_block_codes for every block side by side: row i is the same patch of the same image in every
+    block (all blocks must share the patch grid), its top-k codes concatenated with each block's latent
+    ids shifted by its offset -> one (n_patches, k x n_blocks) code over sum(n_dirs) latents.
+    """
+    idxs, vals, owner, grid = [], [], None, None
+    offsets = joint_offsets(entries, block_list)
+    for block, offset, n in offsets:
+        idx, val, own, g, _ = load_block_codes(entries, block)
+        if grid is not None and tuple(g) != tuple(grid):
+            raise ValueError(f"--joint_blocks needs one patch grid for every block: {block} is {g}, not {grid}")
+        grid, owner = g, own
+        idxs.append(idx.astype(np.int64) + offset)
+        vals.append(val)
+    return np.concatenate(idxs, axis=1), np.concatenate(vals, axis=1), owner, grid, sum(n for _, _, n in offsets)
+
+
+def variant_parts(args, v: dict) -> dict:
+    """{real block: [(position in v["latents"], the block's own latent id)]} - one block, or several for joint."""
+    if v["block"] != JOINT:
+        return {v["block"]: list(enumerate(v["latents"]))}
+    out = {}
+    for pos, j in enumerate(v["latents"]):
+        for block, offset, n in args.joint_offsets:
+            if offset <= j < offset + n:
+                out.setdefault(block, []).append((pos, int(j - offset)))
+                break
+    return out
+
+
+def split_by_block(args, v: dict, per_latent=None) -> dict:
+    """{block: {"latents": [...], "values": ...}}; per_latent is aligned with v["latents"] (or one scalar / None)."""
+    out = {}
+    for block, items in variant_parts(args, v).items():
+        vals = [per_latent[pos] for pos, _ in items] if isinstance(per_latent, (list, tuple)) else per_latent
+        out[block] = {"latents": [j for _, j in items], "values": vals}
+    return out
 
 
 def same_kind_concepts(args, entries: list, ctype: str, concept: str) -> dict:
@@ -1008,9 +1077,10 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
     os.makedirs(os.path.join(args.out_dir, "features"), exist_ok=True)
     features = load_features(args, targets)
 
-    for block in block_list:
+    for block in ([JOINT] if args.joint_blocks else block_list):
         todo = [(t, c, m) for t, c in targets for m in concept_methods(args, t)
                 if block not in features[c]["methods"].get(m, {})
+                or (block == JOINT and features[c]["methods"][m][block].get("joint_blocks") != list(block_list))
                 or (not args.auto_k and "lasso" in args.rules
                     and "1" not in features[c]["methods"][m][block].get("lasso_by_k", {}))
                 or (args.auto_k and not all(
@@ -1027,7 +1097,10 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
                     .get(auto_key(args), {}).values()))]
         if not todo:
             continue
-        idx_all, val_all, owner, (gh, gw), n_dirs = load_block_codes(entries, block)
+        if block == JOINT:
+            idx_all, val_all, owner, (gh, gw), n_dirs = load_joint_codes(entries, block_list)
+        else:
+            idx_all, val_all, owner, (gh, gw), n_dirs = load_block_codes(entries, block)
         means = image_mean_codes(idx_all, val_all, owner, len(entries), n_dirs) if "saeuron" in args.rules else None
         for ctype, concept, method in todo:
             own = concept_entries(args, entries, ctype, concept)
@@ -1049,6 +1122,8 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
                                        args.bce_ridge, args.bce_newton_steps,
                                        lasso="lasso" in args.rules and not args.auto_k, auto=auto)
             result["n_images"] = len(own)
+            if block == JOINT:
+                result["joint_blocks"] = list(block_list)
             # keep lasso picks and auto-k searches with other settings from earlier runs
             old = features[concept]["methods"].get(method, {}).get(block, {})
             result["lasso_by_k"] = {**old.get("lasso_by_k", {}), **result.get("lasso_by_k", {})}
@@ -1057,7 +1132,14 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
                 result["auto_by_key"][auto_key(args)] = {
                     **result["auto_by_key"].get(auto_key(args), {}), **result.pop("auto")}
             if "attribution" in args.rules:
-                attr = load_attribution(args, concept).get(block)
+                if block == JOINT:  # one ranking over every block: same objective, so the scores compare
+                    per = load_attribution(args, concept)
+                    merged = sorted(((sc, off + j) for b, off, _ in args.joint_offsets if b in per
+                                     for j, sc in zip(per[b]["order"], per[b]["scores"])), reverse=True)
+                    attr = ({"order": [j for _, j in merged], "scores": [sc for sc, _ in merged]}
+                            if all(b in per for b in block_list) else None)
+                else:
+                    attr = load_attribution(args, concept).get(block)
                 if attr is None:
                     print(f"  ! no attribution for '{concept}' @ {block} - run without --disable_attribution")
                 else:
@@ -1133,28 +1215,35 @@ def attach_latent_means(args, entries: list, var_list: list, block_list: list):
     '''
     v["latent_means"]: each latent's mean activation over every patch of the
     concept's own discovery images (SAeUron's avg_acts), for the edits with
-    gamma != 0. Uses the cached top-k codes, one block at a time.
+    gamma != 0 (and v["thresholds"] with --saeuron_mask). Uses the cached
+    top-k codes, one block at a time; a joint edit is split by block.
     '''
     need_inject = args.inject_value == "concept_mean" and not args.disable_inject
     if args.remove_mode != "saeuron" and not need_inject and not args.saeuron_mask:
         return  # direct: the scale doesn't depend on the latent's activations
     todo = [v for v in var_list if v["kind"] != "base" and (need_inject or args.saeuron_mask
                                                              or v["gamma"] is None or v["gamma"] != 0.0)]
+    for v in todo:
+        v["latent_means"] = [0.0] * len(v["latents"])
+        if args.saeuron_mask:
+            v["thresholds"] = [0.0] * len(v["latents"])
     for block in block_list:
-        here = [v for v in todo if v["block"] == block]
+        here = [(v, items) for v in todo for b, items in variant_parts(args, v).items() if b == block]
         if not here:
             continue
         idx_all, val_all, owner, _, n_dirs = load_block_codes(entries, block)
         means = image_mean_codes(idx_all, val_all, owner, len(entries), n_dirs) if args.saeuron_mask else None
-        for v in here:
+        for v, items in here:
             rows = np.isin(owner, concept_entries(args, entries, v["concept_type"], v["subject"]))
             idx, val = idx_all[rows], val_all[rows]
-            v["latent_means"] = [float(np.where(idx == j, val, 0.0).sum(axis=1).mean()) for j in v["latents"]]
+            for pos, j in items:
+                v["latent_means"][pos] = float(np.where(idx == j, val, 0.0).sum(axis=1).mean())
             if args.saeuron_mask:
                 # SAeUron's all_concept_avg_acts: the mean over concepts of each concept's mean image code
                 groups = same_kind_concepts(args, entries, v["concept_type"], v["subject"])
                 thr = np.mean([means[ns].mean(axis=0) for ns in groups.values()], axis=0)
-                v["thresholds"] = [float(thr[j]) for j in v["latents"]]
+                for pos, j in items:
+                    v["thresholds"][pos] = float(thr[j])
     for v in todo:
         means = ", ".join(f"{j}:{m:.3g}" for j, m in zip(v["latents"], v["latent_means"]))
         print(f"  {v['subject']} {v['method']} {v['kind']} @ {v['block']} gamma "
@@ -1181,16 +1270,18 @@ def auto_gamma_key(args, v: dict) -> str:
 @torch.no_grad()
 def run_auto_gamma(args, models: UCModels, entries: list, var_list: list, block_list: list):
     '''
-    For every learned edit: fit a dense probe (StandardScaler + L2 logistic
-    regression) on the block's un-encoded activations (out - in with --mode
-    diff) of ~80% of the concept's discovery images, labels = its mask. On
-    the held-out images, apply the edit offline exactly as make_zero_hook does
-    (x - decoder(onehot of the chosen latents x (1 - scale))) and binary-search
-    gamma in [--auto_gamma_min, 0] for the weakest one after which at most
-    --auto_gamma_target of the held-out mask patches the probe called positive
-    before are still positive. Sets v["gamma"] and v["gamma_search"]; results
-    are cached in {out_dir}/auto_gamma/{concept}__{method}.json. Random
-    controls get the mean gamma found for their concept at their block.
+    For every learned edit: at each block it touches, fit a dense probe
+    (StandardScaler + L2 logistic regression) on the block's un-encoded
+    activations (out - in with --mode diff) of ~80% of the concept's discovery
+    images, labels = its mask. On the held-out images, apply the edit offline
+    exactly as make_zero_hook does (x - decoder(onehot of the chosen latents x
+    (1 - scale)), each block with its own latents) and binary-search gamma in
+    [--auto_gamma_min, 0] for the weakest one after which at most
+    --auto_gamma_target of the held-out mask patches the probes called positive
+    before are still positive (pooled over the blocks a joint edit spans).
+    Sets v["gamma"] and v["gamma_search"]; cached in
+    {out_dir}/auto_gamma/{concept}__{method}.json. Random controls get the mean
+    gamma found for their concept at their block.
     '''
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
@@ -1205,19 +1296,23 @@ def run_auto_gamma(args, models: UCModels, entries: list, var_list: list, block_
             v["gamma"], v["gamma_search"] = hit["gamma"], hit
     todo = [v for v in learned if v["gamma"] is None]
     print(f"auto-gamma: {len(todo)} of {len(learned)} edits to search")
-
-    for block in block_list:
-        here = [v for v in todo if v["block"] == block]
-        if not here:
-            continue
+    if todo:
         models.free(keep="sae")
-        sae = models.get_sae(block)
-        groups = {}
-        for v in here:
-            groups.setdefault((v["concept_type"], v["subject"], v["method"]), []).append(v)
-        for (ctype, concept, method), vs in groups.items():
-            images = []  # (x (h, w, C), labels (h*w,)) per discovery image of the concept
-            for n in concept_entries(args, entries, ctype, concept):
+
+    groups = {}
+    for v in todo:
+        groups.setdefault((v["concept_type"], v["subject"], v["method"]), []).append(v)
+    for (ctype, concept, method), vs in groups.items():
+        own = concept_entries(args, entries, ctype, concept)
+        rng = np.random.default_rng(args.seed)
+        test_ids = set(rng.choice(len(own), max(1, int(round(0.2 * len(own)))), replace=False).tolist())
+        data = {}  # block -> probe + held-out activations / codes, built on first use
+
+        def block_data(block):
+            if block in data:
+                return data[block]
+            images = []
+            for n in own:
                 e = entries[n]
                 with np.load(e["embedding"]) as d:
                     out = d[f"saved_output.{block}"][0]
@@ -1225,92 +1320,115 @@ def run_auto_gamma(args, models: UCModels, entries: list, var_list: list, block_
                 x = x.transpose(1, 2, 0).astype(np.float32)
                 labels = patch_labels(args, e, ctype, concept, method, x.shape[0], x.shape[1]).reshape(-1)
                 images.append((x, labels.astype(bool)))
-            rng = np.random.default_rng(args.seed)
-            test_ids = set(rng.choice(len(images), max(1, int(round(0.2 * len(images)))), replace=False).tolist())
             train = [im for i, im in enumerate(images) if i not in test_ids] or images
             test = [im for i, im in enumerate(images) if i in test_ids]
             Xtr = np.concatenate([x.reshape(-1, x.shape[-1]) for x, _ in train])
             ytr = np.concatenate([y for _, y in train])
             if ytr.all() or not ytr.any():
-                print(f"  auto-gamma: '{concept}' ({method}) @ {block}: no mask contrast - gamma 0")
-                for v in vs:
-                    v["gamma"], v["gamma_search"] = 0.0, {"gamma": 0.0, "reached": False}
-                continue
+                data[block] = None
+                return None
             scaler = StandardScaler().fit(Xtr)
             probe = LogisticRegression(C=1.0, max_iter=2000).fit(scaler.transform(Xtr), ytr)
-
+            sae = models.get_sae(block)
             xt = [torch.tensor(x, device=models.device) for x, _ in test]
-            codes = [sae.encode(x) for x in xt]  # (h, w, n_dirs), relu'd top-k
             yte = np.concatenate([y for _, y in test])
             flat = np.concatenate([x.reshape(-1, x.shape[-1]) for x, _ in test])
             before = probe.predict(scaler.transform(flat)).astype(bool)
-            was_pos = yte & before
+            data[block] = {"sae": sae, "probe": probe, "scaler": scaler, "xt": xt,
+                           "codes": [sae.encode(x) for x in xt], "yte": yte, "before": before,
+                           "was_pos": yte & before}
+            return data[block]
 
-            for v in vs:
-                latents = list(v["latents"])
+        for v in vs:
+            parts = {b: items for b, items in variant_parts(args, v).items() if block_data(b) is not None}
+            if not parts:
+                print(f"  auto-gamma: '{concept}' ({method}) @ {v['block']}: no mask contrast - gamma 0")
+                v["gamma"], v["gamma_search"] = 0.0, {"gamma": 0.0, "reached": False}
+                continue
 
-                def measure(gamma):
-                    keep = 1.0 - torch.as_tensor(edit_scale(args, v, gamma), dtype=torch.float32,
-                                                 device=models.device)
+            def measure(gamma):
+                scale = edit_scale(args, v, gamma)
+                pooled = {"was_pos": 0, "still": 0, "pos": 0, "rec": 0, "neg": 0, "fp": 0}
+                ch_on, ch_off = [], []
+                for block, items in parts.items():
+                    d = data[block]
+                    pos_list = [pos for pos, _ in items]
+                    latents = [j for _, j in items]
+                    sc = scale if not isinstance(scale, list) else [scale[p] for p in pos_list]
+                    keep = 1.0 - torch.as_tensor(sc, dtype=torch.float32, device=models.device)
                     edited, change = [], []
-                    for x, a in zip(xt, codes):
+                    for x, a in zip(d["xt"], d["codes"]):
                         onehot = torch.zeros_like(a)
                         sel = a[..., latents]
                         if v.get("thresholds") is not None:  # SAeUron's mask, as the hook applies it
-                            thr = torch.tensor(v["thresholds"], dtype=sel.dtype, device=sel.device)
+                            thr = torch.tensor([v["thresholds"][p] for p in pos_list], dtype=sel.dtype,
+                                               device=sel.device)
                             onehot[..., latents] = torch.where(sel > thr, sel * keep, torch.zeros_like(sel))
                         else:
                             onehot[..., latents] = sel * keep
-                        delta = sae.decoder(onehot)
+                        delta = d["sae"].decoder(onehot)
                         edited.append((x - delta).reshape(-1, x.shape[-1]).cpu().numpy())
                         change.append((delta.norm(dim=-1) / x.norm(dim=-1).clamp_min(1e-6)).reshape(-1).cpu().numpy())
-                    after = probe.predict(scaler.transform(np.concatenate(edited))).astype(bool)
+                    after = d["probe"].predict(d["scaler"].transform(np.concatenate(edited))).astype(bool)
                     change = np.concatenate(change)
-                    return {"still_positive": float(after[was_pos].mean()) if was_pos.any() else 0.0,
-                            "recall_after": float(after[yte].mean()) if yte.any() else float("nan"),
-                            "fp_after": float(after[~yte].mean()) if (~yte).any() else float("nan"),
-                            "change_on": float(change[yte].mean()) if yte.any() else float("nan"),
-                            "change_off": float(change[~yte].mean()) if (~yte).any() else float("nan")}
+                    yte, was_pos = d["yte"], d["was_pos"]
+                    pooled["was_pos"] += int(was_pos.sum())
+                    pooled["still"] += int(after[was_pos].sum())
+                    pooled["pos"] += int(yte.sum())
+                    pooled["rec"] += int(after[yte].sum())
+                    pooled["neg"] += int((~yte).sum())
+                    pooled["fp"] += int(after[~yte].sum())
+                    ch_on.append(change[yte])
+                    ch_off.append(change[~yte])
+                ch_on, ch_off = np.concatenate(ch_on), np.concatenate(ch_off)
+                return {"still_positive": pooled["still"] / pooled["was_pos"] if pooled["was_pos"] else 0.0,
+                        "recall_after": pooled["rec"] / pooled["pos"] if pooled["pos"] else float("nan"),
+                        "fp_after": pooled["fp"] / pooled["neg"] if pooled["neg"] else float("nan"),
+                        "change_on": float(ch_on.mean()) if len(ch_on) else float("nan"),
+                        "change_off": float(ch_off.mean()) if len(ch_off) else float("nan")}
 
-                curve = {}
+            curve = {}
 
-                def at(g):
-                    g = float(f"{g:.4g}")  # 4 significant digits: keeps image folder names sane
-                    if g not in curve:
-                        curve[g] = measure(g)
-                    return g, curve[g]
+            def at(g):
+                g = float(f"{g:.4g}")  # 4 significant digits: keeps the numbers readable
+                if g not in curve:
+                    curve[g] = measure(g)
+                return g, curve[g]
 
-                target = args.auto_gamma_target
-                g0, m0 = at(0.0)
-                gmin, mmin = at(args.auto_gamma_min)
-                if m0["still_positive"] <= target:
-                    best, reached = g0, True
-                elif mmin["still_positive"] > target:
-                    best, reached = gmin, False
-                else:
-                    lo, hi = gmin, 0.0  # lo meets the target, hi doesn't
-                    for _ in range(args.auto_gamma_steps):
-                        g, m = at((lo + hi) / 2)
-                        if m["still_positive"] <= target:
-                            lo = g
-                        else:
-                            hi = g
-                    best, reached = lo, True
-                res = {"gamma": best, "reached": reached,
-                       "dense_recall_before": float(before[yte].mean()) if yte.any() else float("nan"),
-                       "dense_fp_before": float(before[~yte].mean()) if (~yte).any() else float("nan"),
-                       **curve[best],
-                       "curve": {f"{g:g}": round(m["still_positive"], 4) for g, m in sorted(curve.items())}}
-                v["gamma"], v["gamma_search"] = best, res
-                caches[auto_gamma_path(args, concept, method)][auto_gamma_key(args, v)] = res
-                print(f"  auto-gamma '{concept}' ({method}) {v['kind']} @ {block} {len(latents)} latents: "
-                      f"gamma {best:g}{'' if reached else ' (target NOT reached)'} - still positive "
-                      f"{res['still_positive']:.3f} (target {target:g}), recall {res['dense_recall_before']:.3f}"
-                      f" -> {res['recall_after']:.3f}, fp {res['dense_fp_before']:.3f} -> {res['fp_after']:.3f}, "
-                      f"rel. change on/off mask {res['change_on']:.3f}/{res['change_off']:.3f} | curve {res['curve']}")
-            path = auto_gamma_path(args, concept, method)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            save_json(path, caches[path])
+            target = args.auto_gamma_target
+            g0, m0 = at(0.0)
+            gmin, mmin = at(args.auto_gamma_min)
+            if m0["still_positive"] <= target:
+                best, reached = g0, True
+            elif mmin["still_positive"] > target:
+                best, reached = gmin, False
+            else:
+                lo, hi = gmin, 0.0  # lo meets the target, hi doesn't
+                for _ in range(args.auto_gamma_steps):
+                    g, m = at((lo + hi) / 2)
+                    if m["still_positive"] <= target:
+                        lo = g
+                    else:
+                        hi = g
+                best, reached = lo, True
+            yte_all = np.concatenate([data[b]["yte"] for b in parts])
+            before_all = np.concatenate([data[b]["before"] for b in parts])
+            res = {"gamma": best, "reached": reached,
+                   "dense_recall_before": float(before_all[yte_all].mean()) if yte_all.any() else float("nan"),
+                   "dense_fp_before": float(before_all[~yte_all].mean()) if (~yte_all).any() else float("nan"),
+                   **curve[best],
+                   "curve": {f"{g:g}": round(m["still_positive"], 4) for g, m in sorted(curve.items())}}
+            v["gamma"], v["gamma_search"] = best, res
+            caches[auto_gamma_path(args, concept, method)][auto_gamma_key(args, v)] = res
+            print(f"  auto-gamma '{concept}' ({method}) {v['kind']} @ {v['block']} ({', '.join(parts)}) "
+                  f"{len(v['latents'])} latents: gamma {best:g}{'' if reached else ' (target NOT reached)'} - still "
+                  f"positive {res['still_positive']:.3f} (target {target:g}), recall {res['dense_recall_before']:.3f}"
+                  f" -> {res['recall_after']:.3f}, fp {res['dense_fp_before']:.3f} -> {res['fp_after']:.3f}, "
+                  f"rel. change on/off mask {res['change_on']:.3f}/{res['change_off']:.3f} | curve {res['curve']}")
+        path = auto_gamma_path(args, concept, method)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        save_json(path, caches[path])
+        del data
 
     # random controls: the mean gamma found for the same concept at the same block
     for v in var_list:
@@ -1350,7 +1468,7 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
         for method, per_block in features.get(concept, {}).get("methods", {}).items():
             if method not in concept_methods(args, ctype):
                 continue  # only the mask methods this run was asked to test
-            for block in block_list:
+            for block in ([JOINT] if args.joint_blocks else block_list):
                 info = per_block.get(block)
                 if info is None:
                     continue
@@ -1488,15 +1606,17 @@ def run_answers_generate(args, models: UCModels, answers: list, var_list: list):
             # saeuron: each latent -> activation x (gamma x its mean activation on the concept);
             # direct: activation x gamma
             scale = edit_scale(args, v, v["gamma"])
-            jobs[path] = {"block": v["block"], "feature_idx": list(v["latents"]), "scale": scale,
-                          "thresholds": v.get("thresholds"),
-                          "prompt": a["prompt"], "seed": a["seed"], "image": path}
+            thr = split_by_block(args, v, v["thresholds"]) if v.get("thresholds") is not None else None
+            parts = {b: {"latents": p["latents"], "scale": p["values"],
+                         "thresholds": thr[b]["values"] if thr else None}
+                     for b, p in split_by_block(args, v, scale).items()}
+            jobs[path] = {"block": v["block"], "parts": parts, "prompt": a["prompt"], "seed": a["seed"],
+                          "image": path}
     # every edit folder records the latents + scale its images were made with; a folder made with
     # different ones (the probe or gamma changed) is emptied so its images are regenerated
     specs = {}
     for j in jobs.values():
-        specs[os.path.dirname(j["image"])] = {"block": j["block"], "latents": j["feature_idx"], "scale": j["scale"],
-                                              "thresholds": j["thresholds"]}
+        specs[os.path.dirname(j["image"])] = {"block": j["block"], "parts": j["parts"]}
     for folder, spec in specs.items():
         manifest = os.path.join(folder, "latents.json")
         if os.path.exists(manifest) and load_json(manifest, None) != json.loads(json.dumps(spec)):
@@ -1745,6 +1865,7 @@ def inject_jobs(args, base_entries: list, var_list: list) -> list:
                     **{k: v[k] for k in ["subject", "concept_type", "method", "block", "kind", "feature_idx",
                                          "k_metric"]},
                     "latents": latents, "values": values, "n_latents": len(latents),
+                    "parts": split_by_block(args, v, values),
                     "probe": v["probe"], "pos_mean": pos_mean, "strength": strength, "base": e["name"],
                     "image": os.path.join(edit_dir(args, v, root="inject"), f"s{strength:g}", f"{e['name']}.jpg"),
                 })
@@ -1949,12 +2070,15 @@ def main(args):
     entries = discover_entries(args, args.object_list, args.style_list,
                                style_targets=any(t == "style" for t, _ in targets))
     os.makedirs(os.path.join(args.cache_dir, "discover", "sparse"), exist_ok=True)
+    args.joint_offsets = None
     if not args.disable_discover_generate:
         run_discover_generate(args, models, entries, block_list)
     if not args.disable_sparsify:
         run_dream_sparsify(args, models, entries, block_list)
     if not args.disable_masks:
         run_masks(args, models, entries, targets, device)
+    if args.joint_blocks and not args.prepare_only:
+        args.joint_offsets = joint_offsets(entries, block_list)
     if "attribution" in args.rules and not args.prepare_only and not args.disable_attribution:
         run_attribution(args, models, entries, targets, block_list)
     if args.prepare_only:
