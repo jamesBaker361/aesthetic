@@ -260,7 +260,7 @@ from experiment_helpers.init_helpers import default_parser, repo_api_init
 from attribution import DEFAULT_BLOCK_LIST
 from generate_clean_inference import resize_mask_to_grid
 from grad_eclip_mask import load_clip, grad_eclip_pixel_map, top_frac_patch_mask
-from sparse_probe import select_bce_and_f1, smallest_k, latent_activation_stats
+from sparse_probe import select_bce_and_f1, smallest_k, latent_activation_stats, image_mean_codes
 from evaluate_sae_features import (
     Models, safe, load_json, save_json, generate, ensure_sam_masks, load_sam, sam_cache_path,
     ensure_text_scores, score_cache_path, load_text_score, run_dream_sparsify, load_block_codes,
@@ -920,14 +920,6 @@ def saeuron_tau(args, ctype: str, concept: str) -> int:
     if args.saeuron_tau > 0:
         return args.saeuron_tau
     return SAEURON_TAU.get(concept, 1) if ctype == "object" else 1
-
-
-def image_mean_codes(idx_all, val_all, owner, n_images: int, n_dirs: int) -> np.ndarray:
-    '''(n_images, n_dirs): each discovery image's SAE code averaged over its patches (SAeUron's sae_out.mean(1)).'''
-    sums = np.zeros((n_images, n_dirs), dtype=np.float64)
-    rows = np.repeat(owner, idx_all.shape[1])
-    np.add.at(sums, (rows, idx_all.reshape(-1)), np.maximum(val_all.reshape(-1), 0.0))
-    return sums / np.maximum(np.bincount(owner, minlength=n_images), 1)[:, None]
 
 
 def same_kind_concepts(args, entries: list, ctype: str, concept: str) -> dict:
