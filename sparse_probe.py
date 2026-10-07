@@ -135,6 +135,14 @@ def latent_activation_stats(idx: np.ndarray, val: np.ndarray, labels: np.ndarray
     }
 
 
+def image_mean_codes(idx_all, val_all, owner, n_images: int, n_dirs: int) -> np.ndarray:
+    '''(n_images, n_dirs): each discovery image's SAE code averaged over its patches (SAeUron's sae_out.mean(1)).'''
+    sums = np.zeros((n_images, n_dirs), dtype=np.float64)
+    rows = np.repeat(owner, idx_all.shape[1])
+    np.add.at(sums, (rows, idx_all.reshape(-1)), np.maximum(val_all.reshape(-1), 0.0))
+    return sums / np.maximum(np.bincount(owner, minlength=n_images), 1)[:, None]
+
+
 def scaled_csr(idx: np.ndarray, val: np.ndarray, n_dirs: int):
     '''The top-k codes as a (n_patches, n_dirs) CSR matrix, each latent scaled to max 1; also the scales.'''
     from scipy.sparse import csr_matrix
