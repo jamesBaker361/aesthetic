@@ -215,6 +215,11 @@
 #   psnr_target             pixels                    target images                    change vs the unedited image
 #   psnr_retain             pixels                    non-target images (--eval_scope  collateral change on unrelated prompts
 #                                                     all only)
+#   epr_target_change       classifier logits         target images vs unedited        |change| of the concept's logit
+#   epr_nontarget_change    classifier logits         target images vs unedited        mean |change| of every other logit of
+#                                                                                      both classifiers (side effects)
+#   EPR (summary only)      CASL (arXiv:2601.15441,   ratio of the two means above     Editing Precision Ratio: target change
+#                           Eq. 14)                   (+1e-8)                          per unit of collateral change
 #
 #   uc_summary.csv also has UA_base, CRA_base, p_target_base, sam_removed_base,
 #   vqa_base, clip_base (and IRA_base / CRA_target_base where they
@@ -238,6 +243,8 @@
 #   vqa_subject, clip_subject             VQAScore / CLIPScore   does the image now match the injected concept's text?
 #     (+_before, _gain)
 #   background_psnr                       pixels                 background preservation outside the mask
+#   epr_target_change,                    classifier logits      CASL's EPR terms vs the unedited base image, as in
+#     epr_nontarget_change, EPR (summary)                        the removal tables
 #   foreground_change, background_change  pixels                 mean absolute pixel change inside / outside the mask
 #
 #   Rows also carry probe_bce / probe_loss_explained / probe_f1.
@@ -531,16 +538,23 @@ class UCClassifiers:
     @torch.no_grad()
     def batch(self, images, texts=None):
         x = torch.stack([self.transform(Image.open(p).convert("RGB")) for p in images]).to(self.device)
-        sp = F.softmax(self.style(x).float(), dim=-1).cpu().numpy()
-        cp = F.softmax(self.cls(x).float(), dim=-1).cpu().numpy()
+        sl, cl = self.style(x).float(), self.cls(x).float()
+        sp, cp = F.softmax(sl, dim=-1).cpu().numpy(), F.softmax(cl, dim=-1).cpu().numpy()
         return [{"score": THEMES[int(s.argmax())], "style_pred": THEMES[int(s.argmax())],
                  "class_pred": CLASSES[int(c.argmax())],
-                 "style_probs": np.round(s, 5).tolist(), "class_probs": np.round(c, 5).tolist()}
-                for s, c in zip(sp, cp)]
+                 "style_probs": np.round(s, 5).tolist(), "class_probs": np.round(c, 5).tolist(),
+                 "style_logits": np.round(slg, 4).tolist(), "class_logits": np.round(clg, 4).tolist()}
+                for s, c, slg, clg in zip(sp, cp, sl.cpu().numpy(), cl.cpu().numpy())]
 
 
 def uc_model_id(args) -> str:
     return f"{args.style_ckpt}|{args.class_ckpt}"
+
+
+def uc_score_id(args) -> str:
+    # the classifier score cache's id: "+logits" so scores cached before the logits were stored (EPR needs
+    # them) are recomputed, without touching attribution_key (also built on uc_model_id)
+    return f"{uc_model_id(args)}+logits"
 
 
 def load_uc(image_path: str):
@@ -1645,7 +1659,7 @@ def run_scoring(args, models: UCModels, answers: list, var_list: list, device):
     if not args.disable_uc:
         if os.path.exists(args.style_ckpt) and os.path.exists(args.class_ckpt):
             ensure_text_scores(models.get_uc, "uc", [(p, "image") for p in images], args.score_batch_size,
-                               model=uc_model_id(args))
+                               model=uc_score_id(args))
         else:
             print(f"! UnlearnCanvas classifiers not found ({args.style_ckpt}, {args.class_ckpt}) - "
                   f"skipping UA/IRA/CRA")
@@ -1712,7 +1726,7 @@ def build_results(args, answers: list, var_list: list):
                 "probe_score_k_latents": v.get("auto", {}).get("score"),
             }
             uc = load_uc(path) if not args.disable_uc else None
-            if uc is not None and uc.get("model") == uc_model_id(args):
+            if uc is not None and uc.get("model") == uc_score_id(args):
                 style_ok = float(uc["style_pred"] == a["style"])
                 class_ok = float(uc["class_pred"] == a["object"])
                 same, other = (style_ok, class_ok) if ctype == "style" else (class_ok, style_ok)
@@ -1727,6 +1741,10 @@ def build_results(args, answers: list, var_list: list):
                     "CRA_target": other if (target and args.eval_scope == "all") else np.nan,
                     "p_target": float(probs[labels.index(concept)]) if target else np.nan,
                 })
+            if target and v["kind"] != "base":
+                d_t, d_n = uc_logit_changes(args, path, a["image"], ctype, concept)
+                if d_t is not None:
+                    row.update({"epr_target_change": d_t, "epr_nontarget_change": d_n})
             if target and ctype == "object" and os.path.exists(sam_cache_path(path, sam_query(concept))):
                 mask, score = load_sam(path, sam_query(concept))
                 row.update({"sam_removed": float(not mask.any()), "sam_score": score,
@@ -1753,7 +1771,7 @@ def build_results(args, answers: list, var_list: list):
     keys = ["subject", "concept_type", "method", "block", "kind", "k_metric", "remove_mode", "remove_scale",
             "auto_gamma_target"]
     metrics = ["UA", "IRA", "CRA", "CRA_target", "p_target", "style_acc", "object_acc", "sam_removed", "sam_score", "sam_area",
-               "vqa", "clip", "psnr_target", "psnr_retain",
+               "vqa", "clip", "psnr_target", "psnr_retain", "epr_target_change", "epr_nontarget_change",
                "probe_bce", "probe_loss_explained", "probe_f1",
                "n_latents", "probe_score_all_latents", "probe_score_k_latents", "gamma", "fid", "fid_target", "fid_retain",
                "dense_recall_before", "dense_recall_after", "dense_fp_before", "dense_fp_after",
@@ -1767,7 +1785,7 @@ def build_results(args, answers: list, var_list: list):
     summary.insert(0, "n_images", grouped.size())
     summary.insert(0, "latents", grouped["latents"].first())
     summary.insert(0, "feature_idx", grouped["feature_idx"].first())
-    summary = summary.reset_index()
+    summary = add_epr(summary.reset_index())
 
     # the unedited model's numbers next to every row of the same concept
     base_cols = [m for m in ["UA", "IRA", "CRA", "CRA_target", "p_target", "sam_removed", "vqa", "clip"] if m in summary]
@@ -1775,7 +1793,7 @@ def build_results(args, answers: list, var_list: list):
     summary = summary.join(base, on="subject")
     summary.to_csv(os.path.join(args.out_dir, f"uc_summary_{run_tag(args)}.csv"), index=False)
 
-    shown = [m for m in ["UA", "IRA", "CRA", "CRA_target", "sam_removed", "vqa", "psnr_target", "psnr_retain"]
+    shown = [m for m in ["UA", "IRA", "CRA", "CRA_target", "sam_removed", "vqa", "psnr_target", "psnr_retain", "EPR"]
              if m in summary and summary[m].notna().any()]
     print(summary.groupby(["concept_type", "method", "kind"])[shown].mean().to_string())
 
@@ -1825,7 +1843,7 @@ def save_panels(args, answers: list, var_list: list):
                     continue
                 grid.paste(Image.open(path).convert("RGB").resize((size, size)), (x, y))
                 uc = load_uc(path) if not args.disable_uc else None
-                if uc is not None and uc.get("model") == uc_model_id(args):
+                if uc is not None and uc.get("model") == uc_score_id(args):
                     pred = uc["class_pred"] if ctype == "object" else uc["style_pred"]
                     draw.text((x + 3, y + size), f"{uc['class_pred']} / {uc['style_pred']}"[:30],
                               fill="red" if pred == concept else "black")
@@ -1922,7 +1940,7 @@ def run_inject_scoring(args, models: UCModels, jobs: list, base_by_name: dict, d
 
     if not args.disable_uc and os.path.exists(args.style_ckpt) and os.path.exists(args.class_ckpt):
         ensure_text_scores(models.get_uc, "uc", [(p, "image") for p in images], args.score_batch_size,
-                           model=uc_model_id(args))
+                           model=uc_score_id(args))
 
     text_pairs = set()
     for j in done:
@@ -1938,12 +1956,38 @@ def run_inject_scoring(args, models: UCModels, jobs: list, base_by_name: dict, d
 def uc_target(args, path: str, ctype: str, concept: str):
     '''(classified as concept, p(concept)) from the UnlearnCanvas classifiers, or (None, None).'''
     uc = load_uc(path) if not args.disable_uc else None
-    if uc is None or uc.get("model") != uc_model_id(args):
+    if uc is None or uc.get("model") != uc_score_id(args):
         return None, None
     pred = uc["style_pred"] if ctype == "style" else uc["class_pred"]
     probs = uc["style_probs"] if ctype == "style" else uc["class_probs"]
     labels = THEMES if ctype == "style" else CLASSES
     return float(pred == concept), float(probs[labels.index(concept)])
+
+
+def uc_logit_changes(args, path: str, original: str, ctype: str, concept: str):
+    '''
+    CASL's EPR terms (arXiv:2601.15441, Eqs. 12-13) for one edited / original image pair, on the
+    UnlearnCanvas classifiers' logits: |change| of the concept's own logit, and the mean |change| of every
+    other logit of both classifiers (the other styles incl. Seed_Images and the other objects).
+    (None, None) if either image has no logits cached.
+    '''
+    if args.disable_uc:
+        return None, None
+    a, b = load_uc(path), load_uc(original)
+    if any(u is None or u.get("model") != uc_score_id(args) for u in (a, b)):
+        return None, None
+    own, other = ("style_logits", "class_logits") if ctype == "style" else ("class_logits", "style_logits")
+    i = (THEMES if ctype == "style" else CLASSES).index(concept)
+    d_own = np.abs(np.asarray(a[own]) - np.asarray(b[own]))
+    d_other = np.abs(np.asarray(a[other]) - np.asarray(b[other]))
+    return float(d_own[i]), float(np.concatenate([np.delete(d_own, i), d_other]).mean())
+
+
+def add_epr(summary: pd.DataFrame, eps: float = 1e-8) -> pd.DataFrame:
+    '''EPR (CASL Eq. 14) per summary row: mean target-logit change / (mean non-target-logit change + eps).'''
+    if "epr_target_change" in summary and "epr_nontarget_change" in summary:
+        summary["EPR"] = summary["epr_target_change"] / (summary["epr_nontarget_change"] + eps)
+    return summary
 
 
 def build_inject_results(args, jobs: list, base_by_name: dict):
@@ -2002,6 +2046,9 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
         if hit is not None:
             row.update({"uc_classified_as": hit, "uc_classified_as_before": hit_before,
                         "uc_p_target": p, "uc_p_target_before": p_before})
+        d_t, d_n = uc_logit_changes(args, j["image"], base["image"], ctype, concept)
+        if d_t is not None:
+            row.update({"epr_target_change": d_t, "epr_nontarget_change": d_n})
         for k in ["vqa_subject", "clip_subject", "uc_p_target"]:
             a, b = row.get(k), row.get(f"{k}_before")
             if k in row:
@@ -2024,7 +2071,7 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
     summary = grouped[metrics].mean()
     summary.insert(0, "n_images", grouped.size())
     summary.insert(0, "feature_idx", grouped["feature_idx"].first())
-    summary.reset_index().to_csv(os.path.join(args.out_dir, f"inject_summary_{run_tag(args)}.csv"), index=False)
+    add_epr(summary.reset_index()).to_csv(os.path.join(args.out_dir, f"inject_summary_{run_tag(args)}.csv"), index=False)
 
     shown = [m for m in ["mask_iou", "base_subject_remaining", "vqa_subject_gain", "uc_classified_as",
                          "uc_p_target_gain", "background_psnr"] if m in df]
