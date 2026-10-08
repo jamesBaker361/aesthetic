@@ -137,6 +137,15 @@
 # is CASL's: they are removed like every other rule's (make_zero_hook, gamma / --auto_gamma), not
 # with CASL-Steer. Not available with --joint_blocks (each block is its own map).
 #
+# --rules casl_steer: CASL-Steer itself (Sec. 4.3, Eqs. 9-11). The same trained map (run_casl, cached
+# in {out_dir}/casl/), but instead of removing its top latents through the SAE decoder, the block's
+# output gets h + alpha * W_delta[:, I] z_I at every patch (make_steer_hook): I = the top
+# --casl_steer_k latents of the CASL ranking, z the block's current SAE code, no bias (Eq. 11). W_delta
+# was trained to take the concept away (casl_texts), so alpha > 0 removes it. One answer set per
+# --casl_alpha value (remove_scale / gamma columns hold alpha, remove_mode "casl_steer", k_metric
+# "top{k}", images in .../casl_steer_top{k}/{concept}/{block}/a{alpha}/). No auto-k, auto-gamma or
+# injection for these edits; per-run files get a _steer tag.
+#
 # --auto_k: instead of a fixed k, per concept x method x block x rule the
 # latents are ordered by importance (the rule: per-latent BCE, per-latent F1,
 # or lasso weight) and a binary search finds the fewest leading ones whose
@@ -342,16 +351,22 @@ parser.add_argument("--style_mask_methods", nargs="*", default=["attention", "gr
 parser.add_argument("--frac", type=float, default=0.25,
                     help="top fraction of patches that count as positive for the attention / grad_eclip masks")
 parser.add_argument("--attn_map_size", type=int, default=64, help="grid every cross-attention map is resized to")
-parser.add_argument("--rules", nargs="*", default=["bce", "f1"], choices=["bce", "f1", "lasso", "attribution", "saeuron", "casl"],
+parser.add_argument("--rules", nargs="*", default=["bce", "f1"], choices=["bce", "f1", "lasso", "attribution", "saeuron", "casl", "casl_steer"],
                     help="which probe rule(s) pick the latent(s) that get zeroed/injected: lowest per-latent "
                          "BCE, highest per-latent F1, or 'lasso' - the latents a joint L1 logistic "
                          "regression over every latent keeps (sparse_probe.lasso_select); 'casl' - CASL's "
-                         "learned code -> activation map (arXiv:2601.15441, run_casl)")
+                         "learned code -> activation map (arXiv:2601.15441, run_casl); 'casl_steer' - CASL-Steer: "
+                         "that map's top --casl_steer_k latents edited CASL's way (make_steer_hook), not removed")
 parser.add_argument("--joint_blocks", action="store_true",
                     help="choose latents from all --block_list blocks at once (one feature space of block x latent, "
                          "patches aligned - every block must share the patch grid): every rule ranks / searches "
                          "across blocks, so no per-block choice is needed; the chosen set is edited at every "
                          "block it spans together (block 'joint' in the tables)")
+parser.add_argument("--casl_steer_k", type=int, default=1,
+                    help="--rules casl_steer: the top-k latents of the CASL ranking that are steered (Table 1: 1)")
+parser.add_argument("--casl_alpha", nargs="*", type=float, default=[1.0, 32.0, 64.0, 128.0, 192.0],
+                    help="--rules casl_steer: editing intensity alpha (Eq. 10), one answer set per value "
+                         "(CASL Fig. 4 sweeps 1-192)")
 parser.add_argument("--casl_steps", type=int, default=200,
                     help="--rules casl: Adam steps (one discovery image each) per concept x block")
 parser.add_argument("--casl_lr", type=float, default=1e-3, help="--rules casl: Adam learning rate for W_delta, b_delta")
@@ -938,6 +953,69 @@ def casl_texts(args, ctype: str, concept: str):
     return concept_text(args, ctype, concept), origin
 
 
+def casl_npz_path(args, concept: str, block: str) -> str:
+    return os.path.join(args.out_dir, "casl", f"{safe(concept)}__{block}.npz")
+
+
+def load_casl_columns(args, path: str, latents: list):
+    '''W_delta's columns for these latents (d_model, k) from run_casl's npz, checked against the settings.'''
+    with np.load(path) as d:
+        if str(d["key"]) != casl_key(args):
+            raise ValueError(f"{path} was trained with other --casl_* settings - rerun --rules casl")
+        pos = {int(j): i for i, j in enumerate(d["latents"])}
+        missing = [j for j in latents if j not in pos]
+        if missing:
+            raise ValueError(f"{path} has no column for latents {missing} (raise --casl_keep)")
+        return d["W"][:, [pos[j] for j in latents]].astype(np.float32)
+
+
+def make_steer_hook(sae, W_cols: torch.Tensor, latents: list, alpha: float, mode: str, start_step: int,
+                    end_step: int):
+    '''
+    CASL-Steer (arXiv:2601.15441, Eq. 11): adds alpha * W_delta[:, I] z_I to the block's output at every
+    patch, z = the SAE code of the block's current activation (its diff with --mode diff, as in training),
+    I = latents. No bias: Eq. 11 edits along the selected latents only. W_cols: (d_model, len(latents)).
+    '''
+    step_counter = {"step": 0}
+
+    def hook_fn(module, input, output):
+        step = step_counter["step"]
+        if start_step <= step <= end_step:
+            out = output[0] if isinstance(output, tuple) else output
+            x = out - input[0] if mode == "diff" else out
+            z = sae.encode(x.permute(0, 2, 3, 1).float())[..., latents]  # (B, H, W, k)
+            dh = alpha * (z @ W_cols.T)                                   # (B, H, W, d_model)
+            out = (out.float() + dh.permute(0, 3, 1, 2)).to(out.dtype)
+            output = (out, *output[1:]) if isinstance(output, tuple) else out
+        step_counter["step"] = step + 1
+        return output
+
+    return hook_fn
+
+
+@torch.no_grad()
+def run_steer_generate(args, models: UCModels, jobs: list):
+    '''run_remove_generate for CASL-Steer jobs: parts = {block: {"steer": npz, "latents", "alpha"}}.'''
+    todo = [j for j in jobs if not os.path.exists(j["image"])]
+    print(f"casl-steer: {len(todo)} of {len(jobs)} images to generate")
+    if not todo:
+        return
+    pipe = models.get_pipe()
+    columns = {}
+    for n, job in enumerate(todo):
+        hooks = {}
+        for block, p in job["parts"].items():
+            key = (p["steer"], tuple(p["latents"]))
+            if key not in columns:
+                columns[key] = torch.from_numpy(load_casl_columns(args, p["steer"], p["latents"])).to(models.device)
+            hooks[f"unet.{block}"] = make_steer_hook(models.get_sae(block), columns[key], p["latents"], p["alpha"],
+                                                     args.mode, args.start_step, args.end_step)
+        os.makedirs(os.path.dirname(job["image"]), exist_ok=True)
+        save_image(generate(pipe, job["prompt"], job["seed"], args, hooks), job["image"])
+        if n % 200 == 0:
+            print(f"  casl-steer {n}/{len(todo)}")
+
+
 def casl_entries(args, entries: list, ctype: str, concept: str) -> list:
     '''The discovery images CASL trains on (the first --casl_images of the concept's, 0 = all).'''
     own = concept_entries(args, entries, ctype, concept)
@@ -1096,7 +1174,7 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
                                "clip_loss_last": float(last[0]), "recon_loss_last": float(last[1]),
                                "steps_skipped": skipped}
                 os.makedirs(os.path.dirname(casl_path(args, concept)), exist_ok=True)
-                save_npz(os.path.join(args.out_dir, "casl", f"{safe(concept)}__{block}.npz"),
+                save_npz(casl_npz_path(args, concept, block),
                          latents=np.asarray(order, dtype=np.int64),
                          W=W.detach()[:, order].half().cpu().numpy(), b=b.detach().cpu().numpy(),
                          key=np.asarray(casl_key(args)))
@@ -1125,6 +1203,8 @@ def run_tag(args) -> str:
         tag += "_attr"
     if "casl" in args.rules:
         tag += "_casl"
+    if "casl_steer" in args.rules:
+        tag += "_steer"
     if "saeuron" in args.rules:
         tag += "_saeuron"
     if args.saeuron_mask:
@@ -1474,7 +1554,9 @@ def edit_dir(args, v: dict, root: str = "answers") -> str:
     '''
     parts = [args.out_dir, root, v["method"], f"{v['kind']}_{v.get('k_metric', k_metric(args))}", safe(v["subject"]),
              safe(v["block"].replace(".", "_"))]
-    if len(args.remove_scale) > 1 and not args.auto_gamma and args.remove_scale_preset == "none":
+    if v["kind"] == "casl_steer":
+        parts.append(f"a{v['gamma']:g}")
+    elif len(args.remove_scale) > 1 and not args.auto_gamma and args.remove_scale_preset == "none":
         parts.append(f"g{v['gamma']:g}")
     return os.path.join(*parts)
 
@@ -1489,8 +1571,8 @@ def attach_latent_means(args, entries: list, var_list: list, block_list: list):
     need_inject = args.inject_value == "concept_mean" and not args.disable_inject
     if args.remove_mode != "saeuron" and not need_inject and not args.saeuron_mask:
         return  # direct: the scale doesn't depend on the latent's activations
-    todo = [v for v in var_list if v["kind"] != "base" and (need_inject or args.saeuron_mask
-                                                             or v["gamma"] is None or v["gamma"] != 0.0)]
+    todo = [v for v in var_list if v["kind"] not in ("base", "casl_steer")
+            and (need_inject or args.saeuron_mask or v["gamma"] is None or v["gamma"] != 0.0)]
     for v in todo:
         v["latent_means"] = [0.0] * len(v["latents"])
         if args.saeuron_mask:
@@ -1554,7 +1636,7 @@ def run_auto_gamma(args, models: UCModels, entries: list, var_list: list, block_
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
 
-    learned = [v for v in var_list if v["kind"] != "base" and v["method"] != "random"]
+    learned = [v for v in var_list if v["kind"] not in ("base", "casl_steer") and v["method"] != "random"]
     caches = {}
     for v in learned:
         path = auto_gamma_path(args, v["subject"], v["method"])
@@ -1740,6 +1822,15 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
                 info = per_block.get(block)
                 if info is None:
                     continue
+                if "casl_steer" in args.rules:
+                    ranking = load_casl(args, concept).get(block)
+                    if ranking is None:
+                        print(f"  ! no casl ranking for '{concept}' @ {block} - run without --disable_casl")
+                    elif ranking["order"]:
+                        top = ranking["order"][:args.casl_steer_k]
+                        out.append({**common, "method": method, "block": block, "kind": "casl_steer",
+                                    "feature_idx": top[0], "latents": top,
+                                    "probe": {"idx": top[0], "casl": ranking["scores"][0]}})
                 if args.auto_k:
                     found = info.get("auto_by_key", {}).get(auto_key(args), {})
                     found = {r: a for r, a in found.items() if r in args.rules and a["latents"]}
@@ -1784,8 +1875,9 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
     if args.auto_k and args.n_random_controls:
         print("--auto_k: no random controls (each variant keeps a different number of latents)")
     for v in out:
-        v["k_metric"] = k_metric(args)
-        v["remove_mode"] = args.remove_mode
+        steer = v["kind"] == "casl_steer"
+        v["k_metric"] = f"top{args.casl_steer_k}" if steer else k_metric(args)
+        v["remove_mode"] = "casl_steer" if steer else args.remove_mode
     # one copy of every edit per --remove_scale; the unedited model is scale 1. remove_scale is the
     # setting (NaN = --auto_gamma), gamma the value actually used (filled in by run_auto_gamma)
     scaled = []
@@ -1793,6 +1885,8 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
         v["auto_gamma_target"] = args.auto_gamma_target if args.auto_gamma else 0.0
         if v["kind"] == "base":
             scaled.append({**v, "remove_scale": 1.0, "gamma": None})
+        elif v["kind"] == "casl_steer":  # alpha, not a removal gamma: never searched
+            scaled += [{**v, "remove_scale": a, "gamma": a, "auto_gamma_target": 0.0} for a in args.casl_alpha]
         elif args.auto_gamma:
             scaled.append({**v, "remove_scale": float("nan"), "gamma": None})
         else:
@@ -1869,6 +1963,14 @@ def run_answers_generate(args, models: UCModels, answers: list, var_list: list):
     for v in var_list:
         if v["kind"] == "base":
             continue
+        if v["kind"] == "casl_steer":
+            parts = {v["block"]: {"steer": casl_npz_path(args, v["subject"], v["block"]), "latents": v["latents"],
+                                  "alpha": v["gamma"]}}
+            for a in scored_answers(args, v, answers):
+                path = variant_image(args, v, a)
+                jobs[path] = {"block": v["block"], "parts": parts, "prompt": a["prompt"], "seed": a["seed"],
+                              "image": path}
+            continue
         for a in scored_answers(args, v, answers):
             path = variant_image(args, v, a)
             # make_zero_hook scales a list of latents as well as one
@@ -1906,7 +2008,11 @@ def run_answers_generate(args, models: UCModels, answers: list, var_list: list):
             save_json(manifest, spec)
     print(f"answers: {len(jobs)} edited images in {len(specs)} folders (k {k_metric(args)}, gamma="
           f"{'auto' if args.auto_gamma else args.remove_scale if args.remove_scale_preset == 'none' else args.remove_scale_preset})")
-    run_remove_generate(args, models, list(jobs.values()))
+    steer, remove = [], []
+    for j in jobs.values():
+        (steer if any("steer" in p for p in j["parts"].values()) else remove).append(j)
+    run_remove_generate(args, models, remove)
+    run_steer_generate(args, models, steer)
 
 
 # ---------------------------------------------------------------- stage 5
@@ -2097,7 +2203,7 @@ def save_panels(args, answers: list, var_list: list):
             label = "unedited" if v["kind"] == "base" else \
                 f"{v['method']} {v['kind']}\n{v['block'].replace('_blocks', '').replace('.attentions', '')} " \
                 f"#{','.join(str(i) for i in v['latents'])[:18]} " \
-                f"{'g' if args.remove_mode == 'saeuron' else 'x'}{v['gamma']:g}"
+                f"{'a' if v['kind'] == 'casl_steer' else 'g' if args.remove_mode == 'saeuron' else 'x'}{v['gamma']:g}"
             draw.text((c * size + 3, 2), label, fill="black")
             for r, a in enumerate(rows):
                 x, y = c * size, head + r * (size + cap)
@@ -2129,8 +2235,9 @@ def inject_jobs(args, base_entries: list, var_list: list) -> list:
     usable = [e for e in base_entries if e.get("mask_area", 0) > 0]
     jobs = []
     for v in var_list:
-        if v["kind"] == "base" or (not args.auto_gamma and v["remove_scale"] != remove_scales(args, v)[0]):
-            continue  # injection doesn't depend on the removal scale: one copy per latent
+        if v["kind"] in ("base", "casl_steer") or \
+                (not args.auto_gamma and v["remove_scale"] != remove_scales(args, v)[0]):
+            continue  # injection doesn't depend on the removal scale: one copy per latent (CASL-Steer: none)
         pos_mean = v["probe"].get("pos_mean")
         latents = list(v["latents"])
         # each latent's value (x strength): None = the checkpoint mean (filled in by run_ablate_generate)
@@ -2392,7 +2499,7 @@ def main(args):
         args.joint_offsets = joint_offsets(entries, block_list)
     if "attribution" in args.rules and not args.prepare_only and not args.disable_attribution:
         run_attribution(args, models, entries, targets, block_list)
-    if "casl" in args.rules and not args.prepare_only and not args.disable_casl:
+    if ({"casl", "casl_steer"} & set(args.rules)) and not args.prepare_only and not args.disable_casl:
         run_casl(args, models, entries, targets, block_list)
     if args.prepare_only:
         features = {}  # -> only the unedited answers and the random controls below
