@@ -233,8 +233,9 @@
 #   psnr_retain             pixels                    non-target images (--eval_scope  collateral change on unrelated prompts
 #                                                     all only)
 #   epr_target_change       classifier logits         target images vs unedited        |change| of the concept's logit
-#   epr_nontarget_change    classifier logits         target images vs unedited        mean |change| of every other logit of
-#                                                                                      both classifiers (side effects)
+#   epr_nontarget_change    classifier logits         target images vs unedited        mean |change| of the other logits of
+#                                                                                      the same classifier (other objects /
+#                                                                                      other styles; side effects)
 #   EPR (summary only)      CASL (arXiv:2601.15441,   ratio of the two means above     Editing Precision Ratio: target change
 #                           Eq. 14)                   (+1e-8)                          per unit of collateral change
 #
@@ -2407,8 +2408,10 @@ def uc_target(args, path: str, ctype: str, concept: str):
 def uc_logit_changes(args, path: str, original: str, ctype: str, concept: str):
     '''
     CASL's EPR terms (arXiv:2601.15441, Eqs. 12-13) for one edited / original image pair, on the
-    UnlearnCanvas classifiers' logits: |change| of the concept's own logit, and the mean |change| of every
-    other logit of both classifiers (the other styles incl. Seed_Images and the other objects).
+    UnlearnCanvas classifiers' logits: |change| of the concept's own logit, and the mean |change| of the
+    other logits of the SAME classifier - the other 19 objects for an object, the other 50 style logits
+    (incl. Seed_Images) for a style. The other classifier is left out: for an object, its 51 style logits
+    would outnumber the 19 object ones and make EPR mostly a measure of style drift.
     (None, None) if either image has no logits cached.
     '''
     if args.disable_uc:
@@ -2416,11 +2419,10 @@ def uc_logit_changes(args, path: str, original: str, ctype: str, concept: str):
     a, b = load_uc(path), load_uc(original)
     if any(u is None or u.get("model") != uc_score_id(args) for u in (a, b)):
         return None, None
-    own, other = ("style_logits", "class_logits") if ctype == "style" else ("class_logits", "style_logits")
+    own = "style_logits" if ctype == "style" else "class_logits"
     i = (THEMES if ctype == "style" else CLASSES).index(concept)
     d_own = np.abs(np.asarray(a[own]) - np.asarray(b[own]))
-    d_other = np.abs(np.asarray(a[other]) - np.asarray(b[other]))
-    return float(d_own[i]), float(np.concatenate([np.delete(d_own, i), d_other]).mean())
+    return float(d_own[i]), float(np.delete(d_own, i).mean())
 
 
 def add_epr(summary: pd.DataFrame, eps: float = 1e-8) -> pd.DataFrame:
