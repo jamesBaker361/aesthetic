@@ -1147,12 +1147,11 @@ def run_tag(args) -> str:
 
 def k_metric(args) -> str:
     '''
-    The metric half of the image folder name / k_metric column: --auto_k_metric with --auto_k; without it,
-    "paper" for the SAeUron baseline (its own tau per concept, Table 5) and "single" for one latent per rule.
+    The metric half of the image folder name / k_metric column: --auto_k_metric with --auto_k, else
+    "single" (one latent per rule, or SAeUron's own tau per concept with --rules saeuron - the notebooks
+    label that one "paper"). Kept as "single" so earlier runs' image folders and table rows still match.
     '''
-    if args.auto_k:
-        return args.auto_k_metric
-    return "paper" if "saeuron" in args.rules else "single"
+    return args.auto_k_metric if args.auto_k else "single"
 
 
 # SAeUron (Cywiński & Deja, arXiv:2501.18052) Table 5, Appendix G (p. 18): per-object multiplier
@@ -1887,9 +1886,18 @@ def run_answers_generate(args, models: UCModels, answers: list, var_list: list):
     specs = {}
     for j in jobs.values():
         specs[os.path.dirname(j["image"])] = {"block": j["block"], "parts": j["parts"]}
+    def as_parts(m):
+        # manifests written before multi-block edits: {"block", "latents", "scale", "thresholds"} for one block
+        if isinstance(m, dict) and "parts" not in m and "latents" in m:
+            return {"block": m["block"], "parts": {m["block"]: {"latents": m["latents"], "scale": m.get("scale", 0.0),
+                                                                "thresholds": m.get("thresholds")}}}
+        return m
+
     for folder, spec in specs.items():
         manifest = os.path.join(folder, "latents.json")
-        if os.path.exists(manifest) and load_json(manifest, None) != json.loads(json.dumps(spec)):
+        if os.path.exists(manifest) and as_parts(load_json(manifest, None)) == json.loads(json.dumps(spec)):
+            save_json(manifest, spec)  # same edit, older manifest format: rewrite it, keep the images
+        elif os.path.exists(manifest):
             print(f"  {folder}: latents/scale changed - regenerating its images")
             for f in os.listdir(folder):
                 os.remove(os.path.join(folder, f))
