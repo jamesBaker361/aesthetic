@@ -130,6 +130,13 @@
 # feeds the same smallest-k search. Needs the classifier checkpoints; SDXL, the
 # SAE and the classifier share the GPU for that step only.
 #
+# --rules casl: CASL (He et al., arXiv:2601.15441) stage 2 as a baseline - rank latents by the
+# weights of a linear map from the block's SAE code to an activation edit, trained with
+# DiffusionCLIP's directional loss (run_casl -> {out_dir}/casl/). The top latent is used (kind
+# "casl"); with --auto_k the CASL order feeds the same smallest-k search. Only the choice of latents
+# is CASL's: they are removed like every other rule's (make_zero_hook, gamma / --auto_gamma), not
+# with CASL-Steer. Not available with --joint_blocks (each block is its own map).
+#
 # --auto_k: instead of a fixed k, per concept x method x block x rule the
 # latents are ordered by importance (the rule: per-latent BCE, per-latent F1,
 # or lasso weight) and a binary search finds the fewest leading ones whose
@@ -335,15 +342,35 @@ parser.add_argument("--style_mask_methods", nargs="*", default=["attention", "gr
 parser.add_argument("--frac", type=float, default=0.25,
                     help="top fraction of patches that count as positive for the attention / grad_eclip masks")
 parser.add_argument("--attn_map_size", type=int, default=64, help="grid every cross-attention map is resized to")
-parser.add_argument("--rules", nargs="*", default=["bce", "f1"], choices=["bce", "f1", "lasso", "attribution", "saeuron"],
+parser.add_argument("--rules", nargs="*", default=["bce", "f1"], choices=["bce", "f1", "lasso", "attribution", "saeuron", "casl"],
                     help="which probe rule(s) pick the latent(s) that get zeroed/injected: lowest per-latent "
                          "BCE, highest per-latent F1, or 'lasso' - the latents a joint L1 logistic "
-                         "regression over every latent keeps (sparse_probe.lasso_select)")
+                         "regression over every latent keeps (sparse_probe.lasso_select); 'casl' - CASL's "
+                         "learned code -> activation map (arXiv:2601.15441, run_casl)")
 parser.add_argument("--joint_blocks", action="store_true",
                     help="choose latents from all --block_list blocks at once (one feature space of block x latent, "
                          "patches aligned - every block must share the patch grid): every rule ranks / searches "
                          "across blocks, so no per-block choice is needed; the chosen set is edited at every "
                          "block it spans together (block 'joint' in the tables)")
+parser.add_argument("--casl_steps", type=int, default=200,
+                    help="--rules casl: Adam steps (one discovery image each) per concept x block")
+parser.add_argument("--casl_lr", type=float, default=1e-3, help="--rules casl: Adam learning rate for W_delta, b_delta")
+parser.add_argument("--casl_lambda_clip", type=float, default=3.0,
+                    help="--rules casl: weight of the directional CLIP loss (CASL Table 4: 3 for faces)")
+parser.add_argument("--casl_lambda_recon", type=float, default=1.0,
+                    help="--rules casl: weight of the L1 loss to the unedited image (CASL Table 4: 1)")
+parser.add_argument("--casl_images", type=int, default=0,
+                    help="--rules casl: train on the first N of the concept's discovery images (0 = all)")
+parser.add_argument("--casl_keep", type=int, default=512, help="--rules casl: latents kept in the saved ranking")
+parser.add_argument("--casl_clip_model", type=str, default="ViT-B-16",
+                    help="--rules casl: open_clip model for the training loss (DiffusionCLIP / Asyrp's ViT-B/16); "
+                         "run on the CPU so it never shares the GPU with SDXL")
+parser.add_argument("--casl_clip_pretrained", type=str, default="openai")
+parser.add_argument("--casl_object_origin", type=str, default="a photo",
+                    help="--rules casl: the concept-free text for objects (CASL Table 4's y_origin, e.g. 'person'); "
+                         "the concept text is --object_text")
+parser.add_argument("--casl_style_origin", type=str, default="an image",
+                    help="--rules casl: the concept-free text for styles; the concept text is --style_text")
 parser.add_argument("--saeuron_tau", type=int, default=0,
                     help="--rules saeuron: latents kept per concept; 0 = SAeUron's Table 5 value per object "
                          "(SAEURON_TAU; styles 1). Ignored with --auto_k")
@@ -431,7 +458,7 @@ parser.add_argument("--inject_top_k", nargs="*", type=int, default=[],
                     help="with --auto_k, also inject the first k latents of each auto-k ranking for every k "
                          "listed (e.g. 1 3 5), to compare a fixed k with the searched one; injection only")
 
-for flag in ["discover_generate", "sparsify", "masks", "attribution", "probe", "answers_generate", "answer_masks",
+for flag in ["discover_generate", "sparsify", "masks", "attribution", "casl", "probe", "answers_generate", "answer_masks",
              "uc", "vqa", "clip", "psnr", "fid", "summary", "panels",
              "inject", "base", "inject_generate", "inject_masks", "inject_summary", "inject_panels"]:
     parser.add_argument(f"--disable_{flag}", action="store_true")
@@ -872,6 +899,194 @@ def run_attribution(args, models: UCModels, entries: list, targets: list, block_
         models.free()
 
 
+# ---------------------------------------------------------------- casl
+
+# smallest |E_I(edit) - E_I(original)| the directional loss divides by: W_delta starts at zero, so the
+# first edit equals the original and the plain cosine's gradient (1 / |difference|) would overflow the
+# fp16 UNet backward. Below this the loss is linear in the difference instead.
+CASL_MIN_DIRECTION = 1e-2
+CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+
+def casl_path(args, concept: str) -> str:
+    return os.path.join(args.out_dir, "casl", f"{safe(concept)}.json")
+
+
+def casl_key(args) -> str:
+    '''CASL rankings are cached per these settings.'''
+    return "|".join([args.mode, str(args.num_inference_steps), f"{args.guidance_scale:g}", str(args.size),
+                     str(args.casl_images), ",".join(map(str, args.discover_seeds)),
+                     str(args.object_discover_prompt_file), str(args.casl_steps), f"{args.casl_lr:g}",
+                     f"{args.casl_lambda_clip:g}", f"{args.casl_lambda_recon:g}",
+                     f"{args.casl_clip_model}/{args.casl_clip_pretrained}", args.casl_object_origin,
+                     args.casl_style_origin, args.object_text, args.style_text, str(args.seed)])
+
+
+def load_casl(args, concept: str) -> dict:
+    '''{block: {"order", "scores", "n_images", ...}} for the current settings (empty if not computed).'''
+    return load_json(casl_path(args, concept), {}).get(casl_key(args), {})
+
+
+def casl_texts(args, ctype: str, concept: str):
+    '''
+    (y_origin, y_ref) for the directional loss. CASL's pairs (Table 4) go from the plain domain word to
+    it with the concept ("person" -> "person with beards"); here the concept is removed, so the pair is
+    reversed: from the concept text to the concept-free one ("a photo of a Cats" -> "a photo").
+    '''
+    origin = args.casl_object_origin if ctype == "object" else args.casl_style_origin
+    return concept_text(args, ctype, concept), origin
+
+
+def run_casl(args, models: UCModels, entries: list, targets: list, block_list: list):
+    '''
+    CASL stage 2 (He et al., arXiv:2601.15441, Sec. 4.2, Eqs. 6-8) per concept x block: with the
+    block's SAE encoder frozen, a linear map dh = W_delta z + b_delta (W_delta: d_model x n_dirs, as
+    their nn.Linear(latent_dim, out_dim)) is added to the block's output, and trained on the concept's
+    discovery prompts (same prompt + seed as discovery) with
+        L = lambda_clip * (1 - cos(E_I(x_edit) - E_I(x_orig), E_T(y_ref) - E_T(y_origin)))
+            + lambda_recon * |x_edit - x_orig|_1
+    (DiffusionCLIP's directional loss + L1 to the unedited image, Eq. 8; casl_texts for the texts).
+    SDXL-Turbo's single step gives x_0 directly, so no DDIM inversion is needed: x_orig is the
+    discovery image itself, regenerated once without the hook. Latents are ranked by the L2 norm of
+    their column of W_delta (Eq. 9's TopK |W_delta^(c)|, which the paper does not reduce over the
+    d_model rows; the column norm is our reading) -> {out_dir}/casl/{concept}.json, and the kept
+    columns + b_delta -> {out_dir}/casl/{concept}__{block}.npz (for a CASL-Steer edit later).
+
+    W_delta starts at zero rather than nn.Linear's random init: a latent that never fires on these
+    images gets no gradient (dh only depends on its column through z_j), so with a random init its
+    column would keep a random norm and enter the ranking anyway.
+
+    The CLIP model lives on the CPU for the whole step: the edited image is moved there (the
+    gradient flows back to the GPU), so only SDXL and the SAE use GPU memory, as in run_attribution.
+    '''
+    todo = [(t, c) for t, c in targets if not all(b in load_casl(args, c) for b in block_list)]
+    print(f"casl: {len(todo)} of {len(targets)} concepts to train")
+    if not todo:
+        return
+    if args.joint_blocks:
+        raise ValueError("--rules casl is per block: not available with --joint_blocks")
+    device = models.device
+    pipe = models.get_pipe()
+    sd = pipe.pipe
+    call = getattr(type(sd).__call__, "__wrapped__", type(sd).__call__)  # the pipeline call without its no_grad
+    unet, vae = sd.unet, sd.vae
+    unet.requires_grad_(False); vae.requires_grad_(False)
+    unet.enable_gradient_checkpointing(); vae.enable_gradient_checkpointing()
+    unet.train(); vae.train()  # some diffusers versions only checkpoint in train mode (no dropout in either)
+    upcast = vae.dtype == torch.float16 and getattr(vae.config, "force_upcast", False)
+    if upcast:
+        vae.to(torch.float32)
+    clip_model, clip_tok = load_clip("cpu", args.casl_clip_model, args.casl_clip_pretrained)
+    clip_model.requires_grad_(False)
+    mean = torch.tensor(CLIP_MEAN).view(1, 3, 1, 1)
+    std = torch.tensor(CLIP_STD).view(1, 3, 1, 1)
+
+    def embed_image(img):
+        '''img: (1, 3, H, W) in [0, 1] on any device -> normalized CLIP embedding on the CPU.'''
+        x = F.interpolate(img.float().cpu(), size=(224, 224), mode="bicubic", antialias=True, align_corners=False)
+        e = clip_model.encode_image((x - mean) / std)
+        return e / e.norm(dim=-1, keepdim=True)
+
+    def generate_image(e):
+        lat = call(sd, prompt=e["prompt"], num_inference_steps=args.num_inference_steps,
+                   guidance_scale=args.guidance_scale, height=args.size, width=args.size,
+                   generator=torch.Generator().manual_seed(e["seed"]), output_type="latent").images
+        lat = lat.to(vae.dtype) / vae.config.scaling_factor
+        return (vae.decode(lat, return_dict=False)[0] / 2 + 0.5).clamp(0, 1)
+
+    rng = np.random.default_rng(args.seed)
+    try:
+        for ctype, concept in todo:
+            own = concept_entries(args, entries, ctype, concept)
+            if args.casl_images > 0:
+                own = own[:args.casl_images]
+            y_origin, y_ref = casl_texts(args, ctype, concept)
+            with torch.no_grad():
+                t = clip_model.encode_text(clip_tok([y_origin, y_ref]))
+                t = t / t.norm(dim=-1, keepdim=True)
+                text_dir = t[1] - t[0]
+                text_dir = text_dir / text_dir.norm()
+            # the unedited images (CPU, fp16) and their CLIP embeddings, shared by every block
+            originals = {}
+            with torch.no_grad():
+                for n in own:
+                    img = generate_image(entries[n])
+                    originals[n] = (img.half().cpu(), embed_image(img))
+            result = load_json(casl_path(args, concept), {})
+            mine = result.setdefault(casl_key(args), {})
+            for block in block_list:
+                if block in mine:
+                    continue
+                sae = models.get_sae(block).requires_grad_(False)
+                d_model, n_dirs = sae.decoder.weight.shape
+                W = torch.zeros(d_model, n_dirs, device=device, requires_grad=True)
+                b = torch.zeros(d_model, device=device, requires_grad=True)
+                opt = torch.optim.Adam([W, b], lr=args.casl_lr)
+
+                def hook(module, inp, out):
+                    o = out[0] if isinstance(out, tuple) else out
+                    x = o - inp[0] if args.mode == "diff" else o
+                    with torch.no_grad():
+                        z = sae.encode(x.permute(0, 2, 3, 1).float())  # frozen encoder (Sec. 4.2)
+                    dh = z @ W.T + b  # Eq. 6, per patch
+                    o = o + dh.permute(0, 3, 1, 2).to(o.dtype)
+                    return (o, *out[1:]) if isinstance(out, tuple) else o
+
+                handle = unet.get_submodule(block).register_forward_hook(hook)
+                log, skipped = [], 0
+                try:
+                    order_n = []
+                    for step in range(args.casl_steps):
+                        if not order_n:
+                            order_n = list(rng.permutation(own))
+                        n = int(order_n.pop())
+                        orig_img, orig_emb = originals[n]
+                        with torch.enable_grad():
+                            img = generate_image(entries[n])
+                            d_img = (embed_image(img) - orig_emb)[0]
+                            cos = (d_img @ text_dir) / d_img.norm().clamp_min(CASL_MIN_DIRECTION)
+                            loss_clip = 1 - cos
+                            loss_recon = (img.float() * 2 - orig_img.to(device).float() * 2).abs().mean()  # [-1, 1]
+                            loss = args.casl_lambda_clip * loss_clip.to(device) + args.casl_lambda_recon * loss_recon
+                            opt.zero_grad(set_to_none=True)
+                            loss.backward()
+                        if not (torch.isfinite(W.grad).all() and torch.isfinite(b.grad).all()):
+                            skipped += 1  # fp16 overflow in the UNet backward: drop this step
+                        else:
+                            opt.step()
+                        log.append((float(loss_clip), float(loss_recon), float(d_img.norm())))
+                        if step % 20 == 0 or step == args.casl_steps - 1:
+                            print(f"  casl {ctype} '{concept}' @ {block} step {step}: clip {log[-1][0]:.4f} "
+                                  f"recon {log[-1][1]:.4f} |dI| {log[-1][2]:.4f}"
+                                  + (f" ({skipped} non-finite steps skipped)" if skipped else ""))
+                        del img, d_img, loss, loss_clip, loss_recon
+                finally:
+                    handle.remove()
+                scores = W.detach().norm(dim=0).double().cpu().numpy()  # column norm per latent
+                order = [int(j) for j in np.argsort(-scores) if scores[j] > 0][:args.casl_keep]
+                last = np.asarray(log[-min(20, len(log)):]).mean(0)
+                mine[block] = {"order": order, "scores": [float(scores[j]) for j in order],
+                               "n_images": len(own), "y_origin": y_origin, "y_ref": y_ref,
+                               "clip_loss_last": float(last[0]), "recon_loss_last": float(last[1]),
+                               "steps_skipped": skipped}
+                os.makedirs(os.path.dirname(casl_path(args, concept)), exist_ok=True)
+                save_npz(os.path.join(args.out_dir, "casl", f"{safe(concept)}__{block}.npz"),
+                         latents=np.asarray(order, dtype=np.int64),
+                         W=W.detach()[:, order].half().cpu().numpy(), b=b.detach().cpu().numpy(),
+                         key=np.asarray(casl_key(args)))
+                print(f"  casl {ctype} '{concept}' @ {block}: '{y_origin}' -> '{y_ref}', clip loss {last[0]:.4f}, "
+                      f"top latents {order[:8]} ({[round(float(scores[j]), 4) for j in order[:8]]})")
+                save_json(casl_path(args, concept), result)
+    finally:
+        clip_model.to("cpu")
+        unet.disable_gradient_checkpointing(); vae.disable_gradient_checkpointing()
+        unet.eval(); vae.eval()
+        if upcast:
+            vae.to(torch.float16)
+        models.free()
+
+
 # ---------------------------------------------------------------- stage 3
 
 def run_tag(args) -> str:
@@ -881,6 +1096,8 @@ def run_tag(args) -> str:
         tag += "_lasso"
     if "attribution" in args.rules:
         tag += "_attr"
+    if "casl" in args.rules:
+        tag += "_casl"
     if "saeuron" in args.rules:
         tag += "_saeuron"
     if args.saeuron_mask:
@@ -1048,6 +1265,15 @@ def auto_rules(args) -> list:
     return [r for r in ["bce", "f1", "lasso"] if r in args.rules]
 
 
+# rules whose latent ranking is computed before the probe stage: rule -> (load it, its cache key)
+RANKED_RULES = {"attribution": (lambda args, c: load_attribution(args, c), lambda args: attribution_key(args)),
+                "casl": (lambda args, c: load_casl(args, c), lambda args: casl_key(args))}
+
+
+def ranked_rules(args) -> list:
+    return [r for r in RANKED_RULES if r in args.rules]
+
+
 def top_n(args) -> int:
     '''How many leading latents of each auto-k ranking are kept with their stats (for --inject_top_k).'''
     return max(args.inject_top_k, default=0)
@@ -1099,9 +1325,10 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
                     and "1" not in features[c]["methods"][m][block].get("lasso_by_k", {}))
                 or (args.auto_k and not all(
                     r in features[c]["methods"][m][block].get("auto_by_key", {}).get(auto_key(args), {})
-                    for r in auto_rules(args) + (["attribution"] if "attribution" in args.rules else [])))
-                or (not args.auto_k and "attribution" in args.rules
-                    and features[c]["methods"][m][block].get("attribution", {}).get("key") != attribution_key(args))
+                    for r in auto_rules(args) + ranked_rules(args)))
+                or (not args.auto_k and any(
+                    features[c]["methods"][m][block].get(r, {}).get("key") != RANKED_RULES[r][1](args)
+                    for r in ranked_rules(args)))
                 or (args.auto_k and "saeuron" in args.rules and "saeuron" not in
                     features[c]["methods"][m][block].get("auto_by_key", {}).get(auto_key(args), {}))
                 or (not args.auto_k and "saeuron" in args.rules
@@ -1145,33 +1372,34 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
             if auto:
                 result["auto_by_key"][auto_key(args)] = {
                     **result["auto_by_key"].get(auto_key(args), {}), **result.pop("auto")}
-            if "attribution" in args.rules:
+            for rule in ranked_rules(args):  # rankings computed before this stage (attribution, casl)
+                load_ranking, ranking_key = RANKED_RULES[rule]
                 if block == JOINT:  # one ranking over every block: same objective, so the scores compare
-                    per = load_attribution(args, concept)
+                    per = load_ranking(args, concept)
                     merged = sorted(((sc, off + j) for b, off, _ in args.joint_offsets if b in per
                                      for j, sc in zip(per[b]["order"], per[b]["scores"])), reverse=True)
                     attr = ({"order": [j for _, j in merged], "scores": [sc for sc, _ in merged]}
                             if all(b in per for b in block_list) else None)
                 else:
-                    attr = load_attribution(args, concept).get(block)
+                    attr = load_ranking(args, concept).get(block)
                 if attr is None:
-                    print(f"  ! no attribution for '{concept}' @ {block} - run without --disable_attribution")
+                    print(f"  ! no {rule} ranking for '{concept}' @ {block} - run without --disable_{rule}")
                 else:
-                    def describe(j, score):
-                        return {"idx": int(j), "attribution": score,
+                    def describe(j, score, rule=rule):
+                        return {"idx": int(j), rule: score,
                                 **latent_activation_stats(idx_all[rows], val_all[rows], labels, j)}
                     if args.auto_k:
-                        # fewest top-attribution latents whose mask classifier reaches --auto_k_frac of all latents
+                        # fewest top-ranked latents whose mask classifier reaches --auto_k_frac of all latents
                         order = attr["order"][:args.auto_k_max]
                         res = smallest_k(idx_all[rows], val_all[rows], labels, owner[rows], n_dirs, order,
                                          frac=args.auto_k_frac, metric=args.auto_k_metric, seed=args.seed)
                         res["top"] = [describe(j, attr["scores"][i]) for i, j in enumerate(res["latents"])]
                         res["order_top"] = [describe(j, attr["scores"][i])
                                             for i, j in enumerate(res["order"][:top_n(args)])]
-                        result["auto_by_key"].setdefault(auto_key(args), {})["attribution"] = res
+                        result["auto_by_key"].setdefault(auto_key(args), {})[rule] = res
                     elif attr["order"]:
-                        result["attribution"] = {"key": attribution_key(args),
-                                                 "top": [describe(attr["order"][0], attr["scores"][0])]}
+                        result[rule] = {"key": ranking_key(args),
+                                        "top": [describe(attr["order"][0], attr["scores"][0])]}
             if "saeuron" in args.rules:
                 order, scores = saeuron_scores(args, entries, means, ctype, concept)
 
@@ -1517,10 +1745,11 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
                     out.append({**common, "method": method, "block": block, "kind": "saeuron",
                                 "feature_idx": sae_top[0]["idx"], "latents": [d["idx"] for d in sae_top],
                                 "probe": sae_top[0], "latent_stats": sae_top})
-                attr = info.get("attribution", {}).get("top", [])
-                if "attribution" in args.rules and attr:
-                    out.append({**common, "method": method, "block": block, "kind": "attribution",
-                                "feature_idx": attr[0]["idx"], "latents": [attr[0]["idx"]], "probe": attr[0]})
+                for rule in ranked_rules(args):
+                    attr = info.get(rule, {}).get("top", [])
+                    if attr:
+                        out.append({**common, "method": method, "block": block, "kind": rule,
+                                    "feature_idx": attr[0]["idx"], "latents": [attr[0]["idx"]], "probe": attr[0]})
         for block in block_list if not args.auto_k else []:  # auto-k: k differs per variant, no random match
             for r in range(args.n_random_controls):
                 latents = [random_latents[f"{block}__random{r}"]]
@@ -2128,6 +2357,8 @@ def main(args):
         args.joint_offsets = joint_offsets(entries, block_list)
     if "attribution" in args.rules and not args.prepare_only and not args.disable_attribution:
         run_attribution(args, models, entries, targets, block_list)
+    if "casl" in args.rules and not args.prepare_only and not args.disable_casl:
+        run_casl(args, models, entries, targets, block_list)
     if args.prepare_only:
         features = {}  # -> only the unedited answers and the random controls below
     elif args.disable_probe:
