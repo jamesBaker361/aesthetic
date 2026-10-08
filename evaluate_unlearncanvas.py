@@ -81,7 +81,7 @@
 # base subject's SAM mask: each latent at --inject_value x strength. Images in {out_dir}/inject/...,
 # panels (base | each block x rule x strength) in {out_dir}/panels_inject/{concept}_{tag}.jpg.
 # --inject_top_k 1 3 5 (with --auto_k) also injects the first k latents of the ranking the auto-k
-# search ran over, for each k: images in {out_dir}/inject/{method}/{rule}_top{k}/..., rows with
+# search ran over, for each k: images in {out_dir}/{--inject_root}/{method}/{rule}_top{k}/..., rows with
 # k_metric "top{k}" next to the searched set's (k_metric = --auto_k_metric). uc_inject_compare_k.ipynb
 # compares them.
 #
@@ -469,6 +469,10 @@ parser.add_argument("--inject_value", type=str, default="checkpoint_mean",
                          "mean.pt, its mean over the concept's positive (mask) discovery patches, or its mean over "
                          "every patch of the concept's discovery images (SAeUron's avg_acts)")
 parser.add_argument("--inject_panel_bases", type=int, default=6, help="base images (rows) per injection panel")
+parser.add_argument("--inject_root", type=str, default="inject",
+                    help="folder under --out_dir for injection images: the path doesn't record --inject_value, so "
+                         "redoing a run's injection with another value needs its own folder (existing images are "
+                         "never regenerated)")
 parser.add_argument("--inject_top_k", nargs="*", type=int, default=[],
                     help="with --auto_k, also inject the first k latents of each auto-k ranking for every k "
                          "listed (e.g. 1 3 5), to compare a fixed k with the searched one; injection only")
@@ -1022,6 +1026,124 @@ def casl_entries(args, entries: list, ctype: str, concept: str) -> list:
     return own[:args.casl_images] if args.casl_images > 0 else own
 
 
+class CaslTrainer:
+    '''
+    SDXL set up for CASL's training step - frozen, gradient checkpointing on the UNet + VAE, the VAE
+    upcast as in run_attribution - plus the loss's CLIP model, which stays on the CPU (the edited image
+    is moved there and the gradient flows back to the GPU, so only SDXL and the SAE use GPU memory).
+    run_casl trains with it and search_flops.py counts one step() with it, so the counted step is the
+    trained one. A context manager: leaving it undoes the training setup and drops the pipeline.
+    '''
+
+    def __init__(self, args, models: UCModels):
+        self.args, self.models, self.device = args, models, models.device
+
+    def __enter__(self):
+        args = self.args
+        self.sd = self.models.get_pipe().pipe
+        self.call = getattr(type(self.sd).__call__, "__wrapped__", type(self.sd).__call__)  # without its no_grad
+        self.unet, self.vae = self.sd.unet, self.sd.vae
+        self.unet.requires_grad_(False); self.vae.requires_grad_(False)
+        self.unet.enable_gradient_checkpointing(); self.vae.enable_gradient_checkpointing()
+        self.unet.train(); self.vae.train()  # some diffusers versions only checkpoint in train mode (no dropout in either)
+        self.upcast = self.vae.dtype == torch.float16 and getattr(self.vae.config, "force_upcast", False)
+        if self.upcast:
+            self.vae.to(torch.float32)
+        self.clip, self.tokenizer = load_clip("cpu", args.casl_clip_model, args.casl_clip_pretrained)
+        self.clip.requires_grad_(False)
+        self.mean = torch.tensor(CLIP_MEAN).view(1, 3, 1, 1)
+        self.std = torch.tensor(CLIP_STD).view(1, 3, 1, 1)
+        self.cfg = args.guidance_scale > 1  # sdxl-turbo's guidance 0 -> no negative embeddings
+        return self
+
+    def __exit__(self, *exc):
+        self.clip.to("cpu")
+        self.unet.disable_gradient_checkpointing(); self.vae.disable_gradient_checkpointing()
+        self.unet.eval(); self.vae.eval()
+        if self.upcast:
+            self.vae.to(torch.float16)
+        self.models.free()
+        return False
+
+    @torch.no_grad()
+    def embed_prompt(self, prompt: str) -> dict:
+        '''The pipeline's prompt embeddings (on the CPU), so the text encoders can leave the GPU.'''
+        pe, npe, ppe, nppe = self.sd.encode_prompt(prompt=prompt, device=self.device, num_images_per_prompt=1,
+                                                   do_classifier_free_guidance=self.cfg)
+        out = {"prompt_embeds": pe, "pooled_prompt_embeds": ppe}
+        if self.cfg:
+            out.update({"negative_prompt_embeds": npe, "negative_pooled_prompt_embeds": nppe})
+        return {k: v.cpu() for k, v in out.items()}
+
+    def offload_text_encoders(self):
+        '''SDXL's two text encoders (~1.6 GB in fp16) wait on the CPU once every prompt is embedded.'''
+        self.sd.text_encoder.to("cpu"); self.sd.text_encoder_2.to("cpu")
+        if is_cuda(self.device):
+            torch.cuda.empty_cache()
+
+    def generate(self, embeds: dict, seed: int):
+        '''(1, 3, H, W) image in [0, 1], differentiable when called with grad enabled.'''
+        args = self.args
+        lat = self.call(self.sd, **{k: v.to(self.device) for k, v in embeds.items()},
+                        num_inference_steps=args.num_inference_steps, guidance_scale=args.guidance_scale,
+                        height=args.size, width=args.size, generator=torch.Generator().manual_seed(seed),
+                        output_type="latent").images
+        lat = lat.to(self.vae.dtype) / self.vae.config.scaling_factor
+        return (self.vae.decode(lat, return_dict=False)[0] / 2 + 0.5).clamp(0, 1)
+
+    def embed_image(self, img):
+        '''img: (1, 3, H, W) in [0, 1] on any device -> normalized CLIP embedding on the CPU.'''
+        x = F.interpolate(img.float().cpu(), size=(224, 224), mode="bicubic", antialias=True, align_corners=False)
+        e = self.clip.encode_image((x - self.mean) / self.std)
+        return e / e.norm(dim=-1, keepdim=True)
+
+    @torch.no_grad()
+    def text_direction(self, y_origin: str, y_ref: str):
+        t = self.clip.encode_text(self.tokenizer([y_origin, y_ref]))
+        t = t / t.norm(dim=-1, keepdim=True)
+        d = t[1] - t[0]
+        return d / d.norm()
+
+    @torch.no_grad()
+    def original(self, embeds: dict, seed: int):
+        '''The unedited image (CPU, fp16) and its CLIP embedding - generate before attach().'''
+        img = self.generate(embeds, seed)
+        return img.half().cpu(), self.embed_image(img)
+
+    def attach(self, block: str, sae, W, b):
+        '''Adds dh = W z + b (Eq. 6, per patch, frozen SAE encoder) to the block's output; returns the handle.'''
+        mode = self.args.mode
+
+        def hook(module, inp, out):
+            o = out[0] if isinstance(out, tuple) else out
+            x = o - inp[0] if mode == "diff" else o
+            with torch.no_grad():
+                z = sae.encode(x.permute(0, 2, 3, 1).float())  # frozen encoder (Sec. 4.2)
+            dh = z @ W.T + b
+            o = o + dh.permute(0, 3, 1, 2).to(o.dtype)
+            return (o, *out[1:]) if isinstance(out, tuple) else o
+
+        return self.unet.get_submodule(block).register_forward_hook(hook)
+
+    def step(self, embeds: dict, seed: int, original: tuple, text_dir, W, b):
+        '''
+        One forward + backward of Eq. 8 with the hook attached; leaves W.grad / b.grad for the optimizer.
+        Returns (clip loss, L1 loss, |E_I(edit) - E_I(original)|) as floats.
+        '''
+        args = self.args
+        orig_img, orig_emb = original
+        W.grad, b.grad = None, None
+        with torch.enable_grad():
+            img = self.generate(embeds, seed)
+            d_img = (self.embed_image(img) - orig_emb)[0]
+            cos = (d_img @ text_dir) / d_img.norm().clamp_min(CASL_MIN_DIRECTION)
+            loss_clip = 1 - cos
+            loss_recon = (img.float() * 2 - orig_img.to(self.device).float() * 2).abs().mean()  # [-1, 1]
+            loss = args.casl_lambda_clip * loss_clip.to(self.device) + args.casl_lambda_recon * loss_recon
+            loss.backward()
+        return loss_clip.item(), loss_recon.item(), d_img.detach().norm().item()
+
+
 def run_casl(args, models: UCModels, entries: list, targets: list, block_list: list):
     '''
     CASL stage 2 (He et al., arXiv:2601.15441, Sec. 4.2, Eqs. 6-8) per concept x block: with the
@@ -1041,10 +1163,8 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
     images gets no gradient (dh only depends on its column through z_j), so with a random init its
     column would keep a random norm and enter the ranking anyway.
 
-    The CLIP model lives on the CPU for the whole step: the edited image is moved there (the
-    gradient flows back to the GPU), so only SDXL and the SAE use GPU memory, as in run_attribution.
-    SDXL's two text encoders (~1.6 GB in fp16) are only used to embed every training prompt once
-    up front; they then wait on the CPU until training is done (models.free() drops the pipeline).
+    The step itself is CaslTrainer.step (CLIP on the CPU; SDXL's text encoders only embed every
+    training prompt once up front, then wait on the CPU).
     '''
     todo = [(t, c) for t, c in targets if not all(b in load_casl(args, c) for b in block_list)]
     print(f"casl: {len(todo)} of {len(targets)} concepts to train")
@@ -1053,69 +1173,17 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
     if args.joint_blocks:
         raise ValueError("--rules casl is per block: not available with --joint_blocks")
     device = models.device
-    pipe = models.get_pipe()
-    sd = pipe.pipe
-    call = getattr(type(sd).__call__, "__wrapped__", type(sd).__call__)  # the pipeline call without its no_grad
-    unet, vae = sd.unet, sd.vae
-    unet.requires_grad_(False); vae.requires_grad_(False)
-    unet.enable_gradient_checkpointing(); vae.enable_gradient_checkpointing()
-    unet.train(); vae.train()  # some diffusers versions only checkpoint in train mode (no dropout in either)
-    upcast = vae.dtype == torch.float16 and getattr(vae.config, "force_upcast", False)
-    if upcast:
-        vae.to(torch.float32)
-    clip_model, clip_tok = load_clip("cpu", args.casl_clip_model, args.casl_clip_pretrained)
-    clip_model.requires_grad_(False)
-    mean = torch.tensor(CLIP_MEAN).view(1, 3, 1, 1)
-    std = torch.tensor(CLIP_STD).view(1, 3, 1, 1)
-
-    def embed_image(img):
-        '''img: (1, 3, H, W) in [0, 1] on any device -> normalized CLIP embedding on the CPU.'''
-        x = F.interpolate(img.float().cpu(), size=(224, 224), mode="bicubic", antialias=True, align_corners=False)
-        e = clip_model.encode_image((x - mean) / std)
-        return e / e.norm(dim=-1, keepdim=True)
-
-    cfg = args.guidance_scale > 1  # sdxl-turbo's guidance 0 -> no negative embeddings
-
-    def embed_prompt(prompt):
-        pe, npe, ppe, nppe = sd.encode_prompt(prompt=prompt, device=device, num_images_per_prompt=1,
-                                              do_classifier_free_guidance=cfg)
-        out = {"prompt_embeds": pe, "pooled_prompt_embeds": ppe}
-        if cfg:
-            out.update({"negative_prompt_embeds": npe, "negative_pooled_prompt_embeds": nppe})
-        return {k: v.cpu() for k, v in out.items()}
-
-    with torch.no_grad():
-        prompt_embeds = {n: embed_prompt(entries[n]["prompt"])
-                         for t, c in todo for n in casl_entries(args, entries, t, c)}
-    sd.text_encoder.to("cpu"); sd.text_encoder_2.to("cpu")
-    if is_cuda(device):
-        torch.cuda.empty_cache()
-
-    def generate_image(n):
-        e = entries[n]
-        lat = call(sd, **{k: v.to(device) for k, v in prompt_embeds[n].items()},
-                   num_inference_steps=args.num_inference_steps,
-                   guidance_scale=args.guidance_scale, height=args.size, width=args.size,
-                   generator=torch.Generator().manual_seed(e["seed"]), output_type="latent").images
-        lat = lat.to(vae.dtype) / vae.config.scaling_factor
-        return (vae.decode(lat, return_dict=False)[0] / 2 + 0.5).clamp(0, 1)
-
     rng = np.random.default_rng(args.seed)
-    try:
+    with CaslTrainer(args, models) as tr:
+        prompt_embeds = {n: tr.embed_prompt(entries[n]["prompt"])
+                         for t, c in todo for n in casl_entries(args, entries, t, c)}
+        tr.offload_text_encoders()
         for ctype, concept in todo:
             own = casl_entries(args, entries, ctype, concept)
             y_origin, y_ref = casl_texts(args, ctype, concept)
-            with torch.no_grad():
-                t = clip_model.encode_text(clip_tok([y_origin, y_ref]))
-                t = t / t.norm(dim=-1, keepdim=True)
-                text_dir = t[1] - t[0]
-                text_dir = text_dir / text_dir.norm()
-            # the unedited images (CPU, fp16) and their CLIP embeddings, shared by every block
-            originals = {}
-            with torch.no_grad():
-                for n in own:
-                    img = generate_image(n)
-                    originals[n] = (img.half().cpu(), embed_image(img))
+            text_dir = tr.text_direction(y_origin, y_ref)
+            # the unedited images and their CLIP embeddings, shared by every block
+            originals = {n: tr.original(prompt_embeds[n], entries[n]["seed"]) for n in own}
             result = load_json(casl_path(args, concept), {})
             mine = result.setdefault(casl_key(args), {})
             for block in block_list:
@@ -1126,17 +1194,7 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
                 W = torch.zeros(d_model, n_dirs, device=device, requires_grad=True)
                 b = torch.zeros(d_model, device=device, requires_grad=True)
                 opt = torch.optim.Adam([W, b], lr=args.casl_lr)
-
-                def hook(module, inp, out):
-                    o = out[0] if isinstance(out, tuple) else out
-                    x = o - inp[0] if args.mode == "diff" else o
-                    with torch.no_grad():
-                        z = sae.encode(x.permute(0, 2, 3, 1).float())  # frozen encoder (Sec. 4.2)
-                    dh = z @ W.T + b  # Eq. 6, per patch
-                    o = o + dh.permute(0, 3, 1, 2).to(o.dtype)
-                    return (o, *out[1:]) if isinstance(out, tuple) else o
-
-                handle = unet.get_submodule(block).register_forward_hook(hook)
+                handle = tr.attach(block, sae, W, b)
                 log, skipped = [], 0
                 try:
                     order_n = []
@@ -1144,26 +1202,15 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
                         if not order_n:
                             order_n = list(rng.permutation(own))
                         n = int(order_n.pop())
-                        orig_img, orig_emb = originals[n]
-                        with torch.enable_grad():
-                            img = generate_image(n)
-                            d_img = (embed_image(img) - orig_emb)[0]
-                            cos = (d_img @ text_dir) / d_img.norm().clamp_min(CASL_MIN_DIRECTION)
-                            loss_clip = 1 - cos
-                            loss_recon = (img.float() * 2 - orig_img.to(device).float() * 2).abs().mean()  # [-1, 1]
-                            loss = args.casl_lambda_clip * loss_clip.to(device) + args.casl_lambda_recon * loss_recon
-                            opt.zero_grad(set_to_none=True)
-                            loss.backward()
+                        log.append(tr.step(prompt_embeds[n], entries[n]["seed"], originals[n], text_dir, W, b))
                         if not (torch.isfinite(W.grad).all() and torch.isfinite(b.grad).all()):
                             skipped += 1  # fp16 overflow in the UNet backward: drop this step
                         else:
                             opt.step()
-                        log.append((loss_clip.item(), loss_recon.item(), d_img.detach().norm().item()))
                         if step % 20 == 0 or step == args.casl_steps - 1:
                             print(f"  casl {ctype} '{concept}' @ {block} step {step}: clip {log[-1][0]:.4f} "
                                   f"recon {log[-1][1]:.4f} |dI| {log[-1][2]:.4f}"
                                   + (f" ({skipped} non-finite steps skipped)" if skipped else ""))
-                        del img, d_img, loss, loss_clip, loss_recon
                 finally:
                     handle.remove()
                 scores = W.detach().norm(dim=0).double().cpu().numpy()  # column norm per latent
@@ -1181,15 +1228,9 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
                 print(f"  casl {ctype} '{concept}' @ {block}: '{y_origin}' -> '{y_ref}', clip loss {last[0]:.4f}, "
                       f"top latents {order[:8]} ({[round(float(scores[j]), 4) for j in order[:8]]})")
                 save_json(casl_path(args, concept), result)
+                del W, b, opt
                 if is_cuda(device):
                     torch.cuda.empty_cache()  # this block's W / Adam state before the next one
-    finally:
-        clip_model.to("cpu")
-        unet.disable_gradient_checkpointing(); vae.disable_gradient_checkpointing()
-        unet.eval(); vae.eval()
-        if upcast:
-            vae.to(torch.float16)
-        models.free()
 
 
 # ---------------------------------------------------------------- stage 3
@@ -2230,7 +2271,7 @@ def save_panels(args, answers: list, var_list: list):
 def inject_jobs(args, base_entries: list, var_list: list) -> list:
     '''
     One job per (variant, strength, masked base image), in
-    {out_dir}/inject/{method}/{rule}_{metric}/{concept}/{block}/s{strength}/.
+    {out_dir}/{--inject_root}/{method}/{rule}_{metric}/{concept}/{block}/s{strength}/.
     '''
     usable = [e for e in base_entries if e.get("mask_area", 0) > 0]
     jobs = []
@@ -2256,7 +2297,8 @@ def inject_jobs(args, base_entries: list, var_list: list) -> list:
                     "latents": latents, "values": values, "n_latents": len(latents),
                     "parts": split_by_block(args, v, values),
                     "probe": v["probe"], "pos_mean": pos_mean, "strength": strength, "base": e["name"],
-                    "image": os.path.join(edit_dir(args, v, root="inject"), f"s{strength:g}", f"{e['name']}.jpg"),
+                    "image": os.path.join(edit_dir(args, v, root=args.inject_root), f"s{strength:g}",
+                                          f"{e['name']}.jpg"),
                 })
     return jobs
 
@@ -2384,6 +2426,7 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
         row = {
             **{k: j[k] for k in ["subject", "concept_type", "method", "block", "kind", "k_metric", "feature_idx",
                                  "strength", "n_latents"]},
+            "inject_value": args.inject_value,
             "base": base["name"], "base_subject": base["subject"], "base_prompt": base["prompt"],
             "image": j["image"],
             "probe_bce": j["probe"].get("bce"), "probe_loss_explained": j["probe"].get("loss_explained"),
@@ -2432,7 +2475,7 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
         return df
     df.to_csv(os.path.join(args.out_dir, f"inject_results_{run_tag(args)}.csv"), index=False)
 
-    keys = ["subject", "concept_type", "method", "block", "kind", "k_metric", "strength"]
+    keys = ["subject", "concept_type", "method", "block", "kind", "k_metric", "inject_value", "strength"]
     metrics = [c for c in df.columns if c not in keys and c != "feature_idx"
                and pd.api.types.is_numeric_dtype(pd.to_numeric(df[c], errors="coerce"))
                and df[c].notna().any() and c not in ["base", "base_subject", "base_prompt", "image"]]

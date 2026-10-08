@@ -33,6 +33,18 @@
 # A run without --auto_k / --auto_gamma (SAeUron's paper recipe, --remove_scale_preset saeuron) is costed as
 # the grid itself, since its per-concept tau / gamma are what that grid search picks.
 #
+# --rules casl / casl_steer (CASL, arXiv:2601.15441) are costed with their training, which is their search:
+#   train    --casl_steps x one CaslTrainer.step at the block (FlopCounterMode on the very step run_casl
+#            trains with: generate with the W_delta hook, VAE decode, CLIP on the CPU, and the backward through
+#            all of it incl. gradient checkpointing's recompute) + Adam's update (ADAM_FLOPS_PER_PARAM per
+#            entry of W_delta, b_delta)
+#   setup    per concept, split evenly over its blocks: embed each training prompt (text encoders), generate
+#            its unedited image and CLIP-embed it (casl_entries images)
+#   alpha    casl_steer only: CASL picks alpha by sweeping it (Fig. 4), i.e. |--casl_alpha| x the answer set
+#            generated with the steer hook + classified - the same form as SAeUron's grid
+# casl's auto-k / auto-gamma search on top of the ranking is counted as for every rule; casl_steer has none.
+# The training step needs the same GPU memory as training (runpygpu_chip_40.sh).
+#
 # Writes {out_dir}/search_flops.json and one row per edit to {outputs_dir}/uc_search_flops.csv (merged across
 # runs like uc_results.csv; compared in uc_results_viz.ipynb). The per-image GPU costs are measured once per
 # pipeline setting and cached in {cache_dir}/search_flops_gpu.json.
@@ -54,6 +66,7 @@ from evaluate_unlearncanvas import (
     parser, CLASSES, STYLES, UCModels, discover_entries, concept_entries, concept_methods,
     answer_entries, load_features, variants, auto_gamma_path, auto_gamma_key, auto_rules,
     saeuron_scores, image_mean_codes, top_n, patch_labels, sam_query, load_attribution, load_casl, k_metric,
+    CaslTrainer, casl_entries, make_steer_hook,
 )
 from sparse_probe import select_bce_and_f1, smallest_k
 
@@ -66,6 +79,11 @@ parser.add_argument("--cg_per_newton", type=int, default=10,
 parser.add_argument("--cd_passes", type=int, default=10,
                     help="liblinear L1 (newGLMNET): coordinate-descent passes per outer iteration, upper bound")
 parser.add_argument("--lbfgs_evals", type=int, default=2, help="lbfgs: loss + gradient evaluations per iteration")
+
+
+# Adam's update, per parameter: two moment updates, bias corrections, sqrt, divide, step (elementwise ops, which
+# FlopCounterMode doesn't count - so it is added analytically)
+ADAM_FLOPS_PER_PARAM = 12
 
 
 # ---------------------------------------------------------------- CPU FLOP counting
@@ -167,6 +185,84 @@ def measure_gpu(args, device, entries, targets, block_list):
     cache = load_json(path, {})  # re-read: another run's job may have added its own settings meanwhile
     cache[gpu_key(args)] = out
     save_json(path, cache)
+    return out
+
+
+def casl_gpu_key(args) -> str:
+    '''CASL's per-step costs: the pipeline's settings plus the loss's CLIP model (the loss weights and lr don't
+    change the FLOPs).'''
+    return gpu_key(args) + f"|casl:{args.casl_clip_model}/{args.casl_clip_pretrained}"
+
+
+def measure_casl(args, device, entries, targets, block_list):
+    '''
+    {"prompt", "original", "step": {block}, "steer_gen": {block}, "params": {block}} with FlopCounterMode, cached in
+    {cache_dir}/search_flops_gpu.json per casl_gpu_key: one prompt embedding, one unedited image + its CLIP
+    embedding, one training step per block (CaslTrainer.step - forward + backward, W_delta at zero, which
+    doesn't change the count) and one steered generation per block (make_steer_hook, top --casl_steer_k).
+    '''
+    path = os.path.join(args.cache_dir, "search_flops_gpu.json")
+    cache = load_json(path, {})
+    out = cache.get(casl_gpu_key(args), {"step": {}, "steer_gen": {}, "params": {}})
+    todo = [b for b in block_list if b not in out["step"] or b not in out["steer_gen"]]
+    if not todo and "prompt" in out:
+        return out
+    models = UCModels(args, device)
+    t, c = targets[0]
+    e = entries[casl_entries(args, entries, t, c)[0]]
+    with CaslTrainer(args, models) as tr:
+        out["prompt"] = gpu_flops(lambda: tr.embed_prompt(e["prompt"]))
+        embeds = tr.embed_prompt(e["prompt"])
+        tr.offload_text_encoders()
+        kept = {}
+        out["original"] = gpu_flops(lambda: kept.update(o=tr.original(embeds, e["seed"])))
+        text_dir = tr.text_direction("a photo of a cat", "a photo")
+        for block in todo:
+            sae = models.get_sae(block).requires_grad_(False)
+            d_model, n_dirs = sae.decoder.weight.shape
+            W = torch.zeros(d_model, n_dirs, device=device, requires_grad=True)
+            b = torch.zeros(d_model, device=device, requires_grad=True)
+            handle = tr.attach(block, sae, W, b)
+            try:
+                out["step"][block] = gpu_flops(lambda: tr.step(embeds, e["seed"], kept["o"], text_dir, W, b))
+            finally:
+                handle.remove()
+            out["params"][block] = int(W.numel() + b.numel())
+    pipe = models.get_pipe()
+    prompt = answer_entries(args)[0]["prompt"]
+    for block in todo:
+        sae = models.get_sae(block)
+        d_model = sae.decoder.weight.shape[0]
+        latents = list(range(args.casl_steer_k))
+        hook = make_steer_hook(sae, torch.randn(d_model, len(latents), device=device), latents, 64.0, args.mode,
+                               args.start_step, args.end_step)
+        with torch.no_grad():
+            out["steer_gen"][block] = gpu_flops(lambda: generate(pipe, prompt, 0, args, {f"unet.{block}": hook}))
+    models.free()
+    cache = load_json(path, {})  # re-read: another run's job may have added its own settings meanwhile
+    cache[casl_gpu_key(args)] = out
+    save_json(path, cache)
+    return out
+
+
+def casl_flops(args, casl_gpu, gpu, entries, targets, keys, n_answer) -> dict:
+    '''{(concept, method, block): {"casl_train", "casl_setup", "casl_alpha"}} - see the header.'''
+    per_concept = {}
+    for k in keys:
+        per_concept[k[0]] = per_concept.get(k[0], 0) + 1
+    out = {}
+    for t, c in targets:
+        n_img = len(casl_entries(args, entries, t, c))
+        setup = n_img * (casl_gpu["prompt"] + casl_gpu["original"])
+        for k in keys:
+            if k[0] != c:
+                continue
+            block = k[2]
+            out[k] = {"casl_train": args.casl_steps * (casl_gpu["step"][block]
+                                                      + ADAM_FLOPS_PER_PARAM * casl_gpu["params"][block]),
+                      "casl_setup": setup / per_concept[c],
+                      "casl_alpha": (len(args.casl_alpha) * n_answer * (casl_gpu["steer_gen"][block] + gpu["cls"])
+                                     if "casl_steer" in args.rules else 0.0)}
     return out
 
 
@@ -291,9 +387,10 @@ def main(args):
     auto = args.auto_k
     if "attribution" in args.rules:
         print("! attribution rule: its ranking (gradients through SDXL + classifier) is not counted, only the search")
-    if "casl" in args.rules:
-        print(f"! casl rule: its training ({args.casl_steps} SDXL + CLIP backward passes per concept x block) "
-              f"is not counted, only the search")
+    casl = bool({"casl", "casl_steer"} & set(args.rules))
+    if "casl_steer" in args.rules:
+        assert args.rules == ["casl_steer"] and not auto, \
+            "cost a --rules casl_steer run on its own (no other rules, no --auto_k / --auto_gamma)"
     if any(m == "grad_eclip" for t, _ in targets for m in concept_methods(args, t)):
         print("! grad_eclip masks are not counted")
 
@@ -314,20 +411,41 @@ def main(args):
     # without --auto_k / --auto_gamma (SAeUron's paper recipe: tau and gamma from its Table 5) the per-concept
     # settings are what the grid search picks, so that run's search is the grid itself
     ours = {k: ak.get(k, 0.0) + ag.get(k, 0.0) + sam_per_key.get(k, 0.0) if auto else saeuron[k] for k in keys}
+    cg, cf = {}, {}
+    if casl:  # CASL's training is its search: added to casl's auto-k / auto-gamma, and all of casl_steer's
+        cg = measure_casl(args, device, entries, targets, block_list)
+        cf = casl_flops(args, cg, gpu, entries, targets, keys, n_answer)
+        ours = {k: (ours[k] if auto else 0.0) + sum(cf[k].values()) for k in keys}
+    part = lambda name: sum(cf[k][name] for k in cf)
     tot = {"saeuron_grid": sum(saeuron.values()), "auto_k": sum(ak.values()), "auto_gamma": sum(ag.values()),
-           "sam_masks": sum(sam_per_key.values()), "ours": sum(ours.values())}
+           "sam_masks": sum(sam_per_key.values()), "casl_train": part("casl_train"), "casl_setup": part("casl_setup"),
+           "casl_alpha": part("casl_alpha"), "ours": sum(ours.values())}
     n = len(keys)
 
+    search = "auto-k + auto-γ" if auto else "CASL training + alpha sweep" if "casl_steer" in args.rules else \
+        "CASL training" if casl else "grid (preset)"
     print(f"\nlike-for-like search cost - {n} edits (concept x mask method x block), rules {args.rules}, "
-          f"k metric {k_metric(args)}, search {'auto-k + auto-γ' if auto else 'grid (preset)'}")
+          f"k metric {k_metric(args)}, search {search}")
     print(f"pipeline: sdxl-turbo {args.size}px, {args.num_inference_steps} step(s), guidance {args.guidance_scale:g}; "
           f"one grid setting = {n_answer} answer images; per image: generate "
           + ", ".join(f"{b.replace('_blocks', '').replace('.attentions', '')} {fmt(gpu['gen'][b])}" for b in block_list)
           + f", classifiers {fmt(gpu['cls'])}" + (f", SAM3 {fmt(gpu['sam'])}" if gpu.get("sam") else ""))
+    if casl:
+        print(f"CASL ({args.casl_steps} steps, {args.casl_clip_model} on the CPU): per training step "
+              + ", ".join(f"{b.replace('_blocks', '').replace('.attentions', '')} {fmt(cg['step'][b])}" for b in block_list)
+              + f"; per training image: prompt {fmt(cg['prompt'])} + unedited image & CLIP {fmt(cg['original'])}"
+              + ("; per steered image: " + ", ".join(f"{b.replace('_blocks', '').replace('.attentions', '')} "
+                                                    f"{fmt(cg['steer_gen'][b])}" for b in block_list)
+                 + f" ({len(args.casl_alpha)} alphas)" if "casl_steer" in args.rules else ""))
     rows = [(f"SAeUron grid ({len(args.sweep_gammas)} γ x {len(args.sweep_percentiles)} τ = {grid} settings)",
              tot["saeuron_grid"]),
             ("this run: auto-k", tot["auto_k"]), ("this run: auto-γ", tot["auto_gamma"]),
-            ("this run: SAM masks", tot["sam_masks"]), ("this run: total", tot["ours"])]
+            ("this run: SAM masks", tot["sam_masks"])]
+    if casl:
+        rows += [("this run: CASL training", tot["casl_train"]), ("this run: CASL setup (unedited images)", tot["casl_setup"])]
+    if "casl_steer" in args.rules:
+        rows += [(f"this run: CASL-Steer alpha sweep ({len(args.casl_alpha)} alphas)", tot["casl_alpha"])]
+    rows += [("this run: total", tot["ours"])]
     print(f"\n{'':52s}{'per edit':>14s}{'run total':>14s}")
     for name, f in rows:
         print(f"{name:52s}{fmt(f / n):>14s}{fmt(f):>14s}")
@@ -335,14 +453,18 @@ def main(args):
 
     # one row per edit in {outputs_dir}/uc_search_flops.csv, next to uc_results.csv (same out_dir keying)
     kind = "+".join(args.rules)
-    df = pd.DataFrame([{"subject": k[0], "method": k[1], "block": k[2], "kind": kind, "k_metric": k_metric(args),
+    km = f"top{args.casl_steer_k}" if "casl_steer" in args.rules else k_metric(args)  # as variants() names them
+    df = pd.DataFrame([{"subject": k[0], "method": k[1], "block": k[2], "kind": kind, "k_metric": km,
                         "feature_idx": np.nan, "auto": int(auto), "grid_size": grid, "n_answer": n_answer,
                         "saeuron_grid": saeuron[k], "auto_k": ak.get(k, 0.0), "auto_gamma": ag.get(k, 0.0),
-                        "sam_masks": sam_per_key.get(k, 0.0), "search": ours[k]} for k in keys])
+                        "sam_masks": sam_per_key.get(k, 0.0), **{c: cf.get(k, {}).get(c, 0.0) for c in
+                                                                 ["casl_train", "casl_setup", "casl_alpha"]},
+                        "search": ours[k]} for k in keys])
     write_outputs_results(args, df, filename="uc_search_flops.csv",
                           keys=["subject", "method", "block", "kind", "k_metric"], replace_on=["subject", "method"])
     path = os.path.join(args.out_dir, "search_flops.json")
-    save_json(path, {"totals": tot, "n_edits": n, "grid": grid, "n_answer": n_answer, "per_image": gpu})
+    save_json(path, {"totals": tot, "n_edits": n, "grid": grid, "n_answer": n_answer, "per_image": gpu,
+                     **({"casl_per_image": cg} if casl else {})})
     print("wrote", path, "and", os.path.join(args.outputs_dir, "uc_search_flops.csv"))
 
 
