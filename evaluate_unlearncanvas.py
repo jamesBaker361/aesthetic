@@ -132,13 +132,14 @@
 #
 # --rules casl: CASL (He et al., arXiv:2601.15441) stage 2 as a baseline - rank latents by the
 # weights of a linear map from the block's SAE code to an activation edit, trained with
-# DiffusionCLIP's directional loss (run_casl -> {out_dir}/casl/). The top latent is used (kind
+# DiffusionCLIP's directional loss (run_casl -> {cache_dir}/casl/, shared by every run with the same
+# --casl_* settings, whatever its out_dir). The top latent is used (kind
 # "casl"); with --auto_k the CASL order feeds the same smallest-k search. Only the choice of latents
 # is CASL's: they are removed like every other rule's (make_zero_hook, gamma / --auto_gamma), not
 # with CASL-Steer. Not available with --joint_blocks (each block is its own map).
 #
 # --rules casl_steer: CASL-Steer itself (Sec. 4.3, Eqs. 9-11). The same trained map (run_casl, cached
-# in {out_dir}/casl/), but instead of removing its top latents through the SAE decoder, the block's
+# in {cache_dir}/casl/), but instead of removing its top latents through the SAE decoder, the block's
 # output gets h + alpha * W_delta[:, I] z_I at every patch (make_steer_hook): I = the top
 # --casl_steer_k latents of the CASL ranking, z the block's current SAE code, no bias (Eq. 11). W_delta
 # was trained to take the concept away (casl_texts), so alpha > 0 removes it. One answer set per
@@ -929,7 +930,12 @@ CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
 
 def casl_path(args, concept: str) -> str:
-    return os.path.join(args.out_dir, "casl", f"{safe(concept)}.json")
+    '''
+    {cache_dir}/casl/{concept}.json: {casl_key: {block: ranking}}. In the shared cache, not out_dir - the
+    trained map doesn't depend on the probe / auto-k / auto-gamma / injection settings that tell runs apart,
+    so every run with the same --casl_* settings reuses it.
+    '''
+    return os.path.join(args.cache_dir, "casl", f"{safe(concept)}.json")
 
 
 def casl_key(args) -> str:
@@ -958,7 +964,25 @@ def casl_texts(args, ctype: str, concept: str):
 
 
 def casl_npz_path(args, concept: str, block: str) -> str:
-    return os.path.join(args.out_dir, "casl", f"{safe(concept)}__{block}.npz")
+    '''One trained map per file, so the settings key is in the name: runs with other --casl_* settings
+    share {cache_dir}/casl/ without overwriting each other's weights.'''
+    key = hashlib.sha1(casl_key(args).encode()).hexdigest()[:12]
+    return os.path.join(args.cache_dir, "casl", f"{safe(concept)}__{block}__{key}.npz")
+
+
+def save_casl_block(args, concept: str, block: str, entry: dict):
+    '''
+    Adds one block's ranking to casl_path under the current key: re-read and merged under an exclusive lock,
+    since parallel runs (another concept shard, another --casl_lr) write the same shared json.
+    '''
+    import fcntl
+    path = casl_path(args, concept)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(f"{path}.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        result = load_json(path, {})
+        result.setdefault(casl_key(args), {})[block] = entry
+        save_json(path, result)
 
 
 def load_casl_columns(args, path: str, latents: list):
@@ -1156,8 +1180,9 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
     SDXL-Turbo's single step gives x_0 directly, so no DDIM inversion is needed: x_orig is the
     discovery image itself, regenerated once without the hook. Latents are ranked by the L2 norm of
     their column of W_delta (Eq. 9's TopK |W_delta^(c)|, which the paper does not reduce over the
-    d_model rows; the column norm is our reading) -> {out_dir}/casl/{concept}.json, and the kept
-    columns + b_delta -> {out_dir}/casl/{concept}__{block}.npz (for a CASL-Steer edit later).
+    d_model rows; the column norm is our reading) -> {cache_dir}/casl/{concept}.json, and the kept
+    columns + b_delta -> {cache_dir}/casl/{concept}__{block}__{key hash}.npz (for a CASL-Steer edit
+    later). Both are keyed by casl_key, so runs with different out_dirs share them.
 
     W_delta starts at zero rather than nn.Linear's random init: a latent that never fires on these
     images gets no gradient (dh only depends on its column through z_j), so with a random init its
@@ -1166,12 +1191,13 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
     The step itself is CaslTrainer.step (CLIP on the CPU; SDXL's text encoders only embed every
     training prompt once up front, then wait on the CPU).
     '''
+    # before the cache check: with every map cached, run_probe would otherwise merge the per-block rankings
+    if args.joint_blocks:
+        raise ValueError("--rules casl is per block: not available with --joint_blocks")
     todo = [(t, c) for t, c in targets if not all(b in load_casl(args, c) for b in block_list)]
     print(f"casl: {len(todo)} of {len(targets)} concepts to train")
     if not todo:
         return
-    if args.joint_blocks:
-        raise ValueError("--rules casl is per block: not available with --joint_blocks")
     device = models.device
     rng = np.random.default_rng(args.seed)
     with CaslTrainer(args, models) as tr:
@@ -1184,10 +1210,9 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
             text_dir = tr.text_direction(y_origin, y_ref)
             # the unedited images and their CLIP embeddings, shared by every block
             originals = {n: tr.original(prompt_embeds[n], entries[n]["seed"]) for n in own}
-            result = load_json(casl_path(args, concept), {})
-            mine = result.setdefault(casl_key(args), {})
+            done = load_casl(args, concept)
             for block in block_list:
-                if block in mine:
+                if block in done:
                     continue
                 sae = models.get_sae(block).requires_grad_(False)
                 d_model, n_dirs = sae.decoder.weight.shape
@@ -1216,18 +1241,19 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
                 scores = W.detach().norm(dim=0).double().cpu().numpy()  # column norm per latent
                 order = [int(j) for j in np.argsort(-scores) if scores[j] > 0][:args.casl_keep]
                 last = np.asarray(log[-min(20, len(log)):]).mean(0)
-                mine[block] = {"order": order, "scores": [float(scores[j]) for j in order],
-                               "n_images": len(own), "y_origin": y_origin, "y_ref": y_ref,
-                               "clip_loss_last": float(last[0]), "recon_loss_last": float(last[1]),
-                               "steps_skipped": skipped}
-                os.makedirs(os.path.dirname(casl_path(args, concept)), exist_ok=True)
+                os.makedirs(os.path.dirname(casl_npz_path(args, concept, block)), exist_ok=True)
                 save_npz(casl_npz_path(args, concept, block),
                          latents=np.asarray(order, dtype=np.int64),
                          W=W.detach()[:, order].half().cpu().numpy(), b=b.detach().cpu().numpy(),
                          key=np.asarray(casl_key(args)))
                 print(f"  casl {ctype} '{concept}' @ {block}: '{y_origin}' -> '{y_ref}', clip loss {last[0]:.4f}, "
                       f"top latents {order[:8]} ({[round(float(scores[j]), 4) for j in order[:8]]})")
-                save_json(casl_path(args, concept), result)
+                # the npz first: a ranking in the json always has its weights on disk
+                save_casl_block(args, concept, block, {
+                    "order": order, "scores": [float(scores[j]) for j in order],
+                    "n_images": len(own), "y_origin": y_origin, "y_ref": y_ref,
+                    "clip_loss_last": float(last[0]), "recon_loss_last": float(last[1]),
+                    "steps_skipped": skipped})
                 del W, b, opt
                 if is_cuda(device):
                     torch.cuda.empty_cache()  # this block's W / Adam state before the next one
@@ -1950,7 +1976,7 @@ def top_k_variants(args, features: dict, targets: list, block_list: list) -> lis
         for method, per_block in features.get(concept, {}).get("methods", {}).items():
             if method not in concept_methods(args, ctype):
                 continue
-            for block in block_list:
+            for block in ([JOINT] if args.joint_blocks else block_list):
                 found = (per_block.get(block) or {}).get("auto_by_key", {}).get(auto_key(args), {})
                 found = {r: a for r, a in found.items() if r in args.rules and a.get("order_top")}
                 for k in args.inject_top_k:
@@ -2502,6 +2528,10 @@ def main(args):
     os.makedirs(args.out_dir, exist_ok=True)
     os.makedirs(args.cache_dir, exist_ok=True)
     block_list = args.block_list if args.block_list else list(DEFAULT_BLOCK_LIST)
+    if args.joint_blocks and {"casl", "casl_steer"} & set(args.rules):
+        # checked here, not only in run_casl: --disable_casl or a cached map would skip that check, and
+        # run_probe would merge the per-block CASL rankings, whose norms don't compare across blocks
+        raise ValueError("--rules casl / casl_steer are per block: not available with --joint_blocks")
     if args.prepare_only:
         # every mask method, so any later --*_mask_methods finds its masks cached
         args.object_mask_methods = ["attention", "sam", "grad_eclip"]
