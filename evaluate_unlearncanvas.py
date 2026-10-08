@@ -2323,6 +2323,7 @@ def inject_jobs(args, base_entries: list, var_list: list) -> list:
                     "latents": latents, "values": values, "n_latents": len(latents),
                     "parts": split_by_block(args, v, values),
                     "probe": v["probe"], "pos_mean": pos_mean, "strength": strength, "base": e["name"],
+                    "probe_score_k_latents": v.get("auto", {}).get("score"),
                     "image": os.path.join(edit_dir(args, v, root=args.inject_root), f"s{strength:g}",
                                           f"{e['name']}.jpg"),
                 })
@@ -2457,6 +2458,8 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
             "image": j["image"],
             "probe_bce": j["probe"].get("bce"), "probe_loss_explained": j["probe"].get("loss_explained"),
             "probe_f1": j["probe"].get("f1"),
+            # the auto-k probe's held-out score on the injected set (none for top-k sets): breaks min-k block ties
+            "probe_score_k_latents": j.get("probe_score_k_latents"),
             # is the original object still there?
             "base_subject_remaining": float((old_mask & base_mask).sum()) / float(base_mask.sum()),
             "base_subject_sam_score": old_score,
