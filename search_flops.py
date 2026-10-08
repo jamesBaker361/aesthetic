@@ -53,7 +53,7 @@ from evaluate_sae_features import (
 from evaluate_unlearncanvas import (
     parser, CLASSES, STYLES, UCModels, discover_entries, concept_entries, concept_methods,
     answer_entries, load_features, variants, auto_gamma_path, auto_gamma_key, auto_rules,
-    saeuron_scores, image_mean_codes, top_n, patch_labels, sam_query, load_attribution, k_metric,
+    saeuron_scores, image_mean_codes, top_n, patch_labels, sam_query, load_attribution, load_casl, k_metric,
 )
 from sparse_probe import select_bce_and_f1, smallest_k
 
@@ -200,6 +200,8 @@ def auto_k_flops(args, entries, targets, block_list) -> dict:
                         orders.append(saeuron_scores(args, entries, means, ctype, concept)[0])
                     if "attribution" in args.rules and load_attribution(args, concept).get(block):
                         orders.append(load_attribution(args, concept)[block]["order"])  # ranking cost not counted
+                    if "casl" in args.rules and load_casl(args, concept).get(block):
+                        orders.append(load_casl(args, concept)[block]["order"])  # training cost not counted
                     for order in orders:
                         smallest_k(idx_all[rows], val_all[rows], labels, owner[rows], n_dirs, order[:args.auto_k_max],
                                    frac=args.auto_k_frac, metric=args.auto_k_metric, seed=args.seed)
@@ -289,6 +291,9 @@ def main(args):
     auto = args.auto_k
     if "attribution" in args.rules:
         print("! attribution rule: its ranking (gradients through SDXL + classifier) is not counted, only the search")
+    if "casl" in args.rules:
+        print(f"! casl rule: its training ({args.casl_steps} SDXL + CLIP backward passes per concept x block) "
+              f"is not counted, only the search")
     if any(m == "grad_eclip" for t, _ in targets for m in concept_methods(args, t)):
         print("! grad_eclip masks are not counted")
 
