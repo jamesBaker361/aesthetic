@@ -287,7 +287,7 @@ from evaluate_sae_features import (
     Models, safe, load_json, save_json, generate, ensure_sam_masks, load_sam, sam_cache_path,
     ensure_text_scores, score_cache_path, load_text_score, run_dream_sparsify, load_block_codes,
     make_zero_hook, run_remove_generate, psnr, write_outputs_results,
-    run_base, run_ablate_generate, save_image, save_npz, fill_prompt, read_lines,
+    run_base, run_ablate_generate, save_image, save_npz, fill_prompt, read_lines, is_cuda,
 )
 from evaluate_nsfw import fid_features, fid_cache_path, frechet_distance  # pytorch-fid, features cached per image
 
@@ -938,6 +938,12 @@ def casl_texts(args, ctype: str, concept: str):
     return concept_text(args, ctype, concept), origin
 
 
+def casl_entries(args, entries: list, ctype: str, concept: str) -> list:
+    '''The discovery images CASL trains on (the first --casl_images of the concept's, 0 = all).'''
+    own = concept_entries(args, entries, ctype, concept)
+    return own[:args.casl_images] if args.casl_images > 0 else own
+
+
 def run_casl(args, models: UCModels, entries: list, targets: list, block_list: list):
     '''
     CASL stage 2 (He et al., arXiv:2601.15441, Sec. 4.2, Eqs. 6-8) per concept x block: with the
@@ -959,6 +965,8 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
 
     The CLIP model lives on the CPU for the whole step: the edited image is moved there (the
     gradient flows back to the GPU), so only SDXL and the SAE use GPU memory, as in run_attribution.
+    SDXL's two text encoders (~1.6 GB in fp16) are only used to embed every training prompt once
+    up front; they then wait on the CPU until training is done (models.free() drops the pipeline).
     '''
     todo = [(t, c) for t, c in targets if not all(b in load_casl(args, c) for b in block_list)]
     print(f"casl: {len(todo)} of {len(targets)} concepts to train")
@@ -988,8 +996,27 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
         e = clip_model.encode_image((x - mean) / std)
         return e / e.norm(dim=-1, keepdim=True)
 
-    def generate_image(e):
-        lat = call(sd, prompt=e["prompt"], num_inference_steps=args.num_inference_steps,
+    cfg = args.guidance_scale > 1  # sdxl-turbo's guidance 0 -> no negative embeddings
+
+    def embed_prompt(prompt):
+        pe, npe, ppe, nppe = sd.encode_prompt(prompt=prompt, device=device, num_images_per_prompt=1,
+                                              do_classifier_free_guidance=cfg)
+        out = {"prompt_embeds": pe, "pooled_prompt_embeds": ppe}
+        if cfg:
+            out.update({"negative_prompt_embeds": npe, "negative_pooled_prompt_embeds": nppe})
+        return {k: v.cpu() for k, v in out.items()}
+
+    with torch.no_grad():
+        prompt_embeds = {n: embed_prompt(entries[n]["prompt"])
+                         for t, c in todo for n in casl_entries(args, entries, t, c)}
+    sd.text_encoder.to("cpu"); sd.text_encoder_2.to("cpu")
+    if is_cuda(device):
+        torch.cuda.empty_cache()
+
+    def generate_image(n):
+        e = entries[n]
+        lat = call(sd, **{k: v.to(device) for k, v in prompt_embeds[n].items()},
+                   num_inference_steps=args.num_inference_steps,
                    guidance_scale=args.guidance_scale, height=args.size, width=args.size,
                    generator=torch.Generator().manual_seed(e["seed"]), output_type="latent").images
         lat = lat.to(vae.dtype) / vae.config.scaling_factor
@@ -998,9 +1025,7 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
     rng = np.random.default_rng(args.seed)
     try:
         for ctype, concept in todo:
-            own = concept_entries(args, entries, ctype, concept)
-            if args.casl_images > 0:
-                own = own[:args.casl_images]
+            own = casl_entries(args, entries, ctype, concept)
             y_origin, y_ref = casl_texts(args, ctype, concept)
             with torch.no_grad():
                 t = clip_model.encode_text(clip_tok([y_origin, y_ref]))
@@ -1011,7 +1036,7 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
             originals = {}
             with torch.no_grad():
                 for n in own:
-                    img = generate_image(entries[n])
+                    img = generate_image(n)
                     originals[n] = (img.half().cpu(), embed_image(img))
             result = load_json(casl_path(args, concept), {})
             mine = result.setdefault(casl_key(args), {})
@@ -1043,7 +1068,7 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
                         n = int(order_n.pop())
                         orig_img, orig_emb = originals[n]
                         with torch.enable_grad():
-                            img = generate_image(entries[n])
+                            img = generate_image(n)
                             d_img = (embed_image(img) - orig_emb)[0]
                             cos = (d_img @ text_dir) / d_img.norm().clamp_min(CASL_MIN_DIRECTION)
                             loss_clip = 1 - cos
@@ -1055,7 +1080,7 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
                             skipped += 1  # fp16 overflow in the UNet backward: drop this step
                         else:
                             opt.step()
-                        log.append((float(loss_clip), float(loss_recon), float(d_img.norm())))
+                        log.append((loss_clip.item(), loss_recon.item(), d_img.detach().norm().item()))
                         if step % 20 == 0 or step == args.casl_steps - 1:
                             print(f"  casl {ctype} '{concept}' @ {block} step {step}: clip {log[-1][0]:.4f} "
                                   f"recon {log[-1][1]:.4f} |dI| {log[-1][2]:.4f}"
@@ -1078,6 +1103,8 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
                 print(f"  casl {ctype} '{concept}' @ {block}: '{y_origin}' -> '{y_ref}', clip loss {last[0]:.4f}, "
                       f"top latents {order[:8]} ({[round(float(scores[j]), 4) for j in order[:8]]})")
                 save_json(casl_path(args, concept), result)
+                if is_cuda(device):
+                    torch.cuda.empty_cache()  # this block's W / Adam state before the next one
     finally:
         clip_model.to("cpu")
         unet.disable_gradient_checkpointing(); vae.disable_gradient_checkpointing()
