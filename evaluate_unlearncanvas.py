@@ -391,6 +391,10 @@ parser.add_argument("--casl_style_origin", type=str, default="an image",
 parser.add_argument("--saeuron_tau", type=int, default=0,
                     help="--rules saeuron: latents kept per concept; 0 = SAeUron's Table 5 value per object "
                          "(SAEURON_TAU; styles 1). Ignored with --auto_k")
+parser.add_argument("--saeuron_search_dir", type=str, default=None,
+                    help="--rules saeuron: tau, gamma and block per object from SAeUron's own hyperparameter search "
+                         "(saeuron_search.py's {dir}/saeuron_search/{block}.json): the best (UA + IRA) / 2 over every "
+                         "block and setting, as find_best_params_cls_sweep.py - instead of Table 5's values")
 parser.add_argument("--saeuron_mask", action="store_true",
                     help="SAeUron's patch mask for removal: only edit a latent where it is above its mean activation "
                          "over all concepts' discovery images (works with any rule)")
@@ -1277,6 +1281,8 @@ def run_tag(args) -> str:
         tag += "_saeuron"
     if args.saeuron_mask:
         tag += "_mask"
+    if args.saeuron_search_dir:
+        tag += "_searched"
     if args.joint_blocks:
         tag += "_joint"
     mode = "g" if args.remove_mode == "saeuron" else "x"  # g = gamma x mean activation, x = direct
@@ -1336,7 +1342,34 @@ SAEURON_TAU = {  # Table 5: number of selected features tau_c per object; styles
 }
 
 
+def load_saeuron_search(args, block_list: list) -> dict:
+    '''
+    {object: {"block", "tau", "gamma", "percentiles", "UA", "IRA", "score"}}: per object, the best (UA + IRA) / 2 of
+    saeuron_search.py's grid over every block (find_best_params_cls_sweep.py; ties: the earlier block, then their
+    loop order - percentiles, then multipliers).
+    '''
+    best = {}
+    for block in block_list:
+        path = os.path.join(args.saeuron_search_dir, "saeuron_search", f"{safe(block)}.json")
+        if not os.path.exists(path):
+            print(f"  ! no SAeUron search results for {block} ({path})")
+            continue
+        for concept, rows in load_json(path, {}).items():
+            rows = sorted((r for r in rows if r["score"] is not None),
+                          key=lambda r: (min(r["percentiles"]), -r["gamma"]))  # their loop order: -1 first
+            for r in rows:
+                if r["score"] > best.get(concept, {}).get("score", float("-inf")):
+                    best[concept] = {**r, "block": block}
+    for concept, b in sorted(best.items()):
+        print(f"  SAeUron search: {concept} -> {b['block']}, tau {b['tau']}, gamma {b['gamma']:g} "
+              f"(UA {b['UA']:.3f}, IRA {b['IRA']:.3f} on the search prompts)")
+    return best
+
+
 def saeuron_tau(args, ctype: str, concept: str) -> int:
+    searched = getattr(args, "saeuron_params", None)
+    if searched is not None and concept in searched:
+        return searched[concept]["tau"]
     if args.saeuron_tau > 0:
         return args.saeuron_tau
     return SAEURON_TAU.get(concept, 1) if ctype == "object" else 1
@@ -1423,6 +1456,9 @@ def saeuron_scores(args, entries: list, means: np.ndarray, ctype: str, concept: 
 
 def remove_scales(args, v: dict) -> list:
     '''The removal scale(s) an edit of this concept is generated with.'''
+    searched = getattr(args, "saeuron_params", None)
+    if searched is not None and v["kind"] == "saeuron" and v["subject"] in searched:
+        return [searched[v["subject"]]["gamma"]]
     if args.remove_scale_preset == "saeuron":
         if v["concept_type"] == "style":
             return [SAEURON_STYLE_MULTIPLIER]
@@ -1926,6 +1962,9 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
                                 "feature_idx": lasso[0]["idx"], "latents": [d["idx"] for d in lasso],
                                 "probe": lasso[0]})
                 sae_top = info.get("saeuron", {}).get("top", [])
+                searched = getattr(args, "saeuron_params", None)
+                if searched is not None and searched.get(concept, {}).get("block") != block:
+                    sae_top = []  # the searched SAeUron: only its block (and no object the search didn't reach)
                 if "saeuron" in args.rules and sae_top:
                     out.append({**common, "method": method, "block": block, "kind": "saeuron",
                                 "feature_idx": sae_top[0]["idx"], "latents": [d["idx"] for d in sae_top],
@@ -2559,6 +2598,14 @@ def main(args):
     if args.limit > 0:
         targets = targets[:args.limit]
     print(f"{len(targets)} concepts to unlearn: {targets}")
+    args.saeuron_params = None
+    if args.saeuron_search_dir:
+        assert args.rules == ["saeuron"] and not args.auto_k and not args.auto_gamma, \
+            "--saeuron_search_dir sets SAeUron's tau / gamma itself: --rules saeuron, no --auto_k / --auto_gamma"
+        # the edit saeuron_search.py scored (it forces both): anything else would apply a different edit
+        assert args.remove_mode == "saeuron" and args.saeuron_mask and not args.joint_blocks, \
+            "--saeuron_search_dir needs SAeUron's edit: --remove_mode saeuron --saeuron_mask, per block"
+        args.saeuron_params = load_saeuron_search(args, block_list)
 
     models = UCModels(args, device)
 
