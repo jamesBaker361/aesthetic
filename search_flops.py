@@ -65,7 +65,7 @@ from evaluate_sae_features import (
 from evaluate_unlearncanvas import (
     parser, CLASSES, STYLES, UCModels, discover_entries, concept_entries, concept_methods,
     answer_entries, load_features, variants, auto_gamma_path, auto_gamma_key, auto_rules,
-    saeuron_scores, image_mean_codes, top_n, patch_labels, sam_query, load_attribution, load_casl, k_metric,
+    saeuron_scores, masked_image_means, image_mean_codes, top_n, patch_labels, sam_query, load_attribution, load_casl, k_metric,
     CaslTrainer, casl_entries, make_steer_hook,
 )
 from sparse_probe import select_bce_and_f1, smallest_k
@@ -274,6 +274,7 @@ def auto_k_flops(args, entries, targets, block_list) -> dict:
     for block in block_list:
         idx_all, val_all, owner, (gh, gw), n_dirs = load_block_codes(entries, block)
         means = image_mean_codes(idx_all, val_all, owner, len(entries), n_dirs) if "saeuron" in args.rules else None
+        masked = {}  # (ctype, mask method) -> saeuron_masked's per-image codes, as run_probe
         for ctype, concept in targets:
             for method in concept_methods(args, ctype):
                 own = concept_entries(args, entries, ctype, concept)
@@ -294,6 +295,11 @@ def auto_k_flops(args, entries, targets, block_list) -> dict:
                     orders = []
                     if "saeuron" in args.rules:
                         orders.append(saeuron_scores(args, entries, means, ctype, concept)[0])
+                    if "saeuron_masked" in args.rules:  # its masks are the probes' own SAM masks (counted below)
+                        if (ctype, method) not in masked:
+                            masked[(ctype, method)] = masked_image_means(args, entries, idx_all, val_all, owner, gh,
+                                                                         gw, n_dirs, ctype, method)
+                        orders.append(saeuron_scores(args, entries, masked[(ctype, method)], ctype, concept)[0])
                     if "attribution" in args.rules and load_attribution(args, concept).get(block):
                         orders.append(load_attribution(args, concept)[block]["order"])  # ranking cost not counted
                     if "casl" in args.rules and load_casl(args, concept).get(block):
