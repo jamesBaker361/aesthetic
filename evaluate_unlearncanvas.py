@@ -353,12 +353,14 @@ parser.add_argument("--style_mask_methods", nargs="*", default=["attention", "gr
 parser.add_argument("--frac", type=float, default=0.25,
                     help="top fraction of patches that count as positive for the attention / grad_eclip masks")
 parser.add_argument("--attn_map_size", type=int, default=64, help="grid every cross-attention map is resized to")
-parser.add_argument("--rules", nargs="*", default=["bce", "f1"], choices=["bce", "f1", "lasso", "attribution", "saeuron", "casl", "casl_steer"],
+parser.add_argument("--rules", nargs="*", default=["bce", "f1"], choices=["bce", "f1", "lasso", "attribution", "saeuron", "saeuron_masked", "casl", "casl_steer"],
                     help="which probe rule(s) pick the latent(s) that get zeroed/injected: lowest per-latent "
                          "BCE, highest per-latent F1, or 'lasso' - the latents a joint L1 logistic "
                          "regression over every latent keeps (sparse_probe.lasso_select); 'casl' - CASL's "
                          "learned code -> activation map (arXiv:2601.15441, run_casl); 'casl_steer' - CASL-Steer: "
-                         "that map's top --casl_steer_k latents edited CASL's way (make_steer_hook), not removed")
+                         "that map's top --casl_steer_k latents edited CASL's way (make_steer_hook), not removed; "
+                         "'saeuron' - SAeUron's feature importance; 'saeuron_masked' - the same score with each "
+                         "image's code averaged over its own object's mask patches only (saeuron_scores)")
 parser.add_argument("--joint_blocks", action="store_true",
                     help="choose latents from all --block_list blocks at once (one feature space of block x latent, "
                          "patches aligned - every block must share the patch grid): every rule ranks / searches "
@@ -775,6 +777,9 @@ def concept_methods(args, ctype: str) -> list:
 
 def run_masks(args, models: UCModels, entries: list, targets: list, device):
     sam_pairs, geclip_pairs = set(), set()
+    if "saeuron_masked" in args.rules:  # its score reads every same-kind concept's mask, not only the targets'
+        targets = sorted(set(targets) | {(t, e[t]) for t in {t for t, _ in targets} for e in entries
+                                         if e[t] is not None})
     for ctype, concept in targets:
         methods = concept_methods(args, ctype)
         for n in concept_entries(args, entries, ctype, concept):
@@ -1279,6 +1284,8 @@ def run_tag(args) -> str:
         tag += "_steer"
     if "saeuron" in args.rules:
         tag += "_saeuron"
+    if "saeuron_masked" in args.rules:
+        tag += "_saeuronm"
     if args.saeuron_mask:
         tag += "_mask"
     if args.saeuron_search_dir:
@@ -1443,15 +1450,44 @@ def saeuron_scores(args, entries: list, means: np.ndarray, ctype: str, concept: 
     '''
     SAeUron's compute_feature_importance on our discovery images: each latent's share of the total mean
     activation on the concept's images minus its share on every other concept's images. Returns the
-    latents with a positive score, best first, and their scores.
+    latents with a positive score, best first, and their scores. means: one code per image (image_mean_codes)
+    - over every patch for SAeUron, over the image's own object mask for saeuron_masked (masked_image_means;
+    images with an empty mask are NaN and left out).
     '''
     groups = same_kind_concepts(args, entries, ctype, concept)
-    mean_x = means[groups[concept]].mean(axis=0)
-    others = [n for c, ns in groups.items() if c != concept for n in ns]
+    valid = ~np.isnan(means[:, 0])  # saeuron_masked: images with no mask patch have no code
+    own = [n for n in groups[concept] if valid[n]]
+    others = [n for c, ns in groups.items() if c != concept for n in ns if valid[n]]
+    if not own:
+        return [], np.zeros(means.shape[1])
+    mean_x = means[own].mean(axis=0)
     mean_o = means[others].mean(axis=0) if others else np.zeros_like(mean_x)
     scores = mean_x / (mean_x.sum() + eps) - mean_o / (mean_o.sum() + eps)
     order = [int(j) for j in np.argsort(-scores) if scores[j] > 0]
     return order, scores
+
+
+SAEURON_RULES = ("saeuron", "saeuron_masked")
+
+
+def saeuron_rules(args) -> list:
+    return [r for r in SAEURON_RULES if r in args.rules]
+
+
+def masked_image_means(args, entries, idx_all, val_all, owner, gh, gw, n_dirs, ctype: str, method: str) -> np.ndarray:
+    '''
+    image_mean_codes over each image's OWN concept mask only (the run's --*_mask_methods: SAM / attention /
+    Grad-ECLIP, at this grid): the code of the object region, so the score contrasts the concept's region with
+    the other concepts' regions instead of whole images.
+    '''
+    # only the discovery source saeuron_scores compares within (as concept_entries / same_kind_concepts): the
+    # other source's images aren't scored and have no masks
+    source = "prompt" if (ctype == "object" and args.object_discover_prompt_file) else "grid"
+    patch_mask = np.zeros(len(owner), dtype=bool)
+    for n, e in enumerate(entries):
+        if e[ctype] is not None and e["source"] == source:
+            patch_mask[owner == n] = patch_labels(args, e, ctype, e[ctype], method, gh, gw).reshape(-1)
+    return image_mean_codes(idx_all, val_all, owner, len(entries), n_dirs, patch_mask=patch_mask)
 
 
 def remove_scales(args, v: dict) -> list:
@@ -1539,10 +1575,12 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
                 or (not args.auto_k and any(
                     features[c]["methods"][m][block].get(r, {}).get("key") != RANKED_RULES[r][1](args)
                     for r in ranked_rules(args)))
-                or (args.auto_k and "saeuron" in args.rules and "saeuron" not in
-                    features[c]["methods"][m][block].get("auto_by_key", {}).get(auto_key(args), {}))
-                or (not args.auto_k and "saeuron" in args.rules
-                    and features[c]["methods"][m][block].get("saeuron", {}).get("tau") != saeuron_tau(args, t, c))
+                or (args.auto_k and not all(
+                    r in features[c]["methods"][m][block].get("auto_by_key", {}).get(auto_key(args), {})
+                    for r in saeuron_rules(args)))
+                or (not args.auto_k and any(
+                    features[c]["methods"][m][block].get(r, {}).get("tau") != saeuron_tau(args, t, c)
+                    for r in saeuron_rules(args)))
                 or (args.auto_k and args.inject_top_k and not all(
                     has_top_k(args, a) for a in features[c]["methods"][m][block].get("auto_by_key", {})
                     .get(auto_key(args), {}).values()))]
@@ -1553,6 +1591,7 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
         else:
             idx_all, val_all, owner, (gh, gw), n_dirs = load_block_codes(entries, block)
         means = image_mean_codes(idx_all, val_all, owner, len(entries), n_dirs) if "saeuron" in args.rules else None
+        masked = {}  # (ctype, mask method) -> masked_image_means, for saeuron_masked
         for ctype, concept, method in todo:
             own = concept_entries(args, entries, ctype, concept)
             labels = np.zeros(len(owner), dtype=bool)
@@ -1610,10 +1649,17 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
                     elif attr["order"]:
                         result[rule] = {"key": ranking_key(args),
                                         "top": [describe(attr["order"][0], attr["scores"][0])]}
-            if "saeuron" in args.rules:
-                order, scores = saeuron_scores(args, entries, means, ctype, concept)
+            for sae_rule in saeuron_rules(args):
+                if sae_rule == "saeuron_masked":
+                    if (ctype, method) not in masked:
+                        masked[(ctype, method)] = masked_image_means(args, entries, idx_all, val_all, owner, gh, gw,
+                                                                     n_dirs, ctype, method)
+                    rule_means = masked[(ctype, method)]
+                else:
+                    rule_means = means
+                order, scores = saeuron_scores(args, entries, rule_means, ctype, concept)
 
-                def describe_s(j):
+                def describe_s(j, scores=scores):
                     return {"idx": int(j), "saeuron_score": float(scores[j]),
                             **latent_activation_stats(idx_all[rows], val_all[rows], labels, j)}
                 if args.auto_k:
@@ -1622,11 +1668,11 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
                                      seed=args.seed)
                     res["top"] = [describe_s(j) for j in res["latents"]]
                     res["order_top"] = [describe_s(j) for j in res["order"][:top_n(args)]]
-                    result["auto_by_key"].setdefault(auto_key(args), {})["saeuron"] = res
+                    result["auto_by_key"].setdefault(auto_key(args), {})[sae_rule] = res
                 elif order:
                     tau = saeuron_tau(args, ctype, concept)
-                    result["saeuron"] = {"tau": tau, "top": [describe_s(j) for j in order[:tau]]}
-                    print(f"    saeuron: tau {tau}, latents {order[:tau]}")
+                    result[sae_rule] = {"tau": tau, "top": [describe_s(j) for j in order[:tau]]}
+                    print(f"    {sae_rule}: tau {tau}, latents {order[:tau]}")
             features[concept]["methods"].setdefault(method, {})[block] = result
             print(f"{ctype} '{concept}' ({method}) @ {block}: bce latent {result['bce']['idx']} "
                   f"(bce={result['bce']['bce']:.4f}, explained={result['bce']['loss_explained']:.3f}) | "
@@ -1961,14 +2007,16 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
                     out.append({**common, "method": method, "block": block, "kind": "lasso",
                                 "feature_idx": lasso[0]["idx"], "latents": [d["idx"] for d in lasso],
                                 "probe": lasso[0]})
-                sae_top = info.get("saeuron", {}).get("top", [])
-                searched = getattr(args, "saeuron_params", None)
-                if searched is not None and searched.get(concept, {}).get("block") != block:
-                    sae_top = []  # the searched SAeUron: only its block (and no object the search didn't reach)
-                if "saeuron" in args.rules and sae_top:
-                    out.append({**common, "method": method, "block": block, "kind": "saeuron",
-                                "feature_idx": sae_top[0]["idx"], "latents": [d["idx"] for d in sae_top],
-                                "probe": sae_top[0], "latent_stats": sae_top})
+                for sae_rule in saeuron_rules(args):
+                    sae_top = info.get(sae_rule, {}).get("top", [])
+                    searched = getattr(args, "saeuron_params", None)
+                    if sae_rule == "saeuron" and searched is not None and \
+                            searched.get(concept, {}).get("block") != block:
+                        sae_top = []  # the searched SAeUron: only its block (and no object the search didn't reach)
+                    if sae_top:
+                        out.append({**common, "method": method, "block": block, "kind": sae_rule,
+                                    "feature_idx": sae_top[0]["idx"], "latents": [d["idx"] for d in sae_top],
+                                    "probe": sae_top[0], "latent_stats": sae_top})
                 for rule in ranked_rules(args):
                     attr = info.get(rule, {}).get("top", [])
                     if attr:

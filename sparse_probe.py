@@ -135,12 +135,20 @@ def latent_activation_stats(idx: np.ndarray, val: np.ndarray, labels: np.ndarray
     }
 
 
-def image_mean_codes(idx_all, val_all, owner, n_images: int, n_dirs: int) -> np.ndarray:
-    '''(n_images, n_dirs): each discovery image's SAE code averaged over its patches (SAeUron's sae_out.mean(1)).'''
+def image_mean_codes(idx_all, val_all, owner, n_images: int, n_dirs: int, patch_mask=None) -> np.ndarray:
+    '''
+    (n_images, n_dirs): each discovery image's SAE code averaged over its patches (SAeUron's sae_out.mean(1)).
+    With patch_mask (one bool per patch), only over the masked patches; an image with none is all NaN.
+    '''
+    keep = np.ones(len(owner), dtype=bool) if patch_mask is None else np.asarray(patch_mask, dtype=bool)
     sums = np.zeros((n_images, n_dirs), dtype=np.float64)
-    rows = np.repeat(owner, idx_all.shape[1])
-    np.add.at(sums, (rows, idx_all.reshape(-1)), np.maximum(val_all.reshape(-1), 0.0))
-    return sums / np.maximum(np.bincount(owner, minlength=n_images), 1)[:, None]
+    rows = np.repeat(owner[keep], idx_all.shape[1])
+    np.add.at(sums, (rows, idx_all[keep].reshape(-1)), np.maximum(val_all[keep].reshape(-1), 0.0))
+    counts = np.bincount(owner[keep], minlength=n_images)
+    means = sums / np.maximum(counts, 1)[:, None]
+    if patch_mask is not None:
+        means[counts == 0] = np.nan
+    return means
 
 
 def scaled_csr(idx: np.ndarray, val: np.ndarray, n_dirs: int):
