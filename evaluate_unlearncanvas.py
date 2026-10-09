@@ -373,7 +373,13 @@ parser.add_argument("--casl_alpha", nargs="*", type=float, default=[1.0, 32.0, 6
                          "(CASL Fig. 4 sweeps 1-192)")
 parser.add_argument("--casl_steps", type=int, default=200,
                     help="--rules casl: Adam steps (one discovery image each) per concept x block")
-parser.add_argument("--casl_lr", type=float, default=1e-3, help="--rules casl: Adam learning rate for W_delta, b_delta")
+parser.add_argument("--casl_lr", type=float, default=1e-3,
+                    help="--rules casl: learning rate for W_delta, b_delta (--casl_optimizer's; SGD's is on another scale)")
+parser.add_argument("--casl_optimizer", type=str, default="adam", choices=["adam", "sgd"],
+                    help="--rules casl: optimizer for W_delta, b_delta. The paper doesn't say. Adam rescales every entry's "
+                         "update, so after many steps W_delta's column norms (the latent ranking) track how often a "
+                         "latent fired rather than its gradient; SGD keeps each column proportional to its summed gradient")
+parser.add_argument("--casl_momentum", type=float, default=0.0, help="--casl_optimizer sgd: momentum (0 = plain SGD)")
 parser.add_argument("--casl_lambda_clip", type=float, default=3.0,
                     help="--rules casl: weight of the directional CLIP loss (CASL Table 4: 3 for faces)")
 parser.add_argument("--casl_lambda_recon", type=float, default=1.0,
@@ -955,7 +961,9 @@ def casl_key(args) -> str:
                      str(args.object_discover_prompt_file), str(args.casl_steps), f"{args.casl_lr:g}",
                      f"{args.casl_lambda_clip:g}", f"{args.casl_lambda_recon:g}",
                      f"{args.casl_clip_model}/{args.casl_clip_pretrained}", args.casl_object_origin,
-                     args.casl_style_origin, args.object_text, args.style_text, str(args.seed)])
+                     args.casl_style_origin, args.object_text, args.style_text, str(args.seed)]
+                    # only for a non-default optimizer, so the Adam maps trained before the option keep their key
+                    + ([f"opt:{args.casl_optimizer}:m{args.casl_momentum:g}"] if args.casl_optimizer != "adam" else []))
 
 
 def load_casl(args, concept: str) -> dict:
@@ -1228,7 +1236,8 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
                 d_model, n_dirs = sae.decoder.weight.shape
                 W = torch.zeros(d_model, n_dirs, device=device, requires_grad=True)
                 b = torch.zeros(d_model, device=device, requires_grad=True)
-                opt = torch.optim.Adam([W, b], lr=args.casl_lr)
+                opt = (torch.optim.SGD([W, b], lr=args.casl_lr, momentum=args.casl_momentum)
+                       if args.casl_optimizer == "sgd" else torch.optim.Adam([W, b], lr=args.casl_lr))
                 handle = tr.attach(block, sae, W, b)
                 log, skipped = [], 0
                 try:
@@ -1243,8 +1252,10 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
                         else:
                             opt.step()
                         if step % 20 == 0 or step == args.casl_steps - 1:
+                            # |grad W| and |W|: for picking an SGD learning rate (its step is lr x |grad W|)
                             print(f"  casl {ctype} '{concept}' @ {block} step {step}: clip {log[-1][0]:.4f} "
-                                  f"recon {log[-1][1]:.4f} |dI| {log[-1][2]:.4f}"
+                                  f"recon {log[-1][1]:.4f} |dI| {log[-1][2]:.4f} |grad W| {W.grad.norm().item():.3g} "
+                                  f"|W| {W.detach().norm().item():.3g}"
                                   + (f" ({skipped} non-finite steps skipped)" if skipped else ""))
                 finally:
                     handle.remove()

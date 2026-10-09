@@ -86,6 +86,13 @@ parser.add_argument("--lbfgs_evals", type=int, default=2, help="lbfgs: loss + gr
 ADAM_FLOPS_PER_PARAM = 12
 
 
+def optimizer_flops_per_param(args) -> int:
+    '''FLOPs of one --casl_optimizer update per parameter: Adam's moments + update, or SGD's (momentum adds 2).'''
+    if getattr(args, "casl_optimizer", "adam") == "sgd":
+        return 2 + (2 if args.casl_momentum else 0)
+    return ADAM_FLOPS_PER_PARAM
+
+
 # ---------------------------------------------------------------- CPU FLOP counting
 
 class Counter:
@@ -259,7 +266,7 @@ def casl_flops(args, casl_gpu, gpu, entries, targets, keys, n_answer) -> dict:
                 continue
             block = k[2]
             out[k] = {"casl_train": args.casl_steps * (casl_gpu["step"][block]
-                                                      + ADAM_FLOPS_PER_PARAM * casl_gpu["params"][block]),
+                                                      + optimizer_flops_per_param(args) * casl_gpu["params"][block]),
                       "casl_setup": setup / per_concept[c],
                       "casl_alpha": (len(args.casl_alpha) * n_answer * (casl_gpu["steer_gen"][block] + gpu["cls"])
                                      if "casl_steer" in args.rules else 0.0)}
