@@ -370,7 +370,16 @@ parser.add_argument("--casl_steer_k", type=int, default=1,
                     help="--rules casl_steer: the top-k latents of the CASL ranking that are steered (Table 1: 1)")
 parser.add_argument("--casl_alpha", nargs="*", type=float, default=[1.0, 32.0, 64.0, 128.0, 192.0],
                     help="--rules casl_steer: editing intensity alpha (Eq. 10), one answer set per value "
-                         "(CASL Fig. 4 sweeps 1-192)")
+                         "(CASL Fig. 4 sweeps 1-192); --casl_alpha_file overrides it per object")
+parser.add_argument("--casl_alpha_file", type=str, default=None,
+                    help="--rules casl_steer: {object: alpha} JSON - CASL's own choice of alpha (App. 7.10, Table 6: "
+                         "picked per concept by visual inspection on a validation set), made with casl_alpha_preview.py "
+                         "+ casl_alpha_pick.ipynb. Objects missing from it are skipped")
+parser.add_argument("--casl_alpha_grid", nargs="*", type=float, default=[16.0, 32.0, 64.0, 96.0, 128.0, 160.0],
+                    help="casl_alpha_preview.py: the alphas rendered for picking (CASL Table 6's range)")
+parser.add_argument("--casl_val_prompts", type=int, default=6,
+                    help="casl_alpha_preview.py: validation prompts per object (anchor prompts after the first 50, "
+                         "which SAeUron's search uses; never the answer set or CASL's training prompts)")
 parser.add_argument("--casl_steps", type=int, default=200,
                     help="--rules casl: Adam steps (one discovery image each) per concept x block")
 parser.add_argument("--casl_lr", type=float, default=1e-3,
@@ -1293,6 +1302,8 @@ def run_tag(args) -> str:
         tag += "_casl"
     if "casl_steer" in args.rules:
         tag += "_steer"
+    if args.casl_alpha_file:
+        tag += "_apicked"
     if "saeuron" in args.rules:
         tag += "_saeuron"
     if "saeuron_masked" in args.rules:
@@ -2052,12 +2063,23 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
         if v["kind"] == "base":
             scaled.append({**v, "remove_scale": 1.0, "gamma": None})
         elif v["kind"] == "casl_steer":  # alpha, not a removal gamma: never searched
-            scaled += [{**v, "remove_scale": a, "gamma": a, "auto_gamma_target": 0.0} for a in args.casl_alpha]
+            scaled += [{**v, "remove_scale": a, "gamma": a, "auto_gamma_target": 0.0} for a in casl_alphas(args, v)]
         elif args.auto_gamma:
             scaled.append({**v, "remove_scale": float("nan"), "gamma": None})
         else:
             scaled += [{**v, "remove_scale": scale, "gamma": scale} for scale in remove_scales(args, v)]
     return scaled
+
+
+def casl_alphas(args, v: dict) -> list:
+    '''CASL-Steer's alpha(s) for this edit: the object's picked alpha with --casl_alpha_file, else --casl_alpha.'''
+    if not args.casl_alpha_file:
+        return list(args.casl_alpha)
+    picked = load_json(args.casl_alpha_file, {})
+    if picked.get(v["subject"]) is None:
+        print(f"  ! no alpha for '{v['subject']}' in {args.casl_alpha_file} - CASL-Steer skips it")
+        return []
+    return [float(picked[v["subject"]])]
 
 
 def top_k_variants(args, features: dict, targets: list, block_list: list) -> list:
