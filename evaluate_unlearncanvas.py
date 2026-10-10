@@ -280,6 +280,10 @@ import importlib.util
 import hashlib
 import json
 
+# grow the CUDA cache in place instead of in fixed segments: less fragmentation (a CASL backward on an 11 GB card
+# failed with 0.3 GB reserved but unusable). Must be set before torch touches CUDA; an explicit setting wins.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import numpy as np
 import pandas as pd
 import torch
@@ -389,6 +393,10 @@ parser.add_argument("--casl_optimizer", type=str, default="adam", choices=["adam
                          "update, so after many steps W_delta's column norms (the latent ranking) track how often a "
                          "latent fired rather than its gradient; SGD keeps each column proportional to its summed gradient")
 parser.add_argument("--casl_momentum", type=float, default=0.0, help="--casl_optimizer sgd: momentum (0 = plain SGD)")
+parser.add_argument("--casl_vae", type=str, default="sdxl", choices=["sdxl", "fp16fix"],
+                    help="--rules casl: the VAE that decodes CASL's training images. 'sdxl' = the pipeline's own, upcast "
+                         "to fp32 (it overflows in fp16) - its fp32 backward is most of the training memory; 'fp16fix' = "
+                         "madebyollin/sdxl-vae-fp16-fix kept in fp16, about half of that, decodes very slightly differently")
 parser.add_argument("--casl_lambda_clip", type=float, default=3.0,
                     help="--rules casl: weight of the directional CLIP loss (CASL Table 4: 3 for faces)")
 parser.add_argument("--casl_lambda_recon", type=float, default=1.0,
@@ -972,7 +980,8 @@ def casl_key(args) -> str:
                      f"{args.casl_clip_model}/{args.casl_clip_pretrained}", args.casl_object_origin,
                      args.casl_style_origin, args.object_text, args.style_text, str(args.seed)]
                     # only for a non-default optimizer, so the Adam maps trained before the option keep their key
-                    + ([f"opt:{args.casl_optimizer}:m{args.casl_momentum:g}"] if args.casl_optimizer != "adam" else []))
+                    + ([f"opt:{args.casl_optimizer}:m{args.casl_momentum:g}"] if args.casl_optimizer != "adam" else [])
+                    + ([f"vae:{args.casl_vae}"] if getattr(args, "casl_vae", "sdxl") != "sdxl" else []))
 
 
 def load_casl(args, concept: str) -> dict:
@@ -1094,10 +1103,16 @@ class CaslTrainer:
         self.sd = self.models.get_pipe().pipe
         self.call = getattr(type(self.sd).__call__, "__wrapped__", type(self.sd).__call__)  # without its no_grad
         self.unet, self.vae = self.sd.unet, self.sd.vae
+        self.own_vae = getattr(args, "casl_vae", "sdxl") == "fp16fix"
+        if self.own_vae:  # decode with the fp16-safe VAE (no fp32 upcast); the pipeline's VAE is left as it is
+            from diffusers import AutoencoderKL
+            self.vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix",
+                                                     torch_dtype=self.unet.dtype).to(self.device)
         self.unet.requires_grad_(False); self.vae.requires_grad_(False)
         self.unet.enable_gradient_checkpointing(); self.vae.enable_gradient_checkpointing()
         self.unet.train(); self.vae.train()  # some diffusers versions only checkpoint in train mode (no dropout in either)
-        self.upcast = self.vae.dtype == torch.float16 and getattr(self.vae.config, "force_upcast", False)
+        self.upcast = (not self.own_vae and self.vae.dtype == torch.float16
+                       and getattr(self.vae.config, "force_upcast", False))
         if self.upcast:
             self.vae.to(torch.float32)
         self.clip, self.tokenizer = load_clip("cpu", args.casl_clip_model, args.casl_clip_pretrained)
@@ -1113,6 +1128,9 @@ class CaslTrainer:
         self.unet.eval(); self.vae.eval()
         if self.upcast:
             self.vae.to(torch.float16)
+        if self.own_vae:
+            self.vae.to("cpu")
+            self.vae = self.sd.vae
         self.models.free()
         return False
 
@@ -1241,7 +1259,12 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
             for block in block_list:
                 if block in done:
                     continue
+                for other in [b for b in models.saes if b != block]:  # earlier blocks' SAEs: not needed now
+                    models.saes.pop(other).to("cpu")
                 sae = models.get_sae(block).requires_grad_(False)
+                if is_cuda(device):
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats(device)
                 d_model, n_dirs = sae.decoder.weight.shape
                 W = torch.zeros(d_model, n_dirs, device=device, requires_grad=True)
                 b = torch.zeros(d_model, device=device, requires_grad=True)
@@ -1277,7 +1300,9 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
                          W=W.detach()[:, order].half().cpu().numpy(), b=b.detach().cpu().numpy(),
                          key=np.asarray(casl_key(args)))
                 print(f"  casl {ctype} '{concept}' @ {block}: '{y_origin}' -> '{y_ref}', clip loss {last[0]:.4f}, "
-                      f"top latents {order[:8]} ({[round(float(scores[j]), 4) for j in order[:8]]})")
+                      f"top latents {order[:8]} ({[round(float(scores[j]), 4) for j in order[:8]]})"
+                      + (f" | peak GPU memory {torch.cuda.max_memory_allocated(device) / 2**30:.2f} GiB"
+                         if is_cuda(device) else ""))
                 # the npz first: a ranking in the json always has its weights on disk
                 save_casl_block(args, concept, block, {
                     "order": order, "scores": [float(scores[j]) for j in order],
