@@ -84,6 +84,11 @@
 # search ran over, for each k: images in {out_dir}/{--inject_root}/{method}/{rule}_top{k}/..., rows with
 # k_metric "top{k}" next to the searched set's (k_metric = --auto_k_metric). uc_inject_compare_k.ipynb
 # compares them.
+# --inject_auto_strength also injects every learned edit (its latents fixed) at a searched strength: the weakest one
+# in [0, --inject_strength_max] for which at least --inject_strength_target (0.5) of the injected patches are classified
+# as the concept by a dense probe on the block's activations (offline, on the base images' cached activations;
+# run_inject_auto_strength). Images in {out_dir}/{--inject_root}/{method}/{rule}_{metric}_sauto{target}/.../s{found}/,
+# rows with that k_metric, the found strength in "strength" and the probe's share as inject_strength_frac_positive.
 #
 # Edited images: {out_dir}/answers/{method}/{rule}_{metric}/{concept}/{block}/
 # {style}_{object}_seed{seed}.jpg - rule = the variant's kind (bce, f1,
@@ -305,6 +310,7 @@ from evaluate_sae_features import (
     make_zero_hook, run_remove_generate, psnr, write_outputs_results,
     run_base, run_ablate_generate, save_image, save_npz, fill_prompt, read_lines, is_cuda,
 )
+from generate_clean_swap import load_feature_mean
 from evaluate_nsfw import fid_features, fid_cache_path, frechet_distance  # pytorch-fid, features cached per image
 
 
@@ -516,6 +522,15 @@ parser.add_argument("--inject_root", type=str, default="inject",
 parser.add_argument("--inject_top_k", nargs="*", type=int, default=[],
                     help="with --auto_k, also inject the first k latents of each auto-k ranking for every k "
                          "listed (e.g. 1 3 5), to compare a fixed k with the searched one; injection only")
+parser.add_argument("--inject_auto_strength", action="store_true",
+                    help="also inject every learned edit at the weakest strength in [0, --inject_strength_max] after which "
+                         "at least --inject_strength_target of the injected patches (base subject's SAM mask) are "
+                         "classified as the concept by a dense probe on the block's activations - bisection, offline "
+                         "(run_inject_auto_strength); k_metric '{metric}_sauto{target}'")
+parser.add_argument("--inject_strength_target", type=float, default=0.5,
+                    help="--inject_auto_strength: fraction of the injected patches the dense probe must call positive")
+parser.add_argument("--inject_strength_max", type=float, default=50.0, help="--inject_auto_strength: strongest strength")
+parser.add_argument("--inject_strength_steps", type=int, default=12, help="--inject_auto_strength: bisection steps")
 
 for flag in ["discover_generate", "sparsify", "masks", "attribution", "casl", "probe", "answers_generate", "answer_masks",
              "uc", "vqa", "clip", "psnr", "fid", "summary", "panels",
@@ -2522,6 +2537,226 @@ def save_panels(args, answers: list, var_list: list):
 
 # ---------------------------------------------------------------- stage 6
 
+def base_embedding_path(args, e: dict) -> str:
+    return os.path.join(args.cache_dir, "base", "embeddings", f"{e['name']}.npz")
+
+
+@torch.no_grad()
+def ensure_base_activations(args, models: UCModels, base_entries: list, block_list: list):
+    '''
+    The unedited base images' block inputs / outputs (same prompt + seed, last step), cached in
+    {cache_dir}/base/embeddings/ in the discovery embeddings' format: what an injection is added to.
+    '''
+    def complete(e):
+        path = base_embedding_path(args, e)
+        if not os.path.exists(path):
+            return False
+        with np.load(path) as d:
+            return all(f"saved_output.{b}" in d.files and f"saved_input.{b}" in d.files for b in block_list)
+
+    todo = [e for e in base_entries if not complete(e)]
+    print(f"base activations: {len(todo)} of {len(base_entries)} to cache")
+    if not todo:
+        return
+    os.makedirs(os.path.dirname(base_embedding_path(args, todo[0])), exist_ok=True)
+    pipe = models.get_pipe()
+    positions = [f"unet.{block}" for block in block_list]
+    for e in todo:
+        _, cache = pipe.run_with_cache(
+            prompt=e["prompt"], positions_to_cache=positions, save_input=True, save_output=True,
+            num_inference_steps=args.num_inference_steps, guidance_scale=args.guidance_scale,
+            height=args.size, width=args.size, generator=torch.Generator().manual_seed(e["seed"]),
+            output_type="pil",
+        )
+        result = {}
+        for block in block_list:
+            pos = f"unet.{block}"
+            result[f"saved_input.{block}"] = cache["input"][pos][:, -1].cpu().float().numpy()
+            result[f"saved_output.{block}"] = cache["output"][pos][:, -1].cpu().float().numpy()
+        save_npz(base_embedding_path(args, e), **result)
+
+
+def inject_values(args, v: dict):
+    """Each injected latent's value (x strength) per --inject_value; None = the SAE checkpoint's mean.pt."""
+    if args.inject_value == "pos_mean":
+        stats = {d["idx"]: d for d in v.get("latent_stats", [v["probe"]])}
+        return [stats.get(j, {}).get("pos_mean") for j in v["latents"]]
+    if args.inject_value == "concept_mean":
+        return v.get("latent_means")
+    return None
+
+
+def strength_metric(args, v: dict) -> str:
+    """k_metric of an --inject_auto_strength copy: the edit's own, tagged with the target."""
+    return f"{v['k_metric']}_sauto{args.inject_strength_target:g}"
+
+
+def inject_strength_path(args, concept: str, method: str) -> str:
+    return os.path.join(args.out_dir, "inject_strength", f"{safe(concept)}__{method}.json")
+
+
+def inject_strength_key(args, v: dict) -> str:
+    return "|".join([v["block"], v["kind"], v["k_metric"], ",".join(str(i) for i in v["latents"]),
+                     f"{args.inject_strength_target:g}", f"{args.inject_strength_max:g}",
+                     str(args.inject_strength_steps), args.inject_value, args.mode, args.base_prompt_file,
+                     args.base_subject_file])
+
+
+@torch.no_grad()
+def run_inject_auto_strength(args, models: UCModels, entries: list, var_list: list, base_entries: list,
+                             block_list: list) -> list:
+    '''
+    --inject_auto_strength: per learned edit (its latents fixed - the auto-k set, top-k set, single latent, ...),
+    the weakest injection strength in [0, --inject_strength_max] after which at least --inject_strength_target of
+    the injected patches look like the concept. "Look like": a dense probe (StandardScaler + L2 logistic
+    regression, as run_auto_gamma's) on the block's un-encoded activations (out - in with --mode diff) of ALL the
+    concept's discovery images, labels = its mask. Offline: each usable base image's cached activations
+    (ensure_base_activations) get exactly what the injection hook adds - strength x decoder(each latent's
+    --inject_value) - inside the base subject's SAM mask at the block's grid, and the probe classifies those
+    patches (pooled over the base images, and over the blocks of a joint edit; each block is checked on its own
+    unedited activations, so an earlier block's injection reaching a later one is not modelled). Bisection for
+    --inject_strength_steps steps, assuming the share rises with strength (every strength tried is kept in
+    "curve"); if even the max misses the target, the max is used (reached False). Cached in
+    {out_dir}/inject_strength/{concept}__{method}.json.
+    Returns injection-only copies of the edits: k_metric "{metric}_sauto{target}", one strength each.
+    '''
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+
+    usable = [e for e in base_entries if e.get("mask_area", 0) > 0]
+    # one search per learned edit: var_list has a copy per removal scale, inject_jobs keeps the first
+    edits = [v for v in var_list if v["kind"] not in ("base", "casl_steer") and v["method"] != "random"
+             and (args.auto_gamma or v.get("k_metric", "").startswith("top") or
+                  v["remove_scale"] == remove_scales(args, v)[0])]
+    caches, found, todo = {}, [], []
+    for v in edits:
+        path = inject_strength_path(args, v["subject"], v["method"])
+        caches.setdefault(path, load_json(path, {}))
+        hit = caches[path].get(inject_strength_key(args, v))
+        (todo.append(v) if hit is None else found.append((v, hit)))
+    print(f"inject auto-strength: {len(todo)} of {len(edits)} searches to run "
+          f"(target {args.inject_strength_target:g}, max {args.inject_strength_max:g})")
+
+    if todo:
+        ensure_base_activations(args, models, usable, block_list)
+        models.free(keep="sae")
+        base_data = {}  # block -> [(x (H*W, C), injected-patch mask (H*W,))] over the usable base images
+
+        def base_block(block):
+            if block not in base_data:
+                rows = []
+                for e in usable:
+                    with np.load(base_embedding_path(args, e)) as d:
+                        o = d[f"saved_output.{block}"][0]
+                        x = o - d[f"saved_input.{block}"][0] if args.mode == "diff" else o
+                    x = x.transpose(1, 2, 0).astype(np.float32)
+                    mask = resize_mask_to_grid(load_sam(e["image"], e["subject"])[0], x.shape[0], x.shape[1])
+                    rows.append((x.reshape(-1, x.shape[-1]), mask.reshape(-1)))
+                base_data[block] = rows
+            return base_data[block]
+
+        groups = {}
+        for v in todo:
+            groups.setdefault((v["concept_type"], v["subject"], v["method"]), []).append(v)
+        for (ctype, concept, method), vs in groups.items():
+            own = concept_entries(args, entries, ctype, concept)
+            probes = {}  # block -> (scaler, probe), or None without mask contrast
+
+            def probe_at(block):
+                if block not in probes:
+                    X, y = [], []
+                    for n in own:
+                        e = entries[n]
+                        with np.load(e["embedding"]) as d:
+                            o = d[f"saved_output.{block}"][0]
+                            x = o - d[f"saved_input.{block}"][0] if args.mode == "diff" else o
+                        x = x.transpose(1, 2, 0).astype(np.float32)
+                        X.append(x.reshape(-1, x.shape[-1]))
+                        y.append(patch_labels(args, e, ctype, concept, method, x.shape[0], x.shape[1]).reshape(-1))
+                    X, y = np.concatenate(X), np.concatenate(y).astype(bool)
+                    if y.all() or not y.any():
+                        probes[block] = None
+                    else:
+                        scaler = StandardScaler().fit(X)
+                        probes[block] = (scaler, LogisticRegression(C=1.0, max_iter=2000).fit(scaler.transform(X), y))
+                return probes[block]
+
+            for v in vs:
+                # per block: what the hook adds at strength 1 (linear in strength)
+                unit = {}
+                for block, part in split_by_block(args, v, inject_values(args, v)).items():
+                    if probe_at(block) is None:
+                        continue
+                    sae = models.get_sae(block)
+                    vals = part["values"] if isinstance(part["values"], (list, tuple)) else [None] * len(part["latents"])
+                    to_vec = torch.zeros(sae.decoder.weight.shape[1], device=models.device, dtype=torch.float32)
+                    for j, val in zip(part["latents"], vals):
+                        to_vec[j] = float(val) if val is not None else (
+                            load_feature_mean(block, j, models.device) if args.sae_source == "local" else 1.0)
+                    unit[block] = sae.decoder(to_vec.to(sae.decoder.weight.dtype)).float().cpu().numpy()
+                if not unit:
+                    print(f"  ! inject auto-strength: '{concept}' ({method}) @ {v['block']}: no mask contrast - skipped")
+                    continue
+
+                def measure(strength):
+                    pos = total = 0
+                    for block, d in unit.items():
+                        scaler, probe = probes[block]
+                        patches = [x[m] + strength * d for x, m in base_block(block) if m.any()]
+                        if not patches:  # no base subject covers a whole patch at this block's grid
+                            continue
+                        patches = np.concatenate(patches)
+                        pos += int(probe.predict(scaler.transform(patches)).sum())
+                        total += len(patches)
+                    return pos / total if total else 0.0
+
+                curve = {}
+
+                def at(s_):
+                    s_ = float(f"{s_:.4g}")  # 4 significant digits: keeps the folder names readable
+                    if s_ not in curve:
+                        curve[s_] = measure(s_)
+                    return s_, curve[s_]
+
+                target = args.inject_strength_target
+                _, f0 = at(0.0)
+                smax, fmax = at(args.inject_strength_max)
+                if f0 >= target:
+                    best, reached = 0.0, True  # already positive without any injection
+                elif fmax < target:
+                    best, reached = smax, False
+                else:
+                    lo, hi = 0.0, smax  # hi meets the target, lo doesn't
+                    for _ in range(args.inject_strength_steps):
+                        s_, f = at((lo + hi) / 2)
+                        if f >= target:
+                            hi = s_
+                        else:
+                            lo = s_
+                    best, reached = hi, True
+                res = {"strength": best, "reached": reached, "frac_positive": curve[best],
+                       "frac_positive_before": f0, "n_bases": len(usable),
+                       "curve": {f"{s_:g}": round(f, 4) for s_, f in sorted(curve.items())}}
+                caches[inject_strength_path(args, concept, method)][inject_strength_key(args, v)] = res
+                found.append((v, res))
+                print(f"  inject auto-strength '{concept}' ({method}) {v['kind']} @ {v['block']} {len(v['latents'])} "
+                      f"latents: strength {best:g}{'' if reached else ' (target NOT reached)'} - positive "
+                      f"{f0:.3f} -> {res['frac_positive']:.3f} (target {target:g}) | curve {res['curve']}")
+            del probes
+        for path, cache in caches.items():
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            save_json(path, cache)
+
+    out = []
+    for v, res in found:
+        if res["strength"] <= 0:
+            continue  # nothing to inject
+        out.append({**v, "k_metric": strength_metric(args, v), "inject_strengths": [res["strength"]],
+                    "inject_strength_search": res})
+    print(f"--inject_auto_strength: {len(out)} injection variants")
+    return out
+
+
 def inject_jobs(args, base_entries: list, var_list: list) -> list:
     '''
     One job per (variant, strength, masked base image), in
@@ -2536,14 +2771,8 @@ def inject_jobs(args, base_entries: list, var_list: list) -> list:
         pos_mean = v["probe"].get("pos_mean")
         latents = list(v["latents"])
         # each latent's value (x strength): None = the checkpoint mean (filled in by run_ablate_generate)
-        if args.inject_value == "pos_mean":
-            stats = {d["idx"]: d for d in v.get("latent_stats", [v["probe"]])}
-            values = [stats.get(j, {}).get("pos_mean") for j in latents]
-        elif args.inject_value == "concept_mean":
-            values = v.get("latent_means")
-        else:
-            values = None
-        for strength in args.strength_list:
+        values = inject_values(args, v)
+        for strength in v.get("inject_strengths", args.strength_list):  # --inject_auto_strength: the one found
             for e in usable:
                 jobs.append({
                     **{k: v[k] for k in ["subject", "concept_type", "method", "block", "kind", "feature_idx",
@@ -2552,6 +2781,7 @@ def inject_jobs(args, base_entries: list, var_list: list) -> list:
                     "parts": split_by_block(args, v, values),
                     "probe": v["probe"], "pos_mean": pos_mean, "strength": strength, "base": e["name"],
                     "probe_score_k_latents": v.get("auto", {}).get("score"),
+                    "inject_strength_search": v.get("inject_strength_search"),
                     "image": os.path.join(edit_dir(args, v, root=args.inject_root), f"s{strength:g}",
                                           f"{e['name']}.jpg"),
                 })
@@ -2689,6 +2919,9 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
             "probe_f1": j["probe"].get("f1"),
             # the auto-k probe's held-out score on the injected set (none for top-k sets): breaks min-k block ties
             "probe_score_k_latents": j.get("probe_score_k_latents"),
+            # --inject_auto_strength: share of the injected patches the dense probe called positive at the strength found
+            "inject_strength_frac_positive": (j.get("inject_strength_search") or {}).get("frac_positive"),
+            "inject_strength_reached": (j.get("inject_strength_search") or {}).get("reached"),
             # is the original object still there?
             "base_subject_remaining": float((old_mask & base_mask).sum()) / float(base_mask.sum()),
             "base_subject_sam_score": old_score,
@@ -2857,6 +3090,8 @@ def main(args):
         top_k = top_k_variants(args, features, targets, block_list)
         if args.inject_value == "concept_mean":
             attach_latent_means(args, entries, top_k, block_list)
+        if args.inject_auto_strength and not args.prepare_only:
+            top_k += run_inject_auto_strength(args, models, entries, var_list + top_k, base_entries, block_list)
         i_jobs = inject_jobs(args, base_entries, var_list + top_k)
         if not args.disable_inject_generate:
             unique = list({j["image"]: j for j in i_jobs}.values())
