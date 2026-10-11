@@ -276,6 +276,7 @@
 import os
 import time
 import argparse
+import shutil
 import importlib.util
 import hashlib
 import json
@@ -420,6 +421,14 @@ parser.add_argument("--saeuron_search_dir", type=str, default=None,
                     help="--rules saeuron: tau, gamma and block per object from SAeUron's own hyperparameter search "
                          "(saeuron_search.py's {dir}/saeuron_search/{block}.json): the best (UA + IRA) / 2 over every "
                          "block and setting, as find_best_params_cls_sweep.py - instead of Table 5's values")
+parser.add_argument("--saeuron_block", type=str, default="best_score", choices=["best_score", "top_feature"],
+                    help="--saeuron_search_dir: each object's block. 'best_score' = the block whose best setting scored the "
+                         "highest (UA + IRA) / 2 in the search; 'top_feature' = the block holding the object's top "
+                         "SAeUron-importance feature when all blocks' latents are scored together (as --joint_blocks), "
+                         "with that block's best searched setting")
+parser.add_argument("--reuse_from", type=str, default=None,
+                    help="another run's out_dir: an edit folder there made with exactly this edit (same block, latents, "
+                         "scales, mask - its latents.json) is copied with its injections instead of regenerated")
 parser.add_argument("--saeuron_mask", action="store_true",
                     help="SAeUron's patch mask for removal: only edit a latent where it is above its mean activation "
                          "over all concepts' discovery images (works with any rule)")
@@ -1336,7 +1345,7 @@ def run_tag(args) -> str:
     if args.saeuron_mask:
         tag += "_mask"
     if args.saeuron_search_dir:
-        tag += "_searched"
+        tag += "_searched" + ("_topfeat" if args.saeuron_block == "top_feature" else "")
     if args.joint_blocks:
         tag += "_joint"
     mode = "g" if args.remove_mode == "saeuron" else "x"  # g = gamma x mean activation, x = direct
@@ -1396,13 +1405,14 @@ SAEURON_TAU = {  # Table 5: number of selected features tau_c per object; styles
 }
 
 
-def load_saeuron_search(args, block_list: list) -> dict:
+def load_saeuron_search(args, block_list: list, top_blocks: dict = None) -> dict:
     '''
-    {object: {"block", "tau", "gamma", "percentiles", "UA", "IRA", "score"}}: per object, the best (UA + IRA) / 2 of
-    saeuron_search.py's grid over every block (find_best_params_cls_sweep.py; ties: the earlier block, then their
-    loop order - percentiles, then multipliers).
+    {object: {"block", "tau", "gamma", "percentiles", "UA", "IRA", "score"}} from saeuron_search.py's grid. At each
+    block the best (UA + IRA) / 2 (find_best_params_cls_sweep.py; ties: their loop order - percentiles, then
+    multipliers). The block: the best of those over every block (ties: the earlier block), or with top_blocks
+    ({object: {"block", ...}}, --saeuron_block top_feature) the block given there.
     '''
-    best = {}
+    per_block = {}  # object -> block -> best row there
     for block in block_list:
         path = os.path.join(args.saeuron_search_dir, "saeuron_search", f"{safe(block)}.json")
         if not os.path.exists(path):
@@ -1411,13 +1421,57 @@ def load_saeuron_search(args, block_list: list) -> dict:
         for concept, rows in load_json(path, {}).items():
             rows = sorted((r for r in rows if r["score"] is not None),
                           key=lambda r: (min(r["percentiles"]), -r["gamma"]))  # their loop order: -1 first
+            best = None
             for r in rows:
-                if r["score"] > best.get(concept, {}).get("score", float("-inf")):
-                    best[concept] = {**r, "block": block}
-    for concept, b in sorted(best.items()):
-        print(f"  SAeUron search: {concept} -> {b['block']}, tau {b['tau']}, gamma {b['gamma']:g} "
+                if best is None or r["score"] > best["score"]:
+                    best = r
+            if best is not None:
+                per_block.setdefault(concept, {})[block] = {**best, "block": block}
+    chosen = {}
+    for concept, by_block in per_block.items():
+        by_score = None
+        for block in block_list:  # strict >: the earlier block wins ties
+            if block in by_block and (by_score is None or by_block[block]["score"] > by_score["score"]):
+                by_score = by_block[block]
+        if top_blocks is None:
+            chosen[concept] = by_score
+        elif concept in top_blocks and top_blocks[concept]["block"] in by_block:
+            chosen[concept] = {**by_block[top_blocks[concept]["block"]], "best_score_block": by_score["block"]}
+        else:
+            print(f"  ! '{concept}': no search results at its top-feature block - skipped")
+    for concept, b in sorted(chosen.items()):
+        note = ""
+        if "best_score_block" in b:
+            note = (" (same as the best-score block)" if b["best_score_block"] == b["block"]
+                    else f" (best-score block was {b['best_score_block']})")
+        print(f"  SAeUron search: {concept} -> {b['block']}{note}, tau {b['tau']}, gamma {b['gamma']:g} "
               f"(UA {b['UA']:.3f}, IRA {b['IRA']:.3f} on the search prompts)")
-    return best
+    return chosen
+
+
+def saeuron_top_feature_blocks(args, entries: list, targets: list, block_list: list) -> dict:
+    '''
+    {object: {"block", "latent", "joint_score"}}: SAeUron's feature importance (saeuron_scores) over every block's
+    latents at once - each image's code is all blocks side by side (load_joint_codes), so the shares are of the
+    total activation over all blocks - and the block holding the top feature (--saeuron_block top_feature).
+    '''
+    idx_all, val_all, owner, _, n_dirs = load_joint_codes(entries, block_list)
+    means = image_mean_codes(idx_all, val_all, owner, len(entries), n_dirs)
+    offsets = joint_offsets(entries, block_list)
+    out = {}
+    for ctype, concept in targets:
+        if ctype != "object":
+            continue
+        order, scores = saeuron_scores(args, entries, means, ctype, concept)
+        if not order:
+            print(f"  ! '{concept}': no feature with a positive SAeUron score over all blocks")
+            continue
+        j = order[0]
+        block, offset = next((b, off) for b, off, n in offsets if off <= j < off + n)
+        out[concept] = {"block": block, "latent": int(j - offset), "joint_score": float(scores[j])}
+        print(f"  top SAeUron feature over all blocks for {concept}: latent {j - offset} @ {block} "
+              f"(score {scores[j]:.4g})")
+    return out
 
 
 def saeuron_tau(args, ctype: str, concept: str) -> int:
@@ -2158,6 +2212,38 @@ def scored_answers(args, v: dict, answers: list) -> list:
     return answers if args.eval_scope == "all" else [a for a in answers if is_target(v, a)]
 
 
+def edit_spec(args, v: dict) -> dict:
+    '''The edit a removal folder records in latents.json (run_answers_generate; not CASL-Steer's).'''
+    scale = edit_scale(args, v, v["gamma"])
+    thr = split_by_block(args, v, v["thresholds"]) if v.get("thresholds") is not None else None
+    parts = {b: {"latents": p["latents"], "scale": p["values"], "thresholds": thr[b]["values"] if thr else None}
+             for b, p in split_by_block(args, v, scale).items()}
+    return json.loads(json.dumps({"block": v["block"], "parts": parts}))
+
+
+def reuse_edits(args, var_list: list):
+    '''
+    --reuse_from: copy an edit's folder (images + their cached scores) and its injection folder from that run when
+    its latents.json records exactly this edit, so only edits that differ are generated. Folders already here are
+    left alone.
+    '''
+    src_args = argparse.Namespace(**{**vars(args), "out_dir": args.reuse_from})
+    copied = 0
+    for v in var_list:
+        if v["kind"] in ("base", "casl_steer") or v["gamma"] is None:
+            continue
+        src, dst = edit_dir(src_args, v), edit_dir(args, v)
+        manifest = os.path.join(src, "latents.json")
+        if os.path.exists(dst) or not os.path.exists(manifest) or load_json(manifest, None) != edit_spec(args, v):
+            continue
+        shutil.copytree(src, dst)
+        src_inj, dst_inj = edit_dir(src_args, v, root=args.inject_root), edit_dir(args, v, root=args.inject_root)
+        if os.path.exists(src_inj) and not os.path.exists(dst_inj):
+            shutil.copytree(src_inj, dst_inj)
+        copied += 1
+    print(f"--reuse_from {args.reuse_from}: {copied} edits copied, the rest are generated")
+
+
 def run_answers_generate(args, models: UCModels, answers: list, var_list: list):
     needed = {}
     for v in var_list:
@@ -2189,11 +2275,7 @@ def run_answers_generate(args, models: UCModels, answers: list, var_list: list):
             # make_zero_hook scales a list of latents as well as one
             # saeuron: each latent -> activation x (gamma x its mean activation on the concept);
             # direct: activation x gamma
-            scale = edit_scale(args, v, v["gamma"])
-            thr = split_by_block(args, v, v["thresholds"]) if v.get("thresholds") is not None else None
-            parts = {b: {"latents": p["latents"], "scale": p["values"],
-                         "thresholds": thr[b]["values"] if thr else None}
-                     for b, p in split_by_block(args, v, scale).items()}
+            parts = edit_spec(args, v)["parts"]
             jobs[path] = {"block": v["block"], "parts": parts, "prompt": a["prompt"], "seed": a["seed"],
                           "image": path}
     # every edit folder records the latents + scale its images were made with; a folder made with
@@ -2711,7 +2793,7 @@ def main(args):
         # the edit saeuron_search.py scored (it forces both): anything else would apply a different edit
         assert args.remove_mode == "saeuron" and args.saeuron_mask and not args.joint_blocks, \
             "--saeuron_search_dir needs SAeUron's edit: --remove_mode saeuron --saeuron_mask, per block"
-        args.saeuron_params = load_saeuron_search(args, block_list)
+        # loaded below, once the discovery codes exist (--saeuron_block top_feature scores them)
 
     models = UCModels(args, device)
 
@@ -2732,6 +2814,10 @@ def main(args):
         run_attribution(args, models, entries, targets, block_list)
     if ({"casl", "casl_steer"} & set(args.rules)) and not args.prepare_only and not args.disable_casl:
         run_casl(args, models, entries, targets, block_list)
+    if args.saeuron_search_dir and not args.prepare_only:
+        top = (saeuron_top_feature_blocks(args, entries, targets, block_list)
+               if args.saeuron_block == "top_feature" else None)
+        args.saeuron_params = load_saeuron_search(args, block_list, top)
     if args.prepare_only:
         features = {}  # -> only the unedited answers and the random controls below
     elif args.disable_probe:
@@ -2746,6 +2832,8 @@ def main(args):
     attach_latent_means(args, entries, var_list, block_list)
     if args.auto_gamma:  # (prepare-only: no learned edits, just gives the random controls gamma 0)
         run_auto_gamma(args, models, entries, var_list, block_list)
+    if args.reuse_from and not args.prepare_only:
+        reuse_edits(args, var_list)
     if not args.disable_answers_generate:
         run_answers_generate(args, models, answers, var_list)
 
