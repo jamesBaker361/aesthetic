@@ -658,8 +658,20 @@ def uc_score_id(args) -> str:
     return f"{uc_model_id(args)}+logits"
 
 
-def load_uc(image_path: str):
-    path = score_cache_path(image_path, "uc", "image")
+def uc_kind(args) -> str:
+    '''
+    The classifier score cache's kind (next to each image: {image}.{kind}.image.json): "uc" for the released
+    UnlearnCanvas checkpoints (the caches every earlier run wrote), "uc_{hash}" for any other pair (e.g. the
+    sdxl-trained ones, train_uc_classifier_sdxl.py) - so each classifier pair keeps its own scores instead of
+    overwriting the other's, and runs with different classifiers can share images and run at the same time.
+    '''
+    if (args.style_ckpt, args.class_ckpt) == (parser.get_default("style_ckpt"), parser.get_default("class_ckpt")):
+        return "uc"
+    return "uc_" + hashlib.sha1(uc_model_id(args).encode()).hexdigest()[:8]
+
+
+def load_uc(image_path: str, kind: str = "uc"):
+    path = score_cache_path(image_path, kind, "image")
     return load_json(path, None) if os.path.exists(path) else None
 
 
@@ -2338,7 +2350,7 @@ def run_scoring(args, models: UCModels, answers: list, var_list: list, device):
 
     if not args.disable_uc:
         if os.path.exists(args.style_ckpt) and os.path.exists(args.class_ckpt):
-            ensure_text_scores(models.get_uc, "uc", [(p, "image") for p in images], args.score_batch_size,
+            ensure_text_scores(models.get_uc, uc_kind(args), [(p, "image") for p in images], args.score_batch_size,
                                model=uc_score_id(args))
         else:
             print(f"! UnlearnCanvas classifiers not found ({args.style_ckpt}, {args.class_ckpt}) - "
@@ -2405,7 +2417,7 @@ def build_results(args, answers: list, var_list: list):
                 "probe_score_all_latents": v.get("auto", {}).get("full"),
                 "probe_score_k_latents": v.get("auto", {}).get("score"),
             }
-            uc = load_uc(path) if not args.disable_uc else None
+            uc = load_uc(path, uc_kind(args)) if not args.disable_uc else None
             if uc is not None and uc.get("model") == uc_score_id(args):
                 style_ok = float(uc["style_pred"] == a["style"])
                 class_ok = float(uc["class_pred"] == a["object"])
@@ -2522,7 +2534,7 @@ def save_panels(args, answers: list, var_list: list):
                     draw.rectangle([x, y, x + size - 1, y + size - 1], fill="lightgray")
                     continue
                 grid.paste(Image.open(path).convert("RGB").resize((size, size)), (x, y))
-                uc = load_uc(path) if not args.disable_uc else None
+                uc = load_uc(path, uc_kind(args)) if not args.disable_uc else None
                 if uc is not None and uc.get("model") == uc_score_id(args):
                     pred = uc["class_pred"] if ctype == "object" else uc["style_pred"]
                     draw.text((x + 3, y + size), f"{uc['class_pred']} / {uc['style_pred']}"[:30],
@@ -2837,7 +2849,7 @@ def run_inject_scoring(args, models: UCModels, jobs: list, base_by_name: dict, d
         ensure_sam_masks(models, sorted(pairs), device)
 
     if not args.disable_uc and os.path.exists(args.style_ckpt) and os.path.exists(args.class_ckpt):
-        ensure_text_scores(models.get_uc, "uc", [(p, "image") for p in images], args.score_batch_size,
+        ensure_text_scores(models.get_uc, uc_kind(args), [(p, "image") for p in images], args.score_batch_size,
                            model=uc_score_id(args))
 
     text_pairs = set()
@@ -2853,7 +2865,7 @@ def run_inject_scoring(args, models: UCModels, jobs: list, base_by_name: dict, d
 
 def uc_target(args, path: str, ctype: str, concept: str):
     '''(classified as concept, p(concept)) from the UnlearnCanvas classifiers, or (None, None).'''
-    uc = load_uc(path) if not args.disable_uc else None
+    uc = load_uc(path, uc_kind(args)) if not args.disable_uc else None
     if uc is None or uc.get("model") != uc_score_id(args):
         return None, None
     pred = uc["style_pred"] if ctype == "style" else uc["class_pred"]
@@ -2873,7 +2885,7 @@ def uc_logit_changes(args, path: str, original: str, ctype: str, concept: str):
     '''
     if args.disable_uc:
         return None, None
-    a, b = load_uc(path), load_uc(original)
+    a, b = load_uc(path, uc_kind(args)), load_uc(original, uc_kind(args))
     if any(u is None or u.get("model") != uc_score_id(args) for u in (a, b)):
         return None, None
     own = "style_logits" if ctype == "style" else "class_logits"

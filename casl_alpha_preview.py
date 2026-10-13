@@ -20,7 +20,7 @@ import time
 from evaluate_sae_features import save_json, ensure_text_scores, safe
 from evaluate_unlearncanvas import (
     parser, CLASSES, STYLES, UCModels, discover_entries, load_casl, casl_key, casl_npz_path, run_casl,
-    run_steer_generate, uc_score_id,
+    run_steer_generate, uc_score_id, uc_kind,
 )
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.init_helpers import repo_api_init
@@ -79,7 +79,7 @@ def main(args):
             images[f"{a:g}"] = paths
         manifest["objects"][concept] = {"latents": latents, "prompts": prompts, "images": images}
     run_steer_generate(args, models, jobs)
-    ensure_text_scores(models.get_uc, "uc", [(j["image"], "image") for j in jobs], args.score_batch_size,
+    ensure_text_scores(models.get_uc, uc_kind(args), [(j["image"], "image") for j in jobs], args.score_batch_size,
                        model=uc_score_id(args))
     os.makedirs(root, exist_ok=True)
     save_json(os.path.join(root, "manifest.json"), manifest)

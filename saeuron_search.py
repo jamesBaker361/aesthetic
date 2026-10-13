@@ -34,7 +34,7 @@ from attribution import DEFAULT_BLOCK_LIST
 from evaluate_sae_features import load_block_codes, load_json, save_json, run_remove_generate, ensure_text_scores, safe
 from evaluate_unlearncanvas import (
     parser, CLASSES, THEMES, STYLES, UCModels, discover_entries, saeuron_scores, image_mean_codes,
-    attach_latent_means, edit_scale, uc_score_id, load_uc,
+    attach_latent_means, edit_scale, uc_score_id, load_uc, uc_kind,
 )
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.init_helpers import repo_api_init
@@ -76,7 +76,7 @@ def ua_ira(paths: list, prompts: list, concept: str, args):
     '''UA and IRA from the object classifier, or (None, None) if any image isn't scored yet.'''
     preds = []
     for path in paths:
-        uc = load_uc(path)
+        uc = load_uc(path, uc_kind(args))
         if uc is None or uc.get("model") != uc_score_id(args):
             return None, None
         preds.append(uc["class_pred"])
@@ -122,7 +122,7 @@ def search_block(args, models, entries, targets, block, prompts):
                          "image": image})
     print(f"{block}: {len(edits)} settings x {len(prompts)} prompts = {len(jobs)} images")
     run_remove_generate(args, models, jobs)
-    ensure_text_scores(models.get_uc, "uc", [(j["image"], "image") for j in jobs], args.score_batch_size,
+    ensure_text_scores(models.get_uc, uc_kind(args), [(j["image"], "image") for j in jobs], args.score_batch_size,
                        model=uc_score_id(args))
 
     results = load_json(results_path(args, block), {})
