@@ -1447,7 +1447,8 @@ def load_saeuron_search(args, block_list: list, top_blocks: dict = None) -> dict
             continue
         for concept, rows in load_json(path, {}).items():
             rows = sorted((r for r in rows if r["score"] is not None),
-                          key=lambda r: (min(r["percentiles"]), -r["gamma"]))  # their loop order: -1 first
+                          # their loop order: features first (smallest tau / percentile), then gamma from -1
+                          key=lambda r: (min(r["percentiles"]) if r.get("percentiles") else r["tau"], -r["gamma"]))
             best = None
             for r in rows:
                 if best is None or r["score"] > best["score"]:

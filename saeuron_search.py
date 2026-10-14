@@ -4,10 +4,12 @@
 #
 # Per object x block, every (percentile, multiplier) of their grid:
 #   features   SAeUron's importance score (saeuron_scores: share of mean activation on the object's
-#              discovery images minus the share on the other objects'), and the features whose score is above
-#              torch.quantile(scores, percentile / 100) over EVERY latent (get_percentile_threshold). On our
-#              5120-latent SAEs, 99.99 / 99.995 / 99.999 all keep the top-1 feature; settings that keep the
-#              same features are generated once.
+#              discovery images minus the share on the other objects'), and its top tau features for every tau in
+#              --sweep_taus (1, 2, 5, 10, 15, 20, 25, 30): the paper's Top-tau_c (Sec. 4, Alg. 1), tuned per object
+#              over the grid of its App. Q / Fig. 31. (--feature_rule percentile instead: their released code's
+#              percentile thresholds, torch.quantile(scores, p / 100) over EVERY latent - on our 5120-latent SAEs
+#              99.99 / 99.995 / 99.999 all keep only the top-1 feature.) Settings that keep the same features
+#              are generated once.
 #   edit       each kept latent -> latent x multiplier x its mean activation on the object, only where it is above
 #              its mean over all objects (their SAEMaskedUnlearningHook = our --remove_mode saeuron
 #              --saeuron_mask), at the block
@@ -15,7 +17,7 @@
 #              " in {style} style." for the first --limit_themes styles (Seed_Images skipped) -> 20 x 49 = 980
 #   score      the UnlearnCanvas object classifier: UA = the object's images not classified as it, IRA = mean
 #              per-object accuracy over the other objects (their accuracy_unlearncanvas_cls_sweep_fast.py)
-# -> {out_dir}/saeuron_search/{block}.json: {object: [{"percentiles", "tau", "latents", "gamma", "UA", "IRA",
+# -> {out_dir}/saeuron_search/{block}.json: {object: [{"tau", "percentiles", "latents", "gamma", "UA", "IRA",
 # "score" = (UA + IRA) / 2}]}. evaluate_unlearncanvas.py --saeuron_search_dir picks, per object, the best score
 # over every block and setting (find_best_params_cls_sweep.py, with the block searched too) and runs it on the
 # benchmark answer set.
@@ -41,8 +43,14 @@ from experiment_helpers.init_helpers import repo_api_init
 
 parser.add_argument("--sweep_gammas", nargs="*", type=float, default=[-1.0, -5.0, -10.0, -15.0, -20.0, -25.0, -30.0],
                     help="SAeUron's multiplier grid (sweep_cls_distr.py)")
+parser.add_argument("--sweep_taus", nargs="*", type=int, default=[1, 2, 5, 10, 15, 20, 25, 30],
+                    help="number of features tau: the top-tau latents by SAeUron score (the paper's Top-tau_c, Sec. 4 / "
+                         "Alg. 1; grid of its App. Q, Fig. 31)")
+parser.add_argument("--feature_rule", type=str, default="top_tau", choices=["top_tau", "percentile"],
+                    help="'top_tau': search --sweep_taus (the paper); 'percentile': their released code's "
+                         "--sweep_percentiles thresholds (sweep_cls_distr.py) - top-1 only on our 5120-latent SAEs")
 parser.add_argument("--sweep_percentiles", nargs="*", type=float, default=[99.99, 99.995, 99.999],
-                    help="SAeUron's feature-percentile grid (sweep_cls_distr.py)")
+                    help="--feature_rule percentile: SAeUron's feature-percentile grid (sweep_cls_distr.py)")
 parser.add_argument("--anchor_prompt_dir", type=str,
                     default="SAeUron/UnlearnCanvas_resources/anchor_prompts/finetune_prompts")
 parser.add_argument("--limit_themes", type=int, default=50, help="sweep_cls_distr.py's limit_themes")
@@ -95,18 +103,29 @@ def search_block(args, models, entries, targets, block, prompts):
 
     edits = []  # one per object x distinct feature set x gamma
     for concept in targets:
-        _, scores = saeuron_scores(args, entries, means, "object", concept)
-        sets = {}
-        for p in args.sweep_percentiles:
-            thr = np.quantile(scores, p / 100.0)  # torch.quantile's default (linear) interpolation
-            latents = tuple(int(j) for j in np.argsort(-scores) if scores[j] > thr)
-            sets.setdefault(latents, []).append(p)
-        for latents, percentiles in sets.items():
+        order, scores = saeuron_scores(args, entries, means, "object", concept)  # positive scores, best first
+        sets = {}  # latent set -> the settings that give it (generated once)
+        if args.feature_rule == "top_tau":
+            # the top tau of the positive-score latents, as evaluate_unlearncanvas.py's run_probe takes them for
+            # --saeuron_search_dir; a tau above the number of positive latents gives all of them (merged)
+            for tau in args.sweep_taus:
+                sets.setdefault(tuple(order[:tau]), []).append(tau)
+        else:
+            for p in args.sweep_percentiles:
+                thr = np.quantile(scores, p / 100.0)  # torch.quantile's default (linear) interpolation
+                latents = tuple(int(j) for j in np.argsort(-scores) if scores[j] > thr)
+                sets.setdefault(latents, []).append(p)
+        for latents, settings in sets.items():
+            if not latents:
+                continue
             for g in args.sweep_gammas:
                 edits.append({"subject": concept, "concept_type": "object", "method": "sam", "block": block,
-                              "kind": "saeuron", "latents": list(latents), "gamma": g, "percentiles": percentiles})
-        print(f"  {concept} @ {block}: " + "; ".join(f"percentiles {ps} -> {len(ls)} latents {list(ls)[:8]}"
-                                                    for ls, ps in sets.items()))
+                              "kind": "saeuron", "latents": list(latents), "gamma": g,
+                              # tau = the smallest setting giving this set (what run_probe slices the order with)
+                              "tau": min(settings) if args.feature_rule == "top_tau" else len(latents),
+                              "percentiles": settings if args.feature_rule == "percentile" else []})
+        print(f"  {concept} @ {block}: " + "; ".join(f"{args.feature_rule} {ss} -> {len(ls)} latents {list(ls)[:8]}"
+                                                    for ls, ss in sets.items()))
     attach_latent_means(args, entries, edits, [block])  # latent_means (gamma's scale) + thresholds (the mask)
 
     jobs, paths = [], {}
@@ -130,14 +149,15 @@ def search_block(args, models, entries, targets, block, prompts):
         rows = []
         for e in (e for e in edits if e["subject"] == concept):
             ua, ira = ua_ira(paths[id(e)], prompts, concept, args)
-            rows.append({"percentiles": e["percentiles"], "tau": len(e["latents"]), "latents": e["latents"],
+            rows.append({"percentiles": e["percentiles"], "tau": e["tau"], "latents": e["latents"],
                          "gamma": e["gamma"], "UA": ua, "IRA": ira,
                          "score": None if ua is None else (ua + ira) / 2})
         results[concept] = rows
         best = max((r for r in rows if r["score"] is not None), key=lambda r: r["score"], default=None)
         if best:
             print(f"  {concept} @ {block}: best tau {best['tau']} gamma {best['gamma']:g} - UA {best['UA']:.3f} "
-                  f"IRA {best['IRA']:.3f} | " + " ".join(f"g{r['gamma']:g}:{r['score']:.3f}" for r in rows))
+                  f"IRA {best['IRA']:.3f} | " + " ".join(f"t{r['tau']}g{r['gamma']:g}:{r['score']:.3f}"
+                                                         for r in rows if r["score"] is not None))
     os.makedirs(os.path.dirname(results_path(args, block)), exist_ok=True)
     save_json(results_path(args, block), results)
 
