@@ -3,7 +3,8 @@
 # both in THIS pipeline (sdxl-turbo, --size, --num_inference_steps, --guidance_scale, the UnlearnCanvas
 # answer set, the ViT-L/16 classifiers).
 #
-# SAeUron's search: every (gamma, percentile) setting of the grid (7 x 3 = 21 by default) is generated on
+# SAeUron's search: every (gamma, tau) setting of the grid (7 x 8 = 56 by default: saeuron_search.py's Top-tau;
+# --feature_rule percentile for their code's 7 x 3 = 21) is generated on
 # the whole answer set and scored (UA + IRA) for every concept x block, then the best setting is kept:
 #     C_grid = |grid| x N_answer x (F_gen(block) + F_cls)            per concept x block
 # F_gen = one generate() call with the SAE removal hook at the block (text encoders, UNet, SAE, VAE),
@@ -72,8 +73,12 @@ from sparse_probe import select_bce_and_f1, smallest_k
 
 parser.add_argument("--sweep_gammas", nargs="*", type=float, default=[-1.0, -5.0, -10.0, -15.0, -20.0, -25.0, -30.0],
                     help="SAeUron's multiplier grid (sweep_cls_distr.py)")
+parser.add_argument("--sweep_taus", nargs="*", type=int, default=[1, 2, 5, 10, 15, 20, 25, 30],
+                    help="SAeUron's number-of-features grid (the paper's Top-tau, App. Q / Fig. 31), as saeuron_search.py")
+parser.add_argument("--feature_rule", type=str, default="top_tau", choices=["top_tau", "percentile"],
+                    help="which feature grid saeuron_search.py searched: --sweep_taus or --sweep_percentiles")
 parser.add_argument("--sweep_percentiles", nargs="*", type=float, default=[99.99, 99.995, 99.999],
-                    help="SAeUron's feature-percentile grid, i.e. its tau (sweep_cls_distr.py)")
+                    help="--feature_rule percentile: SAeUron's released code's feature-percentile grid (sweep_cls_distr.py)")
 parser.add_argument("--cg_per_newton", type=int, default=10,
                     help="liblinear L2 (trust-region Newton): CG steps per Newton iteration, upper bound")
 parser.add_argument("--cd_passes", type=int, default=10,
@@ -216,7 +221,7 @@ def measure_casl(args, device, entries, targets, block_list):
         return out
     models = UCModels(args, device)
     t, c = targets[0]
-    e = entries[casl_entries(args, entries, t, c)[0]]
+    e = casl_entries(args, entries, t, c)[0]
     with CaslTrainer(args, models) as tr:
         out["prompt"] = gpu_flops(lambda: tr.embed_prompt(e["prompt"]))
         embeds = tr.embed_prompt(e["prompt"])
@@ -413,7 +418,8 @@ def main(args):
     ak = auto_k_flops(args, entries, targets, block_list) if auto else {}
     ag = auto_gamma_flops(args, entries, var_list, block_list) if auto else {}
 
-    grid = len(args.sweep_gammas) * len(args.sweep_percentiles)
+    features = args.sweep_taus if args.feature_rule == "top_tau" else args.sweep_percentiles
+    grid = len(args.sweep_gammas) * len(features)
     n_answer = len(answer_entries(args))
     keys = sorted(set(ak) | set(ag) | {(v["subject"], v["method"], v["block"]) for v in learned})
     n_img = {c: len(concept_entries(args, entries, t, c)) for t, c in targets}
@@ -450,7 +456,7 @@ def main(args):
               + ("; per steered image: " + ", ".join(f"{b.replace('_blocks', '').replace('.attentions', '')} "
                                                     f"{fmt(cg['steer_gen'][b])}" for b in block_list)
                  + f" ({len(args.casl_alpha)} alphas)" if "casl_steer" in args.rules else ""))
-    rows = [(f"SAeUron grid ({len(args.sweep_gammas)} γ x {len(args.sweep_percentiles)} τ = {grid} settings)",
+    rows = [(f"SAeUron grid ({len(args.sweep_gammas)} γ x {len(features)} τ = {grid} settings)",
              tot["saeuron_grid"]),
             ("this run: auto-k", tot["auto_k"]), ("this run: auto-γ", tot["auto_gamma"]),
             ("this run: SAM masks", tot["sam_masks"])]

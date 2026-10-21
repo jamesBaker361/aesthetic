@@ -72,8 +72,10 @@ def main(args):
             paths = []
             for i, p in enumerate(prompts):
                 path = os.path.join(root, safe(block), safe(concept), f"a{a:g}", f"{i}.jpg")
+                # --casl_direction paper: the map adds the concept, so its removal edit is -alpha
+                applied = -a if args.casl_direction == "paper" else a
                 parts = {} if a == 0 else {block: {"steer": casl_npz_path(args, concept, block), "latents": latents,
-                                                   "alpha": a}}
+                                                   "alpha": applied}}
                 jobs.append({"block": block, "parts": parts, "prompt": p["prompt"], "seed": p["seed"], "image": path})
                 paths.append(path)
             images[f"{a:g}"] = paths

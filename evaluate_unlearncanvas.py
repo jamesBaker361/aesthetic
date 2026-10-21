@@ -408,8 +408,20 @@ parser.add_argument("--casl_lambda_clip", type=float, default=3.0,
                     help="--rules casl: weight of the directional CLIP loss (CASL Table 4: 3 for faces)")
 parser.add_argument("--casl_lambda_recon", type=float, default=1.0,
                     help="--rules casl: weight of the L1 loss to the unedited image (CASL Table 4: 1)")
+parser.add_argument("--casl_direction", type=str, default="paper", choices=["paper", "remove"],
+                    help="how CASL's map is trained. 'paper' (the paper's Stage 2, Sec. 4.2 / 5.1): one map per concept "
+                         "trained on the same pool of images for every concept (every discovery image of the concept "
+                         "type, not just the concept's), text pair from the domain word to the concept ('a photo' -> "
+                         "'a photo of a Cats'); CASL-Steer then injects with +alpha and removes with -alpha. 'remove' "
+                         "(the earlier adaptation): trained on the concept's own images with the pair reversed, steered "
+                         "with +alpha to remove, no injection")
+parser.add_argument("--casl_pool_seeds", nargs="*", type=int, default=[0, 1],
+                    help="--casl_direction paper: the training pool is every discovery prompt of the concept type x these "
+                         "seeds (20 objects x 25 prompts x 2 = 1,000 images, the paper's '1,000 real images', Sec. 5.1). "
+                         "Only prompt + seed are needed: CASL regenerates each unedited image itself")
 parser.add_argument("--casl_images", type=int, default=0,
-                    help="--rules casl: train on the first N of the concept's discovery images (0 = all)")
+                    help="--rules casl: --casl_direction paper: a fixed random subset of N images of the pool (0 = the "
+                         "whole pool); remove: the first N of the concept's discovery images (0 = all)")
 parser.add_argument("--casl_keep", type=int, default=512, help="--rules casl: latents kept in the saved ranking")
 parser.add_argument("--casl_clip_model", type=str, default="ViT-B-16",
                     help="--rules casl: open_clip model for the training loss (DiffusionCLIP / Asyrp's ViT-B/16); "
@@ -1017,7 +1029,10 @@ def casl_key(args) -> str:
                      args.casl_style_origin, args.object_text, args.style_text, str(args.seed)]
                     # only for a non-default optimizer, so the Adam maps trained before the option keep their key
                     + ([f"opt:{args.casl_optimizer}:m{args.casl_momentum:g}"] if args.casl_optimizer != "adam" else [])
-                    + ([f"vae:{args.casl_vae}"] if getattr(args, "casl_vae", "sdxl") != "sdxl" else []))
+                    + ([f"vae:{args.casl_vae}"] if getattr(args, "casl_vae", "sdxl") != "sdxl" else [])
+                    # the earlier reversed-pair maps ('remove') keep their key
+                    + ([f"dir:paper:pool{','.join(map(str, args.casl_pool_seeds))}"]
+                       if getattr(args, "casl_direction", "remove") == "paper" else []))
 
 
 def load_casl(args, concept: str) -> dict:
@@ -1028,10 +1043,12 @@ def load_casl(args, concept: str) -> dict:
 def casl_texts(args, ctype: str, concept: str):
     '''
     (y_origin, y_ref) for the directional loss. CASL's pairs (Table 4) go from the plain domain word to
-    it with the concept ("person" -> "person with beards"); here the concept is removed, so the pair is
-    reversed: from the concept text to the concept-free one ("a photo of a Cats" -> "a photo").
+    it with the concept ("person" -> "person with beards"): --casl_direction paper, "a photo" -> "a photo of a
+    Cats". --casl_direction remove reverses it ("a photo of a Cats" -> "a photo").
     '''
     origin = args.casl_object_origin if ctype == "object" else args.casl_style_origin
+    if args.casl_direction == "paper":
+        return origin, concept_text(args, ctype, concept)
     return concept_text(args, ctype, concept), origin
 
 
@@ -1117,9 +1134,24 @@ def run_steer_generate(args, models: UCModels, jobs: list):
 
 
 def casl_entries(args, entries: list, ctype: str, concept: str) -> list:
-    '''The discovery images CASL trains on (the first --casl_images of the concept's, 0 = all).'''
+    '''
+    The images CASL trains on, as [{"prompt", "seed"}] (CaslTrainer regenerates each unedited image from them).
+    --casl_direction paper: the paper's "1,000 real images" per concept (Sec. 5.1) - one pool shared by every concept:
+    every discovery prompt of the concept's type and source (all objects') x --casl_pool_seeds (seed 0 = the discovery
+    images themselves); --casl_images > 0: a fixed random subset of that many. remove: the concept's own discovery
+    images (the first --casl_images, 0 = all).
+    '''
+    if args.casl_direction == "paper":
+        prompts = sorted({entries[n]["prompt"] for ns in same_kind_concepts(args, entries, ctype, concept).values()
+                          for n in ns})
+        pool = [{"prompt": p, "seed": seed} for p in prompts for seed in args.casl_pool_seeds]
+        if 0 < args.casl_images < len(pool):
+            keep = np.random.default_rng(args.seed).choice(len(pool), args.casl_images, replace=False)
+            pool = [pool[i] for i in sorted(keep)]
+        return pool
     own = concept_entries(args, entries, ctype, concept)
-    return own[:args.casl_images] if args.casl_images > 0 else own
+    own = own[:args.casl_images] if args.casl_images > 0 else own
+    return [{"prompt": entries[n]["prompt"], "seed": entries[n]["seed"]} for n in own]
 
 
 class CaslTrainer:
@@ -1282,15 +1314,24 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
     device = models.device
     rng = np.random.default_rng(args.seed)
     with CaslTrainer(args, models) as tr:
-        prompt_embeds = {n: tr.embed_prompt(entries[n]["prompt"])
-                         for t, c in todo for n in casl_entries(args, entries, t, c)}
+        prompt_embeds = {}  # prompt -> its text embeddings (one per prompt, whatever the seed)
+        for t, c in todo:
+            for e in casl_entries(args, entries, t, c):
+                if e["prompt"] not in prompt_embeds:
+                    prompt_embeds[e["prompt"]] = tr.embed_prompt(e["prompt"])
         tr.offload_text_encoders()
         for ctype, concept in todo:
             own = casl_entries(args, entries, ctype, concept)
             y_origin, y_ref = casl_texts(args, ctype, concept)
             text_dir = tr.text_direction(y_origin, y_ref)
-            # the unedited images and their CLIP embeddings, shared by every block
-            originals = {n: tr.original(prompt_embeds[n], entries[n]["seed"]) for n in own}
+            # the unedited images and their CLIP embeddings, shared by every block - made on first use: with the
+            # paper's shared pool (1,000 images), --casl_steps steps only ever see that many of them
+            originals = {}
+
+            def original(n):
+                if n not in originals:
+                    originals[n] = tr.original(prompt_embeds[own[n]["prompt"]], own[n]["seed"])
+                return originals[n]
             done = load_casl(args, concept)
             for block in block_list:
                 if block in done:
@@ -1312,9 +1353,9 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
                     order_n = []
                     for step in range(args.casl_steps):
                         if not order_n:
-                            order_n = list(rng.permutation(own))
+                            order_n = list(rng.permutation(len(own)))  # positions in own (same order as before)
                         n = int(order_n.pop())
-                        log.append(tr.step(prompt_embeds[n], entries[n]["seed"], originals[n], text_dir, W, b))
+                        log.append(tr.step(prompt_embeds[own[n]["prompt"]], own[n]["seed"], original(n), text_dir, W, b))
                         if not (torch.isfinite(W.grad).all() and torch.isfinite(b.grad).all()):
                             skipped += 1  # fp16 overflow in the UNet backward: drop this step
                         else:
@@ -2170,7 +2211,10 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
         if v["kind"] == "base":
             scaled.append({**v, "remove_scale": 1.0, "gamma": None})
         elif v["kind"] == "casl_steer":  # alpha, not a removal gamma: never searched
-            scaled += [{**v, "remove_scale": a, "gamma": a, "auto_gamma_target": 0.0} for a in casl_alphas(args, v)]
+            # remove_scale = the alpha setting; gamma = the alpha applied for removal: --casl_direction paper's map adds
+            # the concept, so removal steers with -alpha (injection with +alpha, inject_jobs)
+            sign = -1.0 if args.casl_direction == "paper" else 1.0
+            scaled += [{**v, "remove_scale": a, "gamma": sign * a, "auto_gamma_target": 0.0} for a in casl_alphas(args, v)]
         elif args.auto_gamma:
             scaled.append({**v, "remove_scale": float("nan"), "gamma": None})
         else:
@@ -2770,6 +2814,36 @@ def run_inject_auto_strength(args, models: UCModels, entries: list, var_list: li
     return out
 
 
+def casl_steer_inject_jobs(args, usable: list, v: dict) -> list:
+    '''
+    CASL-Steer injection (--casl_direction paper), as the paper edits: each base image regenerated with
+    h + W_delta (alpha * z) on the top --casl_steer_k latents of the concept's map at every patch (Eq. 11; no mask -
+    the paper's edit has none), alpha = the variant's alpha setting (+, the map's own direction). strength = alpha.
+    '''
+    alpha = float(v["remove_scale"])
+    parts = {v["block"]: {"steer": casl_npz_path(args, v["subject"], v["block"]), "latents": list(v["latents"]),
+                          "alpha": alpha}}
+    folder = os.path.join(args.out_dir, args.inject_root, v["method"], f"{v['kind']}_{v['k_metric']}",
+                          safe(v["subject"]), safe(v["block"].replace(".", "_")), f"s{alpha:g}")
+    # the folder records the map (its npz is keyed by every CASL setting) + latents + alpha; images made with another
+    # one are deleted, so they're regenerated (as run_answers_generate's latents.json)
+    manifest = os.path.join(folder, "latents.json")
+    spec = json.loads(json.dumps({"block": v["block"], "parts": parts}))
+    if os.path.exists(manifest) and load_json(manifest, None) != spec:
+        print(f"  {folder}: CASL map / latents changed - regenerating its images")
+        for f in os.listdir(folder):
+            os.remove(os.path.join(folder, f))
+    if not os.path.exists(manifest):
+        os.makedirs(folder, exist_ok=True)
+        save_json(manifest, spec)
+    return [{**{k: v[k] for k in ["subject", "concept_type", "method", "block", "kind", "feature_idx", "k_metric"]},
+             "latents": list(v["latents"]), "values": None, "n_latents": len(v["latents"]), "parts": parts,
+             "probe": v["probe"], "pos_mean": None, "strength": alpha, "base": e["name"],
+             "prompt": e["prompt"], "seed": e["seed"],
+             "image": os.path.join(folder, f"{e['name']}.jpg")}
+            for e in usable]
+
+
 def inject_jobs(args, base_entries: list, var_list: list) -> list:
     '''
     One job per (variant, strength, masked base image), in
@@ -2778,9 +2852,12 @@ def inject_jobs(args, base_entries: list, var_list: list) -> list:
     usable = [e for e in base_entries if e.get("mask_area", 0) > 0]
     jobs = []
     for v in var_list:
-        if v["kind"] in ("base", "casl_steer") or \
-                (not args.auto_gamma and v["remove_scale"] != remove_scales(args, v)[0]):
-            continue  # injection doesn't depend on the removal scale: one copy per latent (CASL-Steer: none)
+        if v["kind"] == "casl_steer":
+            if args.casl_direction == "paper":
+                jobs += casl_steer_inject_jobs(args, usable, v)
+            continue  # --casl_direction remove: its map removes the concept, it can't inject it
+        if v["kind"] == "base" or (not args.auto_gamma and v["remove_scale"] != remove_scales(args, v)[0]):
+            continue  # injection doesn't depend on the removal scale: one copy per latent
         pos_mean = v["probe"].get("pos_mean")
         latents = list(v["latents"])
         # each latent's value (x strength): None = the checkpoint mean (filled in by run_ablate_generate)
@@ -3108,7 +3185,10 @@ def main(args):
         i_jobs = inject_jobs(args, base_entries, var_list + top_k)
         if not args.disable_inject_generate:
             unique = list({j["image"]: j for j in i_jobs}.values())
-            run_ablate_generate(args, models, unique, base_by_name, device)
+            steer = [j for j in unique if any("steer" in p for p in j["parts"].values())]  # CASL-Steer injection
+            run_ablate_generate(args, models, [j for j in unique if j["image"] not in {x["image"] for x in steer}],
+                                base_by_name, device)
+            run_steer_generate(args, models, steer)
         if not args.disable_inject_panels:
             save_inject_panels(args, i_jobs, base_by_name)
         if args.prepare_only:
