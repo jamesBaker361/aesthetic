@@ -44,6 +44,7 @@ METHODS = {
     "SAeUron score (masked) @ down.2.1 · acc": "evaluation/uc_auto/saeuron_masked_all_autok_accuracy_autog",
     # CASL-Steer (scripts/uc_casl_steer_all.sh): every alpha - removal in {block}/a-{alpha}/, injection in s{alpha}/
     "CASL-Steer": "evaluation/uc_auto/casl_steer_all_paper_sgd_lr1e-1_s1000",
+    "CASL-Steer @ down.2.1": "evaluation/uc_auto/casl_steer_all_paper_sgd_lr1e-1_s1000_down_blocks_2_attentions_1",  # lr: its sweep's
 }
 
 parser = argparse.ArgumentParser()
