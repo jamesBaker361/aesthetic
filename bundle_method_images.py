@@ -18,6 +18,8 @@
 #   python bundle_method_images.py --concepts Dogs Trees --styles Monet Pop_Art
 #   python bundle_method_images.py --add --methods "SAeUron · searched (top-feature block)"   # just one more method
 #   python bundle_method_images.py --methods "SAeUron · searched" "SAeUron score (masked) · per-block · bal-acc" CASL-Steer
+#   python bundle_method_images.py --add --methods saeuron_all_searched_toptau_down_blocks_2_attentions_1 \
+#       saeuron_masked_all_autok_accuracy_autog casl_steer_all_paper_sgd_lr1e-1_s1000   # run folders: through slurm
 # then download and untar images_bundle.tar.gz in the repo root and open uc_method_images.ipynb.
 import argparse
 import glob
@@ -69,7 +71,11 @@ if args.add:
     args.concepts, args.styles, args.seed = previous["concepts"], previous["styles"], previous["seed"]
     args.bases, args.strength, args.cache_dir = previous["bases"], previous["strength"], previous["cache_dir"]
 
-runs = {label: METHODS[label] for label in args.methods}
+# a method is its label or its run folder's name (no spaces: the slurm runner drops the quotes around a label)
+BY_FOLDER = {os.path.basename(run): label for label, run in METHODS.items()}
+unknown = [m for m in args.methods if m not in METHODS and m not in BY_FOLDER]
+assert not unknown, f"unknown --methods {unknown}; use a label or a run folder name: {sorted(BY_FOLDER)}"
+runs = {BY_FOLDER.get(m, m): METHODS[BY_FOLDER.get(m, m)] for m in args.methods}
 runs.update({os.path.basename(r.rstrip("/")): r for r in args.extra_runs})
 copied = []
 
