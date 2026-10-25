@@ -1102,11 +1102,16 @@ def make_steer_hook(sae, W_cols: torch.Tensor, latents: list, alpha: float, mode
             x = out - input[0] if mode == "diff" else out
             z = sae.encode(x.permute(0, 2, 3, 1).float())[..., latents]  # (B, H, W, k)
             dh = alpha * (z @ W_cols.T)                                   # (B, H, W, d_model)
+            # for run_steer_generate's summary: how often the steered latents fire, and how big the edit is
+            hook_fn.stats.append({"fire": (z > 0).any(-1).float().mean().item(),
+                                  "dh_ratio": (dh.norm(dim=-1).mean() / out.permute(0, 2, 3, 1).float().norm(dim=-1)
+                                               .mean().clamp_min(1e-12)).item()})
             out = (out.float() + dh.permute(0, 3, 1, 2)).to(out.dtype)
             output = (out, *output[1:]) if isinstance(output, tuple) else out
         step_counter["step"] = step + 1
         return output
 
+    hook_fn.stats = []
     return hook_fn
 
 
@@ -1119,6 +1124,7 @@ def run_steer_generate(args, models: UCModels, jobs: list):
         return
     pipe = models.get_pipe()
     columns = {}
+    stats = {}  # (block, latents, alpha) -> per-image hook stats, summarized below
     for n, job in enumerate(todo):
         hooks = {}
         for block, p in job["parts"].items():
@@ -1127,10 +1133,20 @@ def run_steer_generate(args, models: UCModels, jobs: list):
                 columns[key] = torch.from_numpy(load_casl_columns(args, p["steer"], p["latents"])).to(models.device)
             hooks[f"unet.{block}"] = make_steer_hook(models.get_sae(block), columns[key], p["latents"], p["alpha"],
                                                      args.mode, args.start_step, args.end_step)
+            stats.setdefault((block, tuple(p["latents"]), p["alpha"]), []).append(hooks[f"unet.{block}"].stats)
         os.makedirs(os.path.dirname(job["image"]), exist_ok=True)
         save_image(generate(pipe, job["prompt"], job["seed"], args, hooks), job["image"])
         if n % 200 == 0:
             print(f"  casl-steer {n}/{len(todo)}")
+    # does the steered latent fire on these images at all? (0% -> the edit adds exactly nothing)
+    for (block, latents, alpha), per_image in sorted(stats.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2])):
+        calls = [s for img in per_image for s in img]
+        if not calls:
+            continue
+        fire = np.array([s["fire"] for s in calls])
+        print(f"  casl-steer stats @ {block} latents {list(latents)} alpha {alpha:g}: fires on {fire.mean():.2%} of "
+              f"patches, on any patch in {sum(any(s['fire'] > 0 for s in img) for img in per_image)}/{len(per_image)} "
+              f"images; mean |dh|/|h| {np.mean([s['dh_ratio'] for s in calls]):.2e}")
 
 
 def casl_entries(args, entries: list, ctype: str, concept: str) -> list:
@@ -1257,6 +1273,14 @@ class CaslTrainer:
             with torch.no_grad():
                 z = sae.encode(x.permute(0, 2, 3, 1).float())  # frozen encoder (Sec. 4.2)
             dh = z @ W.T + b
+            with torch.no_grad():  # for the training log: does the SAE fire here, and does the edit reach the block?
+                active = z > 0
+                top = int(W.detach().norm(dim=0).argmax())
+                self.stats = {"fire": active.any(-1).float().mean().item(),          # patches with any latent on
+                              "l0": active.sum(-1).float().mean().item(),            # active latents per patch
+                              "top_fire": active[..., top].float().mean().item(),    # patches where W's top latent fires
+                              "dh_ratio": (dh.norm(dim=-1).mean() / o.permute(0, 2, 3, 1).float().norm(dim=-1)
+                                           .mean().clamp_min(1e-12)).item()}         # |dh| / |h| per patch
             o = o + dh.permute(0, 3, 1, 2).to(o.dtype)
             return (o, *out[1:]) if isinstance(out, tuple) else o
 
@@ -1365,7 +1389,10 @@ def run_casl(args, models: UCModels, entries: list, targets: list, block_list: l
                             print(f"  casl {ctype} '{concept}' @ {block} step {step}: clip {log[-1][0]:.4f} "
                                   f"recon {log[-1][1]:.4f} |dI| {log[-1][2]:.4f} |grad W| {W.grad.norm().item():.3g} "
                                   f"|W| {W.detach().norm().item():.3g}"
-                                  + (f" ({skipped} non-finite steps skipped)" if skipped else ""))
+                                  + (f" ({skipped} non-finite steps skipped)" if skipped else "")
+                                  + (" | z: {fire:.1%} patches active, {l0:.1f} latents/patch, top-|W| latent on "
+                                     "{top_fire:.2%} of patches, |dh|/|h| {dh_ratio:.2e}".format(**tr.stats)
+                                     if getattr(tr, "stats", None) else ""))
                 finally:
                     handle.remove()
                 scores = W.detach().norm(dim=0).double().cpu().numpy()  # column norm per latent
