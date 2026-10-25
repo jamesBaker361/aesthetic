@@ -400,6 +400,10 @@ parser.add_argument("--casl_optimizer", type=str, default="adam", choices=["adam
                          "update, so after many steps W_delta's column norms (the latent ranking) track how often a "
                          "latent fired rather than its gradient; SGD keeps each column proportional to its summed gradient")
 parser.add_argument("--casl_momentum", type=float, default=0.0, help="--casl_optimizer sgd: momentum (0 = plain SGD)")
+parser.add_argument("--casl_edit_steps", type=int, default=0,
+                    help="CASL training and CASL-Steer edit only the first K denoising steps (0 = every step). The paper "
+                         "edits t >= 500 of its trajectory, i.e. the first half (App. 7.4): with --num_inference_steps 10, "
+                         "K = 5")
 parser.add_argument("--casl_vae", type=str, default="sdxl", choices=["sdxl", "fp16fix"],
                     help="--rules casl: the VAE that decodes CASL's training images. 'sdxl' = the pipeline's own, upcast "
                          "to fp32 (it overflows in fp16) - its fp32 backward is most of the training memory; 'fp16fix' = "
@@ -1030,6 +1034,7 @@ def casl_key(args) -> str:
                     # only for a non-default optimizer, so the Adam maps trained before the option keep their key
                     + ([f"opt:{args.casl_optimizer}:m{args.casl_momentum:g}"] if args.casl_optimizer != "adam" else [])
                     + ([f"vae:{args.casl_vae}"] if getattr(args, "casl_vae", "sdxl") != "sdxl" else [])
+                    + ([f"edit:{args.casl_edit_steps}"] if getattr(args, "casl_edit_steps", 0) > 0 else [])
                     # the earlier reversed-pair maps ('remove') keep their key
                     + ([f"dir:paper:pool{','.join(map(str, args.casl_pool_seeds))}"]
                        if getattr(args, "casl_direction", "remove") == "paper" else []))
@@ -1131,8 +1136,9 @@ def run_steer_generate(args, models: UCModels, jobs: list):
             key = (p["steer"], tuple(p["latents"]))
             if key not in columns:
                 columns[key] = torch.from_numpy(load_casl_columns(args, p["steer"], p["latents"])).to(models.device)
+            end = min(args.end_step, args.casl_edit_steps - 1) if args.casl_edit_steps > 0 else args.end_step
             hooks[f"unet.{block}"] = make_steer_hook(models.get_sae(block), columns[key], p["latents"], p["alpha"],
-                                                     args.mode, args.start_step, args.end_step)
+                                                     args.mode, args.start_step, end)
             stats.setdefault((block, tuple(p["latents"]), p["alpha"]), []).append(hooks[f"unet.{block}"].stats)
         os.makedirs(os.path.dirname(job["image"]), exist_ok=True)
         save_image(generate(pipe, job["prompt"], job["seed"], args, hooks), job["image"])
@@ -1237,6 +1243,7 @@ class CaslTrainer:
     def generate(self, embeds: dict, seed: int):
         '''(1, 3, H, W) image in [0, 1], differentiable when called with grad enabled.'''
         args = self.args
+        self.calls = 0  # denoising steps the attach() hook has seen in this image (--casl_edit_steps)
         lat = self.call(self.sd, **{k: v.to(self.device) for k, v in embeds.items()},
                         num_inference_steps=args.num_inference_steps, guidance_scale=args.guidance_scale,
                         height=args.size, width=args.size, generator=torch.Generator().manual_seed(seed),
@@ -1265,9 +1272,13 @@ class CaslTrainer:
 
     def attach(self, block: str, sae, W, b):
         '''Adds dh = W z + b (Eq. 6, per patch, frozen SAE encoder) to the block's output; returns the handle.'''
-        mode = self.args.mode
+        mode, edit_steps = self.args.mode, self.args.casl_edit_steps
 
         def hook(module, inp, out):
+            step = self.calls
+            self.calls += 1
+            if edit_steps > 0 and step >= edit_steps:  # past the edited part of the trajectory: unchanged
+                return out
             o = out[0] if isinstance(out, tuple) else out
             x = o - inp[0] if mode == "diff" else o
             with torch.no_grad():
@@ -1302,6 +1313,11 @@ class CaslTrainer:
             loss_recon = (img.float() * 2 - orig_img.to(self.device).float() * 2).abs().mean()  # [-1, 1]
             loss = args.casl_lambda_clip * loss_clip.to(self.device) + args.casl_lambda_recon * loss_recon
             loss.backward()
+        if args.casl_edit_steps > 0 and self.calls != args.num_inference_steps:
+            # the hook counts denoising steps; if gradient checkpointing re-runs the hooked block in the backward
+            # pass, the count (and so which steps are edited) is wrong
+            raise RuntimeError(f"--casl_edit_steps: the hooked block ran {self.calls} times for "
+                               f"{args.num_inference_steps} denoising steps (re-run by gradient checkpointing?)")
         return loss_clip.item(), loss_recon.item(), d_img.detach().norm().item()
 
 
