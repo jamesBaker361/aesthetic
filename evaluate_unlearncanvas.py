@@ -1025,7 +1025,9 @@ def casl_path(args, concept: str) -> str:
 
 def casl_key(args) -> str:
     '''CASL rankings are cached per these settings.'''
-    return "|".join([args.mode, str(args.num_inference_steps), f"{args.guidance_scale:g}", str(args.size),
+    # "orig:clean": originals made without the edit (CaslTrainer.original) - maps trained before that fix compared each
+    # edit with itself, so they get a new key and are retrained rather than reused
+    return "|".join(["orig:clean", args.mode, str(args.num_inference_steps), f"{args.guidance_scale:g}", str(args.size),
                      str(args.casl_images), ",".join(map(str, args.discover_seeds)),
                      str(args.object_discover_prompt_file), str(args.casl_steps), f"{args.casl_lr:g}",
                      f"{args.casl_lambda_clip:g}", f"{args.casl_lambda_recon:g}",
@@ -1266,8 +1268,16 @@ class CaslTrainer:
 
     @torch.no_grad()
     def original(self, embeds: dict, seed: int):
-        '''The unedited image (CPU, fp16) and its CLIP embedding - generate before attach().'''
-        img = self.generate(embeds, seed)
+        '''
+        The unedited image (CPU, fp16) and its CLIP embedding. run_casl makes these on first use, while attach()'s hook
+        is on, so the hook is bypassed here: otherwise the "unedited" image carries the current edit, equals the
+        edited one, and the loss sees no change (clip 1, |dI| 0 on every step).
+        '''
+        self.bypass = True
+        try:
+            img = self.generate(embeds, seed)
+        finally:
+            self.bypass = False
         return img.half().cpu(), self.embed_image(img)
 
     def attach(self, block: str, sae, W, b):
@@ -1275,6 +1285,8 @@ class CaslTrainer:
         mode, edit_steps = self.args.mode, self.args.casl_edit_steps
 
         def hook(module, inp, out):
+            if getattr(self, "bypass", False):  # original(): the unedited image
+                return out
             step = self.calls
             self.calls += 1
             if edit_steps > 0 and step >= edit_steps:  # past the edited part of the trajectory: unchanged
