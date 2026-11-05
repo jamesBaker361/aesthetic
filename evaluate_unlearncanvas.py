@@ -308,7 +308,7 @@ from evaluate_sae_features import (
     Models, safe, load_json, save_json, generate, ensure_sam_masks, load_sam, sam_cache_path,
     ensure_text_scores, score_cache_path, load_text_score, run_dream_sparsify, load_block_codes,
     make_zero_hook, run_remove_generate, psnr, write_outputs_results,
-    run_base, run_ablate_generate, save_image, save_npz, fill_prompt, read_lines, is_cuda,
+    run_base, run_ablate_generate, save_image, save_npz, npz_keys, npz_arrays, fill_prompt, read_lines, is_cuda,
 )
 from generate_clean_swap import load_feature_mean
 from evaluate_nsfw import fid_features, fid_cache_path, frechet_distance  # pytorch-fid, features cached per image
@@ -785,7 +785,9 @@ def concept_entries(args, entries: list, ctype: str, concept: str) -> list:
 
 @torch.no_grad()
 def run_discover_generate(args, models: UCModels, entries: list, block_list: list):
-    todo = [e for e in entries if not all(os.path.exists(e[k]) for k in ["image", "embedding", "attn"])]
+    # also redone if the embedding lacks any of these blocks (a run on other blocks made it), merged into it
+    todo = [e for e in entries if not all(os.path.exists(e[k]) for k in ["image", "embedding", "attn"])
+            or not {f"saved_output.{b}" for b in block_list} <= npz_keys(e["embedding"])]
     print(f"discover: {len(todo)} of {len(entries)} images to generate + cache")
     if not todo:
         return
@@ -807,7 +809,7 @@ def run_discover_generate(args, models: UCModels, entries: list, block_list: lis
                 output_type="pil",
             )
             save_image(output.images[0], e["image"])
-            result = {}
+            result = npz_arrays(e["embedding"])  # other blocks' activations already there are kept
             for block in block_list:
                 pos = f"unet.{block}"
                 result[f"saved_input.{block}"] = cache["input"][pos][:, -1].cpu().float().numpy()

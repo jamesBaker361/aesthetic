@@ -190,6 +190,24 @@ def save_image(image: Image.Image, path: str):
     os.replace(tmp, path)
 
 
+def npz_keys(path: str) -> set:
+    '''The array names in an .npz, or an empty set if it doesn't exist or can't be read.'''
+    try:
+        with np.load(path) as d:
+            return set(d.files)
+    except Exception:
+        return set()
+
+
+def npz_arrays(path: str) -> dict:
+    '''Every array in an .npz, or {} if it doesn't exist or can't be read.'''
+    try:
+        with np.load(path) as d:
+            return {k: d[k] for k in d.files}
+    except Exception:
+        return {}
+
+
 def save_npz(path: str, compressed: bool = False, **arrays):
     tmp = f"{path[:-len('.npz')]}.tmp{os.getpid()}.npz"
     (np.savez_compressed if compressed else np.savez)(tmp, **arrays)
@@ -511,14 +529,15 @@ def run_dream_sparsify(args, models: Models, entries: list, block_list: list):
     patch's top-k latent indices/values ({block}__idx, {block}__val, both
     (h, w, k)) instead of the dense (h, w, n_dirs) code.
     '''
-    todo = [e for e in entries if not os.path.exists(e["sparse"])]
+    # an entry is redone if its file lacks any of these blocks (a run on other blocks made it), merged into it
+    todo = [e for e in entries if not {f"{b}__idx" for b in block_list} <= npz_keys(e["sparse"])]
     print(f"sparsify: {len(todo)} of {len(entries)} to encode")
     if not todo:
         return
     models.free(keep="sae")
     device = models.device
     for e in todo:
-        result = {}
+        result = npz_arrays(e["sparse"])  # other blocks' codes already there are kept
         with np.load(e["embedding"]) as data:
             for block in block_list:
                 sae = models.get_sae(block)
