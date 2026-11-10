@@ -14,6 +14,10 @@
 #   auto-k   the per-latent 1-D probes (sparse_probe.select_bce_and_f1, counted analytically) and every
 #            LogisticRegression the search fits/predicts with (re-run here on the cached codes, iterations
 #            read from n_iter_), for the run's --rules
+#            --rules osp / adaptive (Gurnee et al.'s sparse probes): their selection - mean-difference filter,
+#            elastic-net refits / SVM cuts - as counted by the run itself (sparse_probe, its features json's
+#            "selection_flops"; OSP's solves stop at a timeout, so a re-run wouldn't reproduce them), plus the
+#            auto-k refits re-run on the sets it stored. OSP's MILP master problems (HiGHS) are not counted
 #   auto-γ   StandardScaler + dense probe (re-fit here for n_iter_), one SAE encode of the held-out
 #            patches, and per γ tried (the curve length cached in {out_dir}/auto_gamma/) a dense SAE decode
 #            + probe predict
@@ -65,7 +69,7 @@ from evaluate_sae_features import (
 )
 from evaluate_unlearncanvas import (
     parser, CLASSES, STYLES, UCModels, discover_entries, concept_entries, concept_methods,
-    answer_entries, load_features, variants, auto_gamma_path, auto_gamma_key, auto_rules,
+    answer_entries, load_features, variants, auto_gamma_path, auto_gamma_key, auto_rules, auto_key, sparse_settings,
     saeuron_scores, masked_image_means, image_mean_codes, top_n, patch_labels, sam_query, load_attribution, load_casl, k_metric,
     CaslTrainer, casl_entries, make_steer_hook,
 )
@@ -283,6 +287,8 @@ def casl_flops(args, casl_gpu, gpu, entries, targets, keys, n_answer) -> dict:
 def auto_k_flops(args, entries, targets, block_list) -> dict:
     '''{(concept, method, block): FLOPs of the probe stage incl. the auto-k search} for the run's rules.'''
     out = {}
+    sparse = sparse_settings(args)
+    features = load_features(args, targets) if sparse else {}
     for block in block_list:
         idx_all, val_all, owner, (gh, gw), n_dirs = load_block_codes(entries, block)
         means = image_mean_codes(idx_all, val_all, owner, len(entries), n_dirs) if "saeuron" in args.rules else None
@@ -299,7 +305,8 @@ def auto_k_flops(args, entries, targets, block_list) -> dict:
                     continue
                 COUNTER.flops = per_latent_probe_flops(val_all[rows], n_dirs, args.bce_newton_steps)
                 with count_sklearn(args):
-                    auto = {"rules": auto_rules(args), "groups": owner[rows], "frac": args.auto_k_frac,
+                    auto = {"rules": [r for r in auto_rules(args) if r not in sparse], "groups": owner[rows],
+                            "frac": args.auto_k_frac,
                             "metric": args.auto_k_metric, "max_k": args.auto_k_max, "seed": args.seed,
                             "top_n": top_n(args)}
                     select_bce_and_f1(idx_all[rows], val_all[rows], labels, n_dirs, args.bce_ridge,
@@ -319,6 +326,18 @@ def auto_k_flops(args, entries, targets, block_list) -> dict:
                     for order in orders:
                         smallest_k(idx_all[rows], val_all[rows], labels, owner[rows], n_dirs, order[:args.auto_k_max],
                                    frac=args.auto_k_frac, metric=args.auto_k_metric, seed=args.seed)
+                    for rule in sparse:  # osp / adaptive: the run's own count + its auto-k refits
+                        a = (features.get(concept, {}).get("methods", {}).get(method, {}).get(block, {})
+                             .get("auto_by_key", {}).get(auto_key(args), {}).get(rule))
+                        if a is None or "selection_flops" not in a:
+                            print(f"! no {rule} result for '{concept}' ({method}) @ {block} - run the run first")
+                            continue
+                        COUNTER.flops += a["selection_flops"]
+                        solved = {int(k): r["idx"] for k, r in a.get("osp_by_k", {}).items()}
+                        search = {"subsets": solved} if rule == "osp" else {}
+                        smallest_k(idx_all[rows], val_all[rows], labels, owner[rows], n_dirs,
+                                   [] if rule == "osp" else a["order"][:args.auto_k_max], frac=args.auto_k_frac,
+                                   metric=args.auto_k_metric, seed=args.seed, **search)
                 out[(concept, method, block)] = COUNTER.flops
         print(f"auto-k @ {block}: done")
     return out

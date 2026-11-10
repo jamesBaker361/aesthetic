@@ -104,6 +104,16 @@
 # largest weight at the strongest penalty that keeps one is used (kind
 # "lasso"). Per-run files get a _lasso tag.
 #
+# --rules osp / adaptive (needs --auto_k): the two k-sparse probes of Gurnee et al., "Finding Neurons in a
+# Haystack" (arXiv:2305.01610, Sec. 3.2 / App. B.3-B.4), as their official code (sparse-probing-paper/
+# experiments/inner_loops.py): codes normalized by 10 x each latent's std, latents ranked by |class mean
+# difference|. adaptive = adaptive thresholding (telescopic_sparsity_sweep): elastic-net logistic regressions
+# for k = --adaptive_k_max (64), then 32, 16, 12, 10, 8, ..., 1, each on the previous probe's k largest |coefficients|
+# (nested sets, so one ranking for the auto-k search). osp = optimal sparse probing: the k-sparse hinge-loss
+# SVM solved to provable optimality by Bertsimas et al.'s cutting planes (arXiv:1710.01352;
+# sparse_probe.OptimalSparseProbe) on the top --osp_filter latents, --osp_time_limit per solve, for every k
+# of the official schedule up to --osp_max_k (8, 7, ..., 1, largest first); auto-k picks among them. Per-run files get an _osp / _adapt tag.
+#
 # FID (stage 5, --disable_fid to skip): pytorch-fid features of every scored image are cached next to
 # it ({image}.fid.npy); per edit, fid / fid_target / fid_retain compare its images with the unedited
 # images of the same prompts (all / with the concept / other objects - the last needs --eval_scope all).
@@ -364,10 +374,11 @@ parser.add_argument("--style_mask_methods", nargs="*", default=["attention", "gr
 parser.add_argument("--frac", type=float, default=0.25,
                     help="top fraction of patches that count as positive for the attention / grad_eclip masks")
 parser.add_argument("--attn_map_size", type=int, default=64, help="grid every cross-attention map is resized to")
-parser.add_argument("--rules", nargs="*", default=["bce", "f1"], choices=["bce", "f1", "lasso", "attribution", "saeuron", "saeuron_masked", "casl", "casl_steer"],
+parser.add_argument("--rules", nargs="*", default=["bce", "f1"], choices=["bce", "f1", "lasso", "osp", "adaptive", "attribution", "saeuron", "saeuron_masked", "casl", "casl_steer"],
                     help="which probe rule(s) pick the latent(s) that get zeroed/injected: lowest per-latent "
                          "BCE, highest per-latent F1, or 'lasso' - the latents a joint L1 logistic "
-                         "regression over every latent keeps (sparse_probe.lasso_select); 'casl' - CASL's "
+                         "regression over every latent keeps (sparse_probe.lasso_select); 'osp' / 'adaptive' - "
+                         "Gurnee et al.'s optimal sparse probing / adaptive thresholding (--auto_k only); 'casl' - CASL's "
                          "learned code -> activation map (arXiv:2601.15441, run_casl); 'casl_steer' - CASL-Steer: "
                          "that map's top --casl_steer_k latents edited CASL's way (make_steer_hook), not removed; "
                          "'saeuron' - SAeUron's feature importance; 'saeuron_masked' - the same score with each "
@@ -475,6 +486,21 @@ parser.add_argument("--n_random_controls", type=int, default=1)
 parser.add_argument("--auto_k", action="store_true",
                     help="per concept x method x block x rule, the fewest most-important latents whose joint "
                          "classifier reaches --auto_k_frac of the all-latent one (binary search; default: 1 latent)")
+parser.add_argument("--osp_filter", type=int, default=50,
+                    help="--rules osp: latents (largest |class mean difference|) the SVM chooses from (official: 50)")
+parser.add_argument("--osp_max_k", type=int, default=8, help="--rules osp: every k of the official schedule up to this "
+                                                             "is solved (official --osp_upto_k: 8)")
+parser.add_argument("--osp_gamma", type=float, default=0.0,
+                    help="--rules osp: the SVM's ridge gamma (loss + ||w||^2 / (2 gamma)); 0 = the official 1 / sqrt(n)")
+parser.add_argument("--osp_time_limit", type=float, default=60.0,
+                    help="--rules osp: seconds per k-sparse solve; then the best support found is used (official: 60)")
+parser.add_argument("--adaptive_k_max", type=int, default=64,
+                    help="--rules adaptive: the largest k of the official schedule (64, 32, 16, 12, 10, 8, ..., 1); "
+                         "the paper's runs start at 256")
+parser.add_argument("--adaptive_C", type=float, default=-1.0,
+                    help="--rules adaptive: elastic-net probes' C; <= 0 = the official k / 20 per k")
+parser.add_argument("--adaptive_l1_ratio", type=float, default=-1.0,
+                    help="--rules adaptive: elastic-net mix; <= 0 = the official clip(e^(-k/20), 0.1, 0.9) per k")
 parser.add_argument("--auto_k_frac", type=float, default=0.95)
 parser.add_argument("--auto_k_max", type=int, default=64, help="most latents the search may keep")
 parser.add_argument("--auto_k_metric", type=str, default="accuracy",
@@ -1455,6 +1481,10 @@ def run_tag(args) -> str:
     tag = "_".join(sorted(set(args.object_mask_methods) | set(args.style_mask_methods)))
     if "lasso" in args.rules:
         tag += "_lasso"
+    if "osp" in args.rules:
+        tag += "_osp"
+    if "adaptive" in args.rules:
+        tag += "_adapt"
     if "attribution" in args.rules:
         tag += "_attr"
     if "casl" in args.rules:
@@ -1735,7 +1765,16 @@ def auto_key(args) -> str:
 
 
 def auto_rules(args) -> list:
-    return [r for r in ["bce", "f1", "lasso"] if r in args.rules]
+    return [r for r in ["bce", "f1", "lasso", "osp", "adaptive"] if r in args.rules]
+
+
+def sparse_settings(args) -> dict:
+    '''Gurnee et al.'s sparse probes' settings, {rule: settings} for this run's (kept with each auto-k result:
+    a result made with other settings is redone).'''
+    out = {"osp": {"n_filter": args.osp_filter, "gamma": args.osp_gamma, "time_limit": args.osp_time_limit,
+                   "max_k": args.osp_max_k},
+           "adaptive": {"k_max": args.adaptive_k_max, "C": args.adaptive_C, "l1_ratio": args.adaptive_l1_ratio}}
+    return {r: s for r, s in out.items() if r in args.rules}
 
 
 # rules whose latent ranking is computed before the probe stage: rule -> (load it, its cache key)
@@ -1799,6 +1838,9 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
                 or (args.auto_k and not all(
                     r in features[c]["methods"][m][block].get("auto_by_key", {}).get(auto_key(args), {})
                     for r in auto_rules(args) + ranked_rules(args)))
+                or (args.auto_k and any(
+                    features[c]["methods"][m][block].get("auto_by_key", {}).get(auto_key(args), {})
+                    .get(r, {}).get("settings") != s for r, s in sparse_settings(args).items()))
                 or (not args.auto_k and any(
                     features[c]["methods"][m][block].get(r, {}).get("key") != RANKED_RULES[r][1](args)
                     for r in ranked_rules(args)))
@@ -1834,7 +1876,7 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
             if args.auto_k:
                 auto = {"rules": auto_rules(args), "groups": owner[rows], "frac": args.auto_k_frac,
                         "metric": args.auto_k_metric, "max_k": args.auto_k_max, "seed": args.seed,
-                        "top_n": top_n(args)}
+                        "top_n": top_n(args), **sparse_settings(args)}
             result = select_bce_and_f1(idx_all[rows], val_all[rows], labels, n_dirs,
                                        args.bce_ridge, args.bce_newton_steps,
                                        lasso="lasso" in args.rules and not args.auto_k, auto=auto)
@@ -1910,6 +1952,9 @@ def run_probe(args, entries: list, targets: list, block_list: list) -> dict:
                 for rule, a in result["auto_by_key"][auto_key(args)].items():
                     print(f"    auto-k {rule}: k={a['k']} ({a['metric']} {a['score']:.3f} vs all latents "
                           f"{a['full']:.3f}, target {a['target']:.3f}) curve {a['curve']}")
+                    for k, r in a.get("osp_by_k", {}).items():
+                        print(f"      osp k={k}: {r['status']} (gap {r['gap']:.2g}, {r['n_cuts']} cuts, "
+                              f"{r['seconds']:.0f}s) latents {r['idx']}")
         for ctype, concept, method in todo:
             save_json(features_path(args, concept, method), features[concept]["methods"].get(method, {}))
     return features
@@ -3144,6 +3189,8 @@ def main(args):
         # checked here, not only in run_casl: --disable_casl or a cached map would skip that check, and
         # run_probe would merge the per-block CASL rankings, whose norms don't compare across blocks
         raise ValueError("--rules casl / casl_steer are per block: not available with --joint_blocks")
+    if sparse_settings(args) and not args.auto_k:
+        raise ValueError("--rules osp / adaptive pick k themselves through the auto-k search: add --auto_k")
     if args.prepare_only:
         # every mask method, so any later --*_mask_methods finds its masks cached
         args.object_mask_methods = ["attention", "sam", "grad_eclip"]
