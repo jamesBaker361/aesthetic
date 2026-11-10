@@ -28,3 +28,6 @@
 [submodule "UnlearnCanvas"]
 	path = UnlearnCanvas
 	url = https://github.com/OPTML-Group/UnlearnCanvas.git
+[submodule "sparse-probing-paper"]
+	path = sparse-probing-paper
+	url = https://github.com/wesg52/sparse-probing-paper.git
