@@ -26,7 +26,11 @@
 # --search_seed + prompt index (their sweep draws every prompt from one generator seeded 42). One block per
 # job (--block_list) so the blocks run in parallel; every image and score is cached, so a job can be rerun.
 # Needs the discovery codes in --cache_dir (run with the same discovery flags as the other runs).
+# --feature_rule essi: the same gamma grid / prompts / score for ESSI instead - its auto-k set at each block (read from
+# the ESSI run, --essi_dir) with its own edit (no mask); evaluate_unlearncanvas.py --gamma_search_dir then removes with
+# each object x block's best gamma.
 # Run: scripts/uc_saeuron_search.sh
+import argparse
 import os
 import time
 
@@ -36,7 +40,7 @@ from attribution import DEFAULT_BLOCK_LIST
 from evaluate_sae_features import load_block_codes, load_json, save_json, run_remove_generate, ensure_text_scores, safe
 from evaluate_unlearncanvas import (
     parser, CLASSES, THEMES, STYLES, UCModels, discover_entries, saeuron_scores, image_mean_codes,
-    attach_latent_means, edit_scale, uc_score_id, load_uc, uc_kind,
+    attach_latent_means, edit_scale, uc_score_id, load_uc, uc_kind, auto_key, features_path,
 )
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.init_helpers import repo_api_init
@@ -46,9 +50,14 @@ parser.add_argument("--sweep_gammas", nargs="*", type=float, default=[-1.0, -5.0
 parser.add_argument("--sweep_taus", nargs="*", type=int, default=[1, 2, 5, 10, 15, 20, 25, 30],
                     help="number of features tau: the top-tau latents by SAeUron score (the paper's Top-tau_c, Sec. 4 / "
                          "Alg. 1; grid of its App. Q, Fig. 31)")
-parser.add_argument("--feature_rule", type=str, default="top_tau", choices=["top_tau", "percentile"],
+parser.add_argument("--feature_rule", type=str, default="top_tau", choices=["top_tau", "percentile", "essi"],
                     help="'top_tau': search --sweep_taus (the paper); 'percentile': their released code's "
-                         "--sweep_percentiles thresholds (sweep_cls_distr.py) - top-1 only on our 5120-latent SAEs")
+                         "--sweep_percentiles thresholds (sweep_cls_distr.py) - top-1 only on our 5120-latent SAEs; "
+                         "'essi': ESSI's auto-k set at each block (read from --essi_dir), only gamma searched, with "
+                         "ESSI's edit (--remove_mode saeuron, no --saeuron_mask)")
+parser.add_argument("--essi_dir", type=str, default=None,
+                    help="--feature_rule essi: the ESSI run's out_dir (saeuron_masked, --auto_k with this run's "
+                         "--auto_k_metric / _frac / _max), whose features/ jsons hold the auto-k sets")
 parser.add_argument("--sweep_percentiles", nargs="*", type=float, default=[99.99, 99.995, 99.999],
                     help="--feature_rule percentile: SAeUron's feature-percentile grid (sweep_cls_distr.py)")
 parser.add_argument("--anchor_prompt_dir", type=str,
@@ -96,21 +105,36 @@ def ua_ira(paths: list, prompts: list, concept: str, args):
     return ua, ira
 
 
+def essi_latents(args, concept: str, block: str) -> list:
+    '''ESSI's auto-k set for concept at block, from the ESSI run's features json (None if it has none).'''
+    found = load_json(features_path(argparse.Namespace(out_dir=args.essi_dir), concept, "sam"), {})
+    auto = (found.get(block) or {}).get("auto_by_key", {}).get(auto_key(args), {}).get("saeuron_masked")
+    return None if auto is None else [int(j) for j in auto["latents"]]
+
+
 def search_block(args, models, entries, targets, block, prompts):
-    idx_all, val_all, owner, _, n_dirs = load_block_codes(entries, block)
-    means = image_mean_codes(idx_all, val_all, owner, len(entries), n_dirs)
-    del idx_all, val_all
+    if args.feature_rule != "essi":
+        idx_all, val_all, owner, _, n_dirs = load_block_codes(entries, block)
+        means = image_mean_codes(idx_all, val_all, owner, len(entries), n_dirs)
+        del idx_all, val_all
 
     edits = []  # one per object x distinct feature set x gamma
     for concept in targets:
-        order, scores = saeuron_scores(args, entries, means, "object", concept)  # positive scores, best first
         sets = {}  # latent set -> the settings that give it (generated once)
-        if args.feature_rule == "top_tau":
+        if args.feature_rule == "essi":
+            latents = essi_latents(args, concept, block)
+            if latents is None:
+                print(f"  ! {concept} @ {block}: no ESSI auto-k set in {args.essi_dir} - skipped")
+                continue
+            sets[tuple(latents)] = [len(latents)]
+        elif args.feature_rule == "top_tau":
+            order, scores = saeuron_scores(args, entries, means, "object", concept)  # positive scores, best first
             # the top tau of the positive-score latents, as evaluate_unlearncanvas.py's run_probe takes them for
             # --saeuron_search_dir; a tau above the number of positive latents gives all of them (merged)
             for tau in args.sweep_taus:
                 sets.setdefault(tuple(order[:tau]), []).append(tau)
         else:
+            order, scores = saeuron_scores(args, entries, means, "object", concept)
             for p in args.sweep_percentiles:
                 thr = np.quantile(scores, p / 100.0)  # torch.quantile's default (linear) interpolation
                 latents = tuple(int(j) for j in np.argsort(-scores) if scores[j] > thr)
@@ -120,7 +144,8 @@ def search_block(args, models, entries, targets, block, prompts):
                 continue
             for g in args.sweep_gammas:
                 edits.append({"subject": concept, "concept_type": "object", "method": "sam", "block": block,
-                              "kind": "saeuron", "latents": list(latents), "gamma": g,
+                              "kind": "saeuron_masked" if args.feature_rule == "essi" else "saeuron",
+                              "latents": list(latents), "gamma": g,
                               # tau = the smallest setting giving this set (what run_probe slices the order with)
                               "tau": min(settings) if args.feature_rule == "top_tau" else len(latents),
                               "percentiles": settings if args.feature_rule == "percentile" else []})
@@ -132,7 +157,7 @@ def search_block(args, models, entries, targets, block, prompts):
     for e in edits:
         folder = os.path.join(args.out_dir, "saeuron_search", safe(block), f"t{len(e['latents'])}_g{e['gamma']:g}",
                               safe(e["subject"]))
-        part = {"latents": e["latents"], "scale": edit_scale(args, e, e["gamma"]), "thresholds": e["thresholds"]}
+        part = {"latents": e["latents"], "scale": edit_scale(args, e, e["gamma"]), "thresholds": e.get("thresholds")}
         paths[id(e)] = []
         for a in prompts:
             image = os.path.join(folder, f"{a['object']}_{a['style']}.jpg")
@@ -165,7 +190,9 @@ def search_block(args, models, entries, targets, block, prompts):
 def main(args):
     api, accelerator, device = repo_api_init(args)
     args.cache_dir = args.cache_dir or args.out_dir
-    args.remove_mode, args.saeuron_mask = "saeuron", True  # SAeUron's edit (see the header)
+    # SAeUron's edit (see the header); ESSI's has no mask (gamma x the mean activation on the concept, every patch)
+    args.remove_mode, args.saeuron_mask = "saeuron", args.feature_rule != "essi"
+    assert args.feature_rule != "essi" or args.essi_dir, "--feature_rule essi needs --essi_dir"
     args.joint_offsets = None
     block_list = args.block_list or list(DEFAULT_BLOCK_LIST)
     objects = args.object_list or list(CLASSES)
