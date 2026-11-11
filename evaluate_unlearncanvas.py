@@ -463,8 +463,9 @@ parser.add_argument("--reuse_from", type=str, default=None,
                     help="another run's out_dir: an edit folder there made with exactly this edit (same block, latents, "
                          "scales, mask - its latents.json) is copied with its injections instead of regenerated")
 parser.add_argument("--gamma_search_dir", type=str, default=None,
-                    help="instead of --auto_gamma / --remove_scale: each saeuron_masked edit's gamma = the best "
-                         "(UA + IRA) / 2 over the fixed grid saeuron_search.py --feature_rule essi scored for it "
+                    help="instead of --auto_gamma / --remove_scale: each auto-k edit's gamma (--rules saeuron_masked, "
+                         "osp or adaptive) = the best (UA + IRA) / 2 over the fixed grid saeuron_search.py "
+                         "--feature_rule auto_k scored for it "
                          "({dir}/saeuron_search/{block}.json), per object x block")
 parser.add_argument("--saeuron_mask", action="store_true",
                     help="SAeUron's patch mask for removal: only edit a latent where it is above its mean activation "
@@ -1572,9 +1573,12 @@ SAEURON_TAU = {  # Table 5: number of selected features tau_c per object; styles
 }
 
 
+GAMMA_SEARCH_RULES = ("saeuron_masked", "osp", "adaptive")  # saeuron_search.py --auto_k_rule
+
+
 def load_gamma_search(args, block_list: list) -> dict:
     '''
-    {(object, block): best row} from saeuron_search.py --feature_rule essi: one latent set per object x block, so
+    {(object, block): best row} from saeuron_search.py --feature_rule auto_k: one latent set per object x block, so
     the best (UA + IRA) / 2 over its gamma grid (ties: the weaker gamma, as their loop order from -1).
     '''
     out = {}
@@ -1788,7 +1792,7 @@ def remove_scales(args, v: dict) -> list:
     if searched is not None and v["kind"] == "saeuron" and v["subject"] in searched:
         return [searched[v["subject"]]["gamma"]]
     grid = getattr(args, "gamma_params", None)
-    if grid is not None and v["kind"] == "saeuron_masked":
+    if grid is not None and v["kind"] == args.rules[0]:
         best = grid.get((v["subject"], v["block"]))
         assert best is not None, f"no --gamma_search_dir result for {v['subject']} @ {v['block']}"
         # the search scored this exact edit: other latents (a changed auto-k) would get another edit's gamma
@@ -3320,11 +3324,11 @@ def main(args):
         # loaded below, once the discovery codes exist (--saeuron_block top_feature scores them)
     args.gamma_params = None
     if args.gamma_search_dir:
-        # the edit saeuron_search.py --feature_rule essi scored
-        assert args.rules == ["saeuron_masked"] and args.auto_k and not args.auto_gamma and not args.joint_blocks \
-            and args.remove_mode == "saeuron" and not args.saeuron_mask, \
-            "--gamma_search_dir is ESSI's: --rules saeuron_masked --auto_k --remove_mode saeuron, no --auto_gamma / " \
-            "--saeuron_mask, per block"
+        # the edit saeuron_search.py --feature_rule auto_k scored
+        assert len(args.rules) == 1 and args.rules[0] in GAMMA_SEARCH_RULES and args.auto_k and not args.auto_gamma \
+            and not args.joint_blocks and args.remove_mode == "saeuron" and not args.saeuron_mask, \
+            f"--gamma_search_dir: one of --rules {GAMMA_SEARCH_RULES} --auto_k --remove_mode saeuron, no " \
+            "--auto_gamma / --saeuron_mask, per block"
         args.gamma_params = load_gamma_search(args, block_list)
 
     models = UCModels(args, device)
