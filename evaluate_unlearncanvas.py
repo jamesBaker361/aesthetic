@@ -547,6 +547,10 @@ parser.add_argument("--fid_batch_size", type=int, default=64)
 
 parser.add_argument("--base_prompt_file", type=str, default="prompt_dir/base_prompts.txt")
 parser.add_argument("--base_subject_file", type=str, default="prompt_dir/base_subjects.txt")
+parser.add_argument("--base_cache_dir", type=str, default=None,
+                    help="where the injection base images live ({base_cache_dir}/base: images, SAM masks, manifest, "
+                         "activations; default --cache_dir) - another --base_*_file set needs its own, since the "
+                         "manifest only holds the last set run")
 parser.add_argument("--placeholder", type=str, default="<sks>")
 parser.add_argument("--panel_rows", type=int, default=6, help="target prompts (rows) per concept panel")
 parser.add_argument("--panel_size", type=int, default=160, help="side of each panel cell in pixels")
@@ -2696,8 +2700,18 @@ def save_panels(args, answers: list, var_list: list):
 
 # ---------------------------------------------------------------- stage 6
 
+def base_cache_dir(args) -> str:
+    return args.base_cache_dir or args.cache_dir
+
+
 def base_embedding_path(args, e: dict) -> str:
-    return os.path.join(args.cache_dir, "base", "embeddings", f"{e['name']}.npz")
+    return os.path.join(base_cache_dir(args), "base", "embeddings", f"{e['name']}.npz")
+
+
+def own_subject(e: dict, concept: str) -> bool:
+    '''Whether base image e already shows the concept (its subject is the object itself, e.g. "bears" for Bears):
+    injecting a concept into an image of itself measures nothing, so those bases are skipped.'''
+    return e["subject"].strip().lower() == sam_query(concept)
 
 
 @torch.no_grad()
@@ -2810,7 +2824,7 @@ def run_inject_auto_strength(args, models: UCModels, entries: list, var_list: li
                         x = o - d[f"saved_input.{block}"][0] if args.mode == "diff" else o
                     x = x.transpose(1, 2, 0).astype(np.float32)
                     mask = resize_mask_to_grid(load_sam(e["image"], e["subject"])[0], x.shape[0], x.shape[1])
-                    rows.append((x.reshape(-1, x.shape[-1]), mask.reshape(-1)))
+                    rows.append((e, x.reshape(-1, x.shape[-1]), mask.reshape(-1)))
                 base_data[block] = rows
             return base_data[block]
 
@@ -2861,7 +2875,8 @@ def run_inject_auto_strength(args, models: UCModels, entries: list, var_list: li
                     pos = total = 0
                     for block, d in unit.items():
                         scaler, probe = probes[block]
-                        patches = [x[m] + strength * d for x, m in base_block(block) if m.any()]
+                        patches = [x[m] + strength * d for e, x, m in base_block(block)
+                                   if m.any() and not own_subject(e, concept)]
                         if not patches:  # no base subject covers a whole patch at this block's grid
                             continue
                         patches = np.concatenate(patches)
@@ -2894,7 +2909,8 @@ def run_inject_auto_strength(args, models: UCModels, entries: list, var_list: li
                             lo = s_
                     best, reached = hi, True
                 res = {"strength": best, "reached": reached, "frac_positive": curve[best],
-                       "frac_positive_before": f0, "n_bases": len(usable),
+                       "frac_positive_before": f0,
+                       "n_bases": sum(not own_subject(e, concept) for e in usable),
                        "curve": {f"{s_:g}": round(f, 4) for s_, f in sorted(curve.items())}}
                 caches[inject_strength_path(args, concept, method)][inject_strength_key(args, v)] = res
                 found.append((v, res))
@@ -2943,7 +2959,7 @@ def casl_steer_inject_jobs(args, usable: list, v: dict) -> list:
              "probe": v["probe"], "pos_mean": None, "strength": alpha, "base": e["name"],
              "prompt": e["prompt"], "seed": e["seed"],
              "image": os.path.join(folder, f"{e['name']}.jpg")}
-            for e in usable]
+            for e in usable if not own_subject(e, v["subject"])]
 
 
 def inject_jobs(args, base_entries: list, var_list: list) -> list:
@@ -2966,6 +2982,8 @@ def inject_jobs(args, base_entries: list, var_list: list) -> list:
         values = inject_values(args, v)
         for strength in v.get("inject_strengths", args.strength_list):  # --inject_auto_strength: the one found
             for e in usable:
+                if own_subject(e, v["subject"]):
+                    continue
                 jobs.append({
                     **{k: v[k] for k in ["subject", "concept_type", "method", "block", "kind", "feature_idx",
                                          "k_metric"]},
@@ -3156,7 +3174,9 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
     if df.empty:
         print("no injection rows yet")
         return df
-    df.to_csv(os.path.join(args.out_dir, f"inject_results_{run_tag(args)}.csv"), index=False)
+    # another --inject_root is another base set / protocol: its own per-run files
+    root_tag = "" if args.inject_root == "inject" else f"_{args.inject_root}"
+    df.to_csv(os.path.join(args.out_dir, f"inject_results_{run_tag(args)}{root_tag}.csv"), index=False)
 
     keys = ["subject", "concept_type", "method", "block", "kind", "k_metric", "inject_value", "strength"]
     metrics = [c for c in df.columns if c not in keys and c != "feature_idx"
@@ -3168,7 +3188,8 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
     summary = grouped[metrics].mean()
     summary.insert(0, "n_images", grouped.size())
     summary.insert(0, "feature_idx", grouped["feature_idx"].first())
-    add_epr(summary.reset_index()).to_csv(os.path.join(args.out_dir, f"inject_summary_{run_tag(args)}.csv"), index=False)
+    add_epr(summary.reset_index()).to_csv(os.path.join(args.out_dir, f"inject_summary_{run_tag(args)}{root_tag}.csv"),
+                                          index=False)
 
     shown = [m for m in ["mask_iou", "base_subject_remaining", "vqa_subject_gain", "uc_classified_as",
                          "uc_p_target_gain", "background_psnr"] if m in df]
@@ -3275,9 +3296,9 @@ def main(args):
     # stage 6
     if not args.disable_inject:
         # run_base writes {out_dir}/base - point it at the shared cache
-        cache_args = argparse.Namespace(**{**vars(args), "out_dir": args.cache_dir})
+        cache_args = argparse.Namespace(**{**vars(args), "out_dir": base_cache_dir(args)})
         if args.disable_base:
-            base_entries = load_json(os.path.join(args.cache_dir, "base", "manifest.json"), [])
+            base_entries = load_json(os.path.join(base_cache_dir(args), "base", "manifest.json"), [])
         else:
             base_entries = run_base(cache_args, models, device)
         base_by_name = {e["name"]: e for e in base_entries}
