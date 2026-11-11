@@ -577,6 +577,10 @@ parser.add_argument("--inject_auto_strength", action="store_true",
                          "at least --inject_strength_target of the injected patches (base subject's SAM mask) are "
                          "classified as the concept by a dense probe on the block's activations - bisection, offline "
                          "(run_inject_auto_strength); k_metric '{metric}_sauto{target}'")
+parser.add_argument("--inject_strength_grid_root", type=str, default=None,
+                    help="also inject every learned edit at the strength with the best injection EPR over the grid a "
+                         "validation run of this out_dir injected into this --inject_root (its --strength_list, on "
+                         "its own base images); k_metric '{metric}_sgrid' (inject_grid_strength)")
 parser.add_argument("--inject_strength_target", type=float, default=0.5,
                     help="--inject_auto_strength: fraction of the injected patches the dense probe must call positive")
 parser.add_argument("--inject_strength_max", type=float, default=50.0, help="--inject_auto_strength: strongest strength")
@@ -2784,6 +2788,46 @@ def ensure_base_activations(args, models: UCModels, base_entries: list, block_li
         save_npz(base_embedding_path(args, e), **result)
 
 
+def learned_edits(args, var_list: list) -> list:
+    '''The edits an injection strength is chosen for, once each: var_list has a copy per removal scale, inject_jobs
+    keeps the first.'''
+    return [v for v in var_list if v["kind"] not in ("base", "casl_steer") and v["method"] != "random"
+            and (args.auto_gamma or v.get("k_metric", "").startswith("top") or
+                 v["remove_scale"] == remove_scales(args, v)[0])]
+
+
+def inject_grid_strength(args, var_list: list) -> list:
+    '''
+    --inject_strength_grid_root: per learned edit, the strength with the best injection EPR (CASL Eq. 14, as
+    add_epr) over the --strength_list grid an earlier run of this out_dir injected on the validation base images
+    into {out_dir}/{root} - its inject_results_{tag}_{root}.csv. Ties: the weaker strength. Returns injection-only
+    copies of the edits, k_metric "{metric}_sgrid", one strength each (as run_inject_auto_strength).
+    '''
+    path = os.path.join(args.out_dir, f"inject_results_{run_tag(args)}_{args.inject_strength_grid_root}.csv")
+    assert os.path.exists(path), f"--inject_strength_grid_root: no validation injection results {path}"
+    val = pd.read_csv(path)
+    val = val[(val["inject_value"] == args.inject_value) & val["epr_target_change"].notna()
+              & val["epr_nontarget_change"].notna()]
+    out = []
+    for v in learned_edits(args, var_list):
+        t = val[(val["subject"] == v["subject"]) & (val["method"] == v["method"]) & (val["block"] == v["block"])
+                & (val["kind"] == v["kind"]) & (val["k_metric"] == v["k_metric"])]
+        if t.empty:
+            print(f"  ! inject grid strength: no validation rows for '{v['subject']}' ({v['method']}) {v['kind']} "
+                  f"{v['k_metric']} @ {v['block']} - skipped")
+            continue
+        g = t.groupby("strength")[["epr_target_change", "epr_nontarget_change"]].mean()
+        epr = (g["epr_target_change"] / (g["epr_nontarget_change"] + 1e-8)).sort_index()
+        best = float(epr.idxmax())  # idxmax on the sorted index: the first (weakest) of tied strengths
+        out.append({**v, "k_metric": f"{v['k_metric']}_sgrid", "inject_strengths": [best],
+                    "inject_strength_search": {"strength": best, "grid": {f"{s:g}": round(float(e), 4)
+                                                                          for s, e in epr.items()}}})
+        print(f"  inject grid strength '{v['subject']}' ({v['method']}) {v['kind']} @ {v['block']}: {best:g} | EPR "
+              + " ".join(f"{s:g}:{e:.3f}" for s, e in epr.items()))
+    print(f"--inject_strength_grid_root: {len(out)} injection variants")
+    return out
+
+
 def inject_values(args, v: dict):
     """Each injected latent's value (x strength) per --inject_value; None = the SAE checkpoint's mean.pt."""
     if args.inject_value == "pos_mean":
@@ -2832,10 +2876,7 @@ def run_inject_auto_strength(args, models: UCModels, entries: list, var_list: li
     from sklearn.preprocessing import StandardScaler
 
     usable = [e for e in base_entries if e.get("mask_area", 0) > 0]
-    # one search per learned edit: var_list has a copy per removal scale, inject_jobs keeps the first
-    edits = [v for v in var_list if v["kind"] not in ("base", "casl_steer") and v["method"] != "random"
-             and (args.auto_gamma or v.get("k_metric", "").startswith("top") or
-                  v["remove_scale"] == remove_scales(args, v)[0])]
+    edits = learned_edits(args, var_list)
     caches, found, todo = {}, [], []
     for v in edits:
         path = inject_strength_path(args, v["subject"], v["method"])
@@ -3348,8 +3389,11 @@ def main(args):
         top_k = top_k_variants(args, features, targets, block_list)
         if args.inject_value == "concept_mean":
             attach_latent_means(args, entries, top_k, block_list)
+        learned = var_list + top_k
         if args.inject_auto_strength and not args.prepare_only:
-            top_k += run_inject_auto_strength(args, models, entries, var_list + top_k, base_entries, block_list)
+            top_k += run_inject_auto_strength(args, models, entries, learned, base_entries, block_list)
+        if args.inject_strength_grid_root and not args.prepare_only:
+            top_k += inject_grid_strength(args, learned)
         i_jobs = inject_jobs(args, base_entries, var_list + top_k)
         if not args.disable_inject_generate:
             unique = list({j["image"]: j for j in i_jobs}.values())
