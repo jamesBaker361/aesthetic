@@ -161,8 +161,8 @@
 # was trained to take the concept away (casl_texts), so alpha > 0 removes it. One answer set per
 # --casl_alpha value (remove_scale / gamma columns hold alpha, remove_mode "casl_steer", k_metric
 # "top{k}", images in .../casl_steer_top{k}/{concept}/{block}/a{alpha}/). With --auto_gamma, alpha is
-# searched instead (run_auto_gamma, up to --casl_alpha_max); injection steers with minus the removal gamma
-# (casl_steer_inject_jobs). No auto-k; per-run files get a _steer tag.
+# searched instead (run_auto_gamma, up to --casl_alpha_max) for removal only; injection still sweeps every
+# --casl_alpha (casl_steer_inject_jobs). No auto-k; per-run files get a _steer tag.
 #
 # --auto_k: instead of a fixed k, per concept x method x block x rule the
 # latents are ordered by importance (the rule: per-latent BCE, per-latent F1,
@@ -3073,33 +3073,37 @@ def casl_steer_inject_jobs(args, usable: list, v: dict) -> list:
     '''
     CASL-Steer injection (--casl_direction paper), as the paper edits: each base image regenerated with
     h + W_delta (alpha * z) on the top --casl_steer_k latents of the concept's map at every patch (Eq. 11; no mask -
-    the paper's edit has none), alpha = minus the variant's removal gamma (the alpha setting, or the one --auto_gamma
-    found: +, the map's own direction). strength = alpha.
+    the paper's edit has none), alpha = minus the variant's removal gamma (the alpha setting: +, the map's own
+    direction). With --auto_gamma only the removal alpha is searched: injection sweeps every --casl_alpha (as the
+    sweep run's). strength = alpha.
     '''
-    alpha = -float(v["gamma"])
-    if alpha <= 0:
-        return []  # --auto_gamma found 0: nothing to inject
-    parts = {v["block"]: {"steer": casl_npz_path(args, v["subject"], v["block"]), "latents": list(v["latents"]),
-                          "alpha": alpha}}
-    folder = os.path.join(args.out_dir, args.inject_root, v["method"], f"{v['kind']}_{v['k_metric']}",
-                          safe(v["subject"]), safe(v["block"].replace(".", "_")), f"s{alpha:g}")
-    # the folder records the map (its npz is keyed by every CASL setting) + latents + alpha; images made with another
-    # one are deleted, so they're regenerated (as run_answers_generate's latents.json)
-    manifest = os.path.join(folder, "latents.json")
-    spec = json.loads(json.dumps({"block": v["block"], "parts": parts}))
-    if os.path.exists(manifest) and load_json(manifest, None) != spec:
-        print(f"  {folder}: CASL map / latents changed - regenerating its images")
-        for f in os.listdir(folder):
-            os.remove(os.path.join(folder, f))
-    if not os.path.exists(manifest):
-        os.makedirs(folder, exist_ok=True)
-        save_json(manifest, spec)
-    return [{**{k: v[k] for k in ["subject", "concept_type", "method", "block", "kind", "feature_idx", "k_metric"]},
-             "latents": list(v["latents"]), "values": None, "n_latents": len(v["latents"]), "parts": parts,
-             "probe": v["probe"], "pos_mean": None, "strength": alpha, "base": e["name"],
-             "prompt": e["prompt"], "seed": e["seed"],
-             "image": os.path.join(folder, f"{e['name']}.jpg")}
-            for e in usable if not own_subject(e, v["subject"])]
+    alphas = casl_alphas(args, v) if args.auto_gamma else [-float(v["gamma"])]
+    jobs = []
+    for alpha in alphas:
+        if alpha <= 0:
+            continue  # nothing to inject
+        parts = {v["block"]: {"steer": casl_npz_path(args, v["subject"], v["block"]), "latents": list(v["latents"]),
+                              "alpha": alpha}}
+        folder = os.path.join(args.out_dir, args.inject_root, v["method"], f"{v['kind']}_{v['k_metric']}",
+                              safe(v["subject"]), safe(v["block"].replace(".", "_")), f"s{alpha:g}")
+        # the folder records the map (its npz is keyed by every CASL setting) + latents + alpha; images made with
+        # another one are deleted, so they're regenerated (as run_answers_generate's latents.json)
+        manifest = os.path.join(folder, "latents.json")
+        spec = json.loads(json.dumps({"block": v["block"], "parts": parts}))
+        if os.path.exists(manifest) and load_json(manifest, None) != spec:
+            print(f"  {folder}: CASL map / latents changed - regenerating its images")
+            for f in os.listdir(folder):
+                os.remove(os.path.join(folder, f))
+        if not os.path.exists(manifest):
+            os.makedirs(folder, exist_ok=True)
+            save_json(manifest, spec)
+        jobs += [{**{k: v[k] for k in ["subject", "concept_type", "method", "block", "kind", "feature_idx", "k_metric"]},
+                  "latents": list(v["latents"]), "values": None, "n_latents": len(v["latents"]), "parts": parts,
+                  "probe": v["probe"], "pos_mean": None, "strength": alpha, "base": e["name"],
+                  "prompt": e["prompt"], "seed": e["seed"],
+                  "image": os.path.join(folder, f"{e['name']}.jpg")}
+                 for e in usable if not own_subject(e, v["subject"])]
+    return jobs
 
 
 def inject_jobs(args, base_entries: list, var_list: list) -> list:
