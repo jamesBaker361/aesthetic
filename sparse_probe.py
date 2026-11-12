@@ -497,7 +497,8 @@ def select_bce_and_f1(idx: np.ndarray, val: np.ndarray, labels: np.ndarray, n_di
     classifier is kept. "osp" (settings in auto["osp"]: n_filter, gamma,
     time_limit, max_k) solves OptimalSparseProbe for every k of k_schedule(max_k),
     largest first (the official telescoping), and the search picks among those k. Both keep their settings,
-    "selection_flops" and per-k sets ("coef_by_k" / "osp_by_k") in the result.
+    "selection_flops" and per-k sets ("coef_by_k" / "osp_by_k") in the result. A "fixed_k" in either's
+    settings replaces the search with that k (OSP then solves only it).
     auto["top_n"] (optional) also describes the first top_n latents of each
     ranking as "order_top", for fixed top-k sets of the same ranking.
     '''
@@ -549,8 +550,12 @@ def select_bce_and_f1(idx: np.ndarray, val: np.ndarray, labels: np.ndarray, n_di
             elif rule == "f1":
                 order = [int(j) for j in np.argsort(-f1) if w[j] > 0 and f1[j] > 0]
             elif rule == "adaptive":
-                sel = adaptive_threshold_select(idx, val, labels, n_dirs, **auto["adaptive"])
+                fixed = auto["adaptive"].get("fixed_k")
+                sel = adaptive_threshold_select(idx, val, labels, n_dirs,
+                                                **{a: v for a, v in auto["adaptive"].items() if a != "fixed_k"})
                 order = sel["order"]
+                if fixed:  # no search: the schedule's set at that k
+                    search = {"subsets": {fixed: order[:fixed]}}
                 extra = {"settings": auto["adaptive"], "selection_flops": sel["flops"], "coef_by_k": sel["coef"]}
             elif rule == "osp":
                 s = auto["osp"]
@@ -558,6 +563,8 @@ def select_bce_and_f1(idx: np.ndarray, val: np.ndarray, labels: np.ndarray, n_di
                 # as the official optimal_sparse_probing: every k of the schedule up to max_k, largest first
                 # (each warm-starts the next), then the auto-k search picks among them
                 ks = [k for k in k_schedule(min(s["max_k"], auto["max_k"]), n_dirs) if k <= len(probe.filtered)]
+                if s.get("fixed_k"):  # no search: only that k, from the mean-difference warm start
+                    ks = [min(s["fixed_k"], len(probe.filtered))]
                 solved = {k: probe.solve(k) for k in ks[::-1]}
                 order = []
                 search = {"subsets": {k: r["idx"] for k, r in solved.items()}}

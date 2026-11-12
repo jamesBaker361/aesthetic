@@ -113,6 +113,7 @@
 # SVM solved to provable optimality by Bertsimas et al.'s cutting planes (arXiv:1710.01352;
 # sparse_probe.OptimalSparseProbe) on the top --osp_filter latents, --osp_time_limit per solve, for every k
 # of the official schedule up to --osp_max_k (8, 7, ..., 1, largest first); auto-k picks among them. Per-run files get an _osp / _adapt tag.
+# --sparse_k K fixes k instead (OSP solves only K; adaptive keeps its first K) - the paper sweeps k and never picks one.
 #
 # FID (stage 5, --disable_fid to skip): pytorch-fid features of every scored image are cached next to
 # it ({image}.fid.npy); per edit, fid / fid_target / fid_retain compare its images with the unedited
@@ -159,8 +160,9 @@
 # --casl_steer_k latents of the CASL ranking, z the block's current SAE code, no bias (Eq. 11). W_delta
 # was trained to take the concept away (casl_texts), so alpha > 0 removes it. One answer set per
 # --casl_alpha value (remove_scale / gamma columns hold alpha, remove_mode "casl_steer", k_metric
-# "top{k}", images in .../casl_steer_top{k}/{concept}/{block}/a{alpha}/). No auto-k, auto-gamma or
-# injection for these edits; per-run files get a _steer tag.
+# "top{k}", images in .../casl_steer_top{k}/{concept}/{block}/a{alpha}/). With --auto_gamma, alpha is
+# searched instead (run_auto_gamma, up to --casl_alpha_max); injection steers with minus the removal gamma
+# (casl_steer_inject_jobs). No auto-k; per-run files get a _steer tag.
 #
 # --auto_k: instead of a fixed k, per concept x method x block x rule the
 # latents are ordered by importance (the rule: per-latent BCE, per-latent F1,
@@ -506,6 +508,9 @@ parser.add_argument("--adaptive_C", type=float, default=-1.0,
                     help="--rules adaptive: elastic-net probes' C; <= 0 = the official k / 20 per k")
 parser.add_argument("--adaptive_l1_ratio", type=float, default=-1.0,
                     help="--rules adaptive: elastic-net mix; <= 0 = the official clip(e^(-k/20), 0.1, 0.9) per k")
+parser.add_argument("--sparse_k", type=int, default=0,
+                    help="--rules osp / adaptive: this fixed k instead of the auto-k search (OSP solves only this k, "
+                         "adaptive still runs its whole schedule); 0 = the search")
 parser.add_argument("--auto_k_frac", type=float, default=0.95)
 parser.add_argument("--auto_k_max", type=int, default=64, help="most latents the search may keep")
 parser.add_argument("--auto_k_metric", type=str, default="accuracy",
@@ -526,6 +531,8 @@ parser.add_argument("--auto_gamma", action="store_true",
 parser.add_argument("--auto_gamma_target", type=float, default=0.05)
 parser.add_argument("--auto_gamma_min", type=float, default=-50.0, help="strongest gamma the search may use")
 parser.add_argument("--auto_gamma_steps", type=int, default=12, help="bisection steps")
+parser.add_argument("--casl_alpha_max", type=float, default=192.0,
+                    help="--auto_gamma with --rules casl_steer: strongest alpha the search may use (CASL Fig. 4: 1-192)")
 parser.add_argument("--remove_scale_preset", type=str, default="none", choices=["none", "saeuron"],
                     help="saeuron: each concept's gamma is its multiplier from SAeUron's Table 5 "
                          "(arXiv:2501.18052, App. G, p.18; SAEURON_MULTIPLIERS) - objects -5 to -30, styles -1 - "
@@ -582,6 +589,10 @@ parser.add_argument("--inject_strength_grid_root", type=str, default=None,
                     help="also inject every learned edit at the strength with the best injection EPR over the grid a "
                          "validation run of this out_dir injected into this --inject_root (its --strength_list, on "
                          "its own base images); k_metric '{metric}_sgrid' (inject_grid_strength)")
+parser.add_argument("--inject_neg_gamma", action="store_true",
+                    help="also inject every learned edit at minus its removal gamma (the searched one with "
+                         "--saeuron_search_dir / --gamma_search_dir, the found one with --auto_gamma); k_metric "
+                         "'{metric}_snegg' (inject_neg_gamma)")
 parser.add_argument("--inject_strength_target", type=float, default=0.5,
                     help="--inject_auto_strength: fraction of the injected patches the dense probe must call positive")
 parser.add_argument("--inject_strength_max", type=float, default=50.0, help="--inject_auto_strength: strongest strength")
@@ -1821,6 +1832,9 @@ def sparse_settings(args) -> dict:
     out = {"osp": {"n_filter": args.osp_filter, "gamma": args.osp_gamma, "time_limit": args.osp_time_limit,
                    "max_k": args.osp_max_k},
            "adaptive": {"k_max": args.adaptive_k_max, "C": args.adaptive_C, "l1_ratio": args.adaptive_l1_ratio}}
+    if args.sparse_k:  # only when set, so the searched runs' stored settings still match
+        for s in out.values():
+            s["fixed_k"] = args.sparse_k
     return {r: s for r, s in out.items() if r in args.rules}
 
 
@@ -2080,10 +2094,17 @@ def auto_gamma_path(args, concept: str, method: str) -> str:
     return os.path.join(args.out_dir, "auto_gamma", f"{safe(concept)}__{method}.json")
 
 
+def auto_gamma_min(args, v: dict) -> float:
+    '''The strongest gamma run_auto_gamma may use: CASL-Steer's is -alpha, on its own scale.'''
+    return -args.casl_alpha_max if v["kind"] == "casl_steer" else args.auto_gamma_min
+
+
 def auto_gamma_key(args, v: dict) -> str:
-    return "|".join([v["block"], v["kind"], ",".join(str(i) for i in v["latents"]), args.remove_mode,
-                     f"{args.auto_gamma_target:g}", f"{args.auto_gamma_min:g}", str(args.auto_gamma_steps),
-                     args.mode, str(args.seed)])
+    # CASL-Steer: its map's settings too (the npz is keyed by them)
+    steer = [casl_key(args)] if v["kind"] == "casl_steer" else []
+    return "|".join([v["block"], v["kind"], ",".join(str(i) for i in v["latents"]), v.get("remove_mode", args.remove_mode),
+                     f"{args.auto_gamma_target:g}", f"{auto_gamma_min(args, v):g}", str(args.auto_gamma_steps),
+                     args.mode, str(args.seed)] + steer)
 
 
 @torch.no_grad()
@@ -2101,11 +2122,15 @@ def run_auto_gamma(args, models: UCModels, entries: list, var_list: list, block_
     Sets v["gamma"] and v["gamma_search"]; cached in
     {out_dir}/auto_gamma/{concept}__{method}.json. Random controls get the mean
     gamma found for their concept at their block.
+    CASL-Steer edits (--casl_direction paper): the same search over gamma = -alpha in [-(--casl_alpha_max), 0],
+    the edit as make_steer_hook applies it (x + gamma * W_delta[:, I] z_I at every patch).
     '''
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
 
-    learned = [v for v in var_list if v["kind"] not in ("base", "casl_steer") and v["method"] != "random"]
+    if any(v["kind"] == "casl_steer" for v in var_list):
+        assert args.casl_direction == "paper", "--auto_gamma with casl_steer: --casl_direction paper (-alpha removes)"
+    learned = [v for v in var_list if v["kind"] != "base" and v["method"] != "random"]
     caches = {}
     for v in learned:
         path = auto_gamma_path(args, v["subject"], v["method"])
@@ -2165,18 +2190,29 @@ def run_auto_gamma(args, models: UCModels, entries: list, var_list: list, block_
                 v["gamma"], v["gamma_search"] = 0.0, {"gamma": 0.0, "reached": False}
                 continue
 
+            steer = None
+            if v["kind"] == "casl_steer":  # W_delta's columns for the steered latents (d_model, k)
+                steer = torch.from_numpy(load_casl_columns(args, casl_npz_path(args, concept, v["block"]),
+                                                           list(v["latents"]))).float().to(models.device)
+
             def measure(gamma):
-                scale = edit_scale(args, v, gamma)
+                scale = edit_scale(args, v, gamma) if steer is None else None
                 pooled = {"was_pos": 0, "still": 0, "pos": 0, "rec": 0, "neg": 0, "fp": 0}
                 ch_on, ch_off = [], []
                 for block, items in parts.items():
                     d = data[block]
                     pos_list = [pos for pos, _ in items]
                     latents = [j for _, j in items]
-                    sc = scale if not isinstance(scale, list) else [scale[p] for p in pos_list]
-                    keep = 1.0 - torch.as_tensor(sc, dtype=torch.float32, device=models.device)
+                    if steer is None:
+                        sc = scale if not isinstance(scale, list) else [scale[p] for p in pos_list]
+                        keep = 1.0 - torch.as_tensor(sc, dtype=torch.float32, device=models.device)
                     edited, change = [], []
                     for x, a in zip(d["xt"], d["codes"]):
+                        if steer is not None:  # make_steer_hook: x + gamma * W_delta[:, I] z_I, so delta = -that
+                            delta = -gamma * (a[..., latents].float() @ steer.T)
+                            edited.append((x - delta).reshape(-1, x.shape[-1]).cpu().numpy())
+                            change.append((delta.norm(dim=-1) / x.norm(dim=-1).clamp_min(1e-6)).reshape(-1).cpu().numpy())
+                            continue
                         onehot = torch.zeros_like(a)
                         sel = a[..., latents]
                         if v.get("thresholds") is not None:  # SAeUron's mask, as the hook applies it
@@ -2216,7 +2252,7 @@ def run_auto_gamma(args, models: UCModels, entries: list, var_list: list, block_
 
             target = args.auto_gamma_target
             g0, m0 = at(0.0)
-            gmin, mmin = at(args.auto_gamma_min)
+            gmin, mmin = at(auto_gamma_min(args, v))
             if m0["still_positive"] <= target:
                 best, reached = g0, True
             elif mmin["still_positive"] > target:
@@ -2359,7 +2395,9 @@ def variants(args, features: dict, random_latents: dict, targets: list, block_li
         v["auto_gamma_target"] = args.auto_gamma_target if args.auto_gamma else 0.0
         if v["kind"] == "base":
             scaled.append({**v, "remove_scale": 1.0, "gamma": None})
-        elif v["kind"] == "casl_steer":  # alpha, not a removal gamma: never searched
+        elif v["kind"] == "casl_steer" and args.auto_gamma:  # alpha found by run_auto_gamma (gamma = -alpha)
+            scaled.append({**v, "remove_scale": float("nan"), "gamma": None})
+        elif v["kind"] == "casl_steer":  # alpha, not a removal gamma
             # remove_scale = the alpha setting; gamma = the alpha applied for removal: --casl_direction paper's map adds
             # the concept, so removal steers with -alpha (injection with +alpha, inject_jobs)
             sign = -1.0 if args.casl_direction == "paper" else 1.0
@@ -2832,6 +2870,24 @@ def inject_grid_strength(args, var_list: list) -> list:
     return out
 
 
+def inject_neg_gamma(args, var_list: list) -> list:
+    '''
+    --inject_neg_gamma: per learned edit, injection at minus the gamma it was removed with (SAeUron's searched one,
+    --gamma_search_dir's, or --auto_gamma's). The strength multiplies W_dec z-bar (inject_values) while the removal
+    gamma multiplies the latent's mean concept activation, so this reuses the number, not the edit size. Returns
+    injection-only copies, k_metric "{metric}_snegg", one strength each (as run_inject_auto_strength).
+    '''
+    out = []
+    for v in learned_edits(args, var_list):
+        if v["gamma"] is None or v["gamma"] >= 0:
+            continue  # no removal gamma, or nothing to negate
+        strength = float(f"{-v['gamma']:.4g}")
+        out.append({**v, "k_metric": f"{v['k_metric']}_snegg", "inject_strengths": [strength],
+                    "inject_strength_search": {"strength": strength, "gamma": v["gamma"]}})
+    print(f"--inject_neg_gamma: {len(out)} injection variants")
+    return out
+
+
 def inject_values(args, v: dict):
     """Each injected latent's value (x strength) per --inject_value; None = the SAE checkpoint's mean.pt."""
     if args.inject_value == "pos_mean":
@@ -3016,9 +3072,12 @@ def casl_steer_inject_jobs(args, usable: list, v: dict) -> list:
     '''
     CASL-Steer injection (--casl_direction paper), as the paper edits: each base image regenerated with
     h + W_delta (alpha * z) on the top --casl_steer_k latents of the concept's map at every patch (Eq. 11; no mask -
-    the paper's edit has none), alpha = the variant's alpha setting (+, the map's own direction). strength = alpha.
+    the paper's edit has none), alpha = minus the variant's removal gamma (the alpha setting, or the one --auto_gamma
+    found: +, the map's own direction). strength = alpha.
     '''
-    alpha = float(v["remove_scale"])
+    alpha = -float(v["gamma"])
+    if alpha <= 0:
+        return []  # --auto_gamma found 0: nothing to inject
     parts = {v["block"]: {"steer": casl_npz_path(args, v["subject"], v["block"]), "latents": list(v["latents"]),
                           "alpha": alpha}}
     folder = os.path.join(args.out_dir, args.inject_root, v["method"], f"{v['kind']}_{v['k_metric']}",
@@ -3398,6 +3457,8 @@ def main(args):
             top_k += run_inject_auto_strength(args, models, entries, learned, base_entries, block_list)
         if args.inject_strength_grid_root and not args.prepare_only:
             top_k += inject_grid_strength(args, learned)
+        if args.inject_neg_gamma and not args.prepare_only:
+            top_k += inject_neg_gamma(args, learned)
         i_jobs = inject_jobs(args, base_entries, var_list + top_k)
         if not args.disable_inject_generate:
             unique = list({j["image"]: j for j in i_jobs}.values())

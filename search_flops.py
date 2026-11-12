@@ -335,6 +335,9 @@ def auto_k_flops(args, entries, targets, block_list) -> dict:
                         COUNTER.flops += a["selection_flops"]
                         solved = {int(k): r["idx"] for k, r in a.get("osp_by_k", {}).items()}
                         search = {"subsets": solved} if rule == "osp" else {}
+                        fixed = a["settings"].get("fixed_k")
+                        if rule == "adaptive" and fixed:  # --sparse_k: the run scored only that k
+                            search = {"subsets": {fixed: a["order"][:fixed]}}
                         smallest_k(idx_all[rows], val_all[rows], labels, owner[rows], n_dirs,
                                    [] if rule == "osp" else a["order"][:args.auto_k_max], frac=args.auto_k_frac,
                                    metric=args.auto_k_metric, seed=args.seed, **search)
