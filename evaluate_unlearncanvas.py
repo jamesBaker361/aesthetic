@@ -602,6 +602,7 @@ for flag in ["discover_generate", "sparsify", "masks", "attribution", "casl", "p
              "uc", "vqa", "clip", "psnr", "fid", "summary", "panels",
              "inject", "base", "inject_generate", "inject_masks", "inject_summary", "inject_panels"]:
     parser.add_argument(f"--disable_{flag}", action="store_true")
+parser.set_defaults(disable_vqa=True)  # VQAScore is no longer used: never computed (its columns stay empty)
 
 
 # ---------------------------------------------------------------- helpers
@@ -3331,7 +3332,7 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
                                           index=False)
 
     shown = [m for m in ["mask_iou", "base_subject_remaining", "vqa_subject_gain", "uc_classified_as",
-                         "uc_p_target_gain", "background_psnr"] if m in df]
+                         "uc_p_target_gain", "background_psnr"] if m in df and df[m].notna().any()]
     print(df.groupby(["concept_type", "method", "kind", "k_metric", "strength"])[shown].mean().to_string())
     write_outputs_results(args, df, filename="uc_inject_results.csv", keys=keys, replace_on=["subject", "method"])
     return df

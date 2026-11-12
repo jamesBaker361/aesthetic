@@ -143,6 +143,7 @@ for flag in ["base", "dream_generate", "dream_sparsify", "dream_masks", "discove
              "ablate_generate", "ablate_masks", "vqa", "clip", "summary",
              "remove_generate", "remove_masks", "remove_summary"]:
     parser.add_argument(f"--disable_{flag}", action="store_true")
+parser.set_defaults(disable_vqa=True)  # VQAScore is no longer used: never computed (its columns stay empty)
 
 
 # ---------------------------------------------------------------- helpers
@@ -835,8 +836,8 @@ def build_results(args, jobs: list, subjects: list, base_by_name: dict, features
         os.path.join(args.out_dir, "summary_by_block.csv"))
     df.groupby(["subject", "block", "kind", "strength"])[metrics].mean().to_csv(
         os.path.join(args.out_dir, "summary_by_subject.csv"))
-    print(df.groupby(["block", "kind", "strength"])[["mask_iou", "vqa_subject", "vqa_subject_gain"]]
-          .mean().to_string())
+    print(df.groupby(["block", "kind", "strength"])[[m for m in ["mask_iou", "vqa_subject", "vqa_subject_gain"]
+                                                      if m in metrics]].mean().to_string())
     write_outputs_results(args, df)
     return df
 
