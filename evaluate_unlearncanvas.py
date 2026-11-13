@@ -118,6 +118,7 @@
 # FID (stage 5, --disable_fid to skip): pytorch-fid features of every scored image are cached next to
 # it ({image}.fid.npy); per edit, fid / fid_target / fid_retain compare its images with the unedited
 # images of the same prompts (all / with the concept / other objects - the last needs --eval_scope all).
+# Injection (stage 6) gets one fid per setting the same way: its edits against their unedited base images.
 #
 # --joint_blocks: instead of choosing latents block by block (and then needing a per-concept block
 # choice), every rule works on one feature space - all --block_list blocks side by side (at 512 px the
@@ -281,6 +282,7 @@
 #   epr_target_change,                    classifier logits      CASL's EPR terms vs the unedited base image, as in
 #     epr_nontarget_change, EPR (summary)                        the removal tables
 #   foreground_change, background_change  pixels                 mean absolute pixel change inside / outside the mask
+#   fid                                   pytorch-fid            the setting's edits vs their unedited base images
 #
 #   Rows also carry probe_bce / probe_loss_explained / probe_f1.
 #
@@ -2601,6 +2603,12 @@ def run_scoring(args, models: UCModels, answers: list, var_list: list, device):
         fid_features(models, sorted(set(images) | set(base)), args.fid_batch_size)
 
 
+def fid_feats(paths) -> np.ndarray:
+    '''The cached pytorch-fid features of these images (those that have them), one row each.'''
+    paths = [p for p in paths if os.path.exists(fid_cache_path(p))]
+    return np.stack([np.load(fid_cache_path(p)) for p in paths]) if paths else np.zeros((0, 2048))
+
+
 def add_fid(args, df: pd.DataFrame, keys: list) -> pd.DataFrame:
     '''
     Per edit (one keys group): pytorch-fid FID of its images against the unedited images of the same
@@ -2608,10 +2616,6 @@ def add_fid(args, df: pd.DataFrame, keys: list) -> pd.DataFrame:
     only). Written on every row of the group, so means / summaries carry it. FID from a few dozen images
     is biased upward - compare edits with the same image counts, not to published values.
     '''
-    def feats(paths):
-        paths = [p for p in paths if os.path.exists(fid_cache_path(p))]
-        return np.stack([np.load(fid_cache_path(p)) for p in paths]) if paths else np.zeros((0, 2048))
-
     df = df.copy()
     for col in ["fid", "fid_target", "fid_retain"]:
         df[col] = np.nan
@@ -2619,7 +2623,7 @@ def add_fid(args, df: pd.DataFrame, keys: list) -> pd.DataFrame:
         for col, part in [("fid", g), ("fid_target", g[g["is_target"] == 1]), ("fid_retain", g[g["is_target"] == 0])]:
             if len(part) >= 2:
                 df.loc[part.index if col != "fid" else g.index, col] = frechet_distance(
-                    feats(part["image"]), feats(part["base_image"]))
+                    fid_feats(part["image"]), fid_feats(part["base_image"]))
     return df
 
 
@@ -3199,6 +3203,8 @@ def run_inject_scoring(args, models: UCModels, jobs: list, base_by_name: dict, d
         ensure_text_scores(models.get_vqa, "vqa", text_pairs, args.score_batch_size, model=args.vqa_model)
     if not args.disable_clip:
         ensure_text_scores(models.get_clip, "clip", text_pairs, args.score_batch_size, model=args.clip_model)
+    if not args.disable_fid:
+        fid_features(models, images, args.fid_batch_size)
 
 
 def uc_target(args, path: str, ctype: str, concept: str):
@@ -3264,7 +3270,7 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
                                  "strength", "n_latents"]},
             "inject_value": args.inject_value,
             "base": base["name"], "base_subject": base["subject"], "base_prompt": base["prompt"],
-            "image": j["image"],
+            "image": j["image"], "base_image": base["image"],
             "probe_bce": j["probe"].get("bce"), "probe_loss_explained": j["probe"].get("loss_explained"),
             "probe_f1": j["probe"].get("f1"),
             # the auto-k probe's held-out score on the injected set (none for top-k sets): breaks min-k block ties
@@ -3314,14 +3320,21 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
     if df.empty:
         print("no injection rows yet")
         return df
+    keys = ["subject", "concept_type", "method", "block", "kind", "k_metric", "inject_value", "strength"]
+    if not args.disable_fid:
+        # per setting (one keys group): FID of its edits against their unedited base images, on every row of the
+        # group as add_fid - one image per base, so a few dozen images: compare settings, not published values
+        df["fid"] = np.nan
+        for _, g in df.groupby(keys):
+            if len(g) >= 2:
+                df.loc[g.index, "fid"] = frechet_distance(fid_feats(g["image"]), fid_feats(g["base_image"]))
     # another --inject_root is another base set / protocol: its own per-run files
     root_tag = "" if args.inject_root == "inject" else f"_{args.inject_root}"
     df.to_csv(os.path.join(args.out_dir, f"inject_results_{run_tag(args)}{root_tag}.csv"), index=False)
 
-    keys = ["subject", "concept_type", "method", "block", "kind", "k_metric", "inject_value", "strength"]
     metrics = [c for c in df.columns if c not in keys and c != "feature_idx"
                and pd.api.types.is_numeric_dtype(pd.to_numeric(df[c], errors="coerce"))
-               and df[c].notna().any() and c not in ["base", "base_subject", "base_prompt", "image"]]
+               and df[c].notna().any() and c not in ["base", "base_subject", "base_prompt", "image", "base_image"]]
     for m in metrics:
         df[m] = pd.to_numeric(df[m].replace([np.inf], np.nan), errors="coerce")
     grouped = df.groupby(keys)
