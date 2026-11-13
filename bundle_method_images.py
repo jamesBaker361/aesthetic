@@ -40,6 +40,8 @@ METHODS = {
     "OSP · per-block · bal-acc": "evaluation/uc_auto/osp_all_autok_balanced_accuracy_autog",
     "adaptive thresholding · per-block · acc": "evaluation/uc_auto/adaptive_all_autok_accuracy_autog",
     "adaptive thresholding · per-block · bal-acc": "evaluation/uc_auto/adaptive_all_autok_balanced_accuracy_autog",
+    "OSP · k=1 · per-block": "evaluation/uc_auto/osp_all_k1_autog",                       # uc_sparse_probing.sh K=1
+    "adaptive thresholding · k=1 · per-block": "evaluation/uc_auto/adaptive_all_k1_autog",
     "bce · joint · acc": "evaluation/uc_auto/bce_alljoint_autok_accuracy_autog",
     "bce · joint · bal-acc": "evaluation/uc_auto/bce_alljoint_autok_balanced_accuracy_autog",
     "SAeUron · searched": "evaluation/uc_auto/saeuron_all_searched_toptau",                 # scripts/uc_saeuron_searched.sh
