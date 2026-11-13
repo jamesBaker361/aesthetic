@@ -457,7 +457,8 @@ parser.add_argument("--saeuron_tau", type=int, default=0,
 parser.add_argument("--saeuron_search_dir", type=str, default=None,
                     help="--rules saeuron: tau, gamma and block per object from SAeUron's own hyperparameter search "
                          "(saeuron_search.py's {dir}/saeuron_search/{block}.json): the best (UA + IRA) / 2 over every "
-                         "block and setting, as find_best_params_cls_sweep.py - instead of Table 5's values")
+                         "block and setting, as find_best_params_cls_sweep.py - instead of Table 5's values. With "
+                         "--auto_gamma only tau and the block are taken: gamma is searched as the auto-k rules'")
 parser.add_argument("--saeuron_block", type=str, default="best_score", choices=["best_score", "top_feature"],
                     help="--saeuron_search_dir: each object's block. 'best_score' = the block whose best setting scored the "
                          "highest (UA + IRA) / 2 in the search; 'top_feature' = the block holding the object's top "
@@ -3389,8 +3390,9 @@ def main(args):
     print(f"{len(targets)} concepts to unlearn: {targets}")
     args.saeuron_params = None
     if args.saeuron_search_dir:
-        assert args.rules == ["saeuron"] and not args.auto_k and not args.auto_gamma, \
-            "--saeuron_search_dir sets SAeUron's tau / gamma itself: --rules saeuron, no --auto_k / --auto_gamma"
+        # with --auto_gamma only tau (and the block) come from the search: gamma is run_auto_gamma's, as the auto-k rules'
+        assert args.rules == ["saeuron"] and not args.auto_k, \
+            "--saeuron_search_dir sets SAeUron's tau itself: --rules saeuron, no --auto_k"
         # the edit saeuron_search.py scored (it forces both): anything else would apply a different edit
         assert args.remove_mode == "saeuron" and args.saeuron_mask and not args.joint_blocks, \
             "--saeuron_search_dir needs SAeUron's edit: --remove_mode saeuron --saeuron_mask, per block"
