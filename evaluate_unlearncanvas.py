@@ -2913,11 +2913,17 @@ def inject_strength_path(args, concept: str, method: str) -> str:
     return os.path.join(args.out_dir, "inject_strength", f"{safe(concept)}__{method}.json")
 
 
+def inject_strength_max(args, v: dict) -> float:
+    '''The strongest strength run_inject_auto_strength may use: CASL-Steer's is alpha, on its own scale.'''
+    return args.casl_alpha_max if v["kind"] == "casl_steer" else args.inject_strength_max
+
+
 def inject_strength_key(args, v: dict) -> str:
+    steer = [casl_key(args)] if v["kind"] == "casl_steer" else []
     return "|".join([v["block"], v["kind"], v["k_metric"], ",".join(str(i) for i in v["latents"]),
-                     f"{args.inject_strength_target:g}", f"{args.inject_strength_max:g}",
+                     f"{args.inject_strength_target:g}", f"{inject_strength_max(args, v):g}",
                      str(args.inject_strength_steps), args.inject_value, args.mode, args.base_prompt_file,
-                     args.base_subject_file])
+                     args.base_subject_file, *steer])
 
 
 @torch.no_grad()
@@ -2937,12 +2943,17 @@ def run_inject_auto_strength(args, models: UCModels, entries: list, var_list: li
     "curve"); if even the max misses the target, the max is used (reached False). Cached in
     {out_dir}/inject_strength/{concept}__{method}.json.
     Returns injection-only copies of the edits: k_metric "{metric}_sauto{target}", one strength each.
+    CASL-Steer edits (--casl_direction paper): the same search over alpha in [0, --casl_alpha_max], the edit as
+    make_steer_hook applies it - each patch + alpha * W_delta[:, I] z_I, z the base patch's own SAE code.
     '''
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
 
     usable = [e for e in base_entries if e.get("mask_area", 0) > 0]
     edits = learned_edits(args, var_list)
+    if args.casl_direction == "paper":  # CASL-Steer: one copy per alpha in var_list, the strength doesn't depend on it
+        edits += list({(v["subject"], v["block"], tuple(v["latents"])): v
+                       for v in var_list if v["kind"] == "casl_steer"}.values())
     caches, found, todo = {}, [], []
     for v in edits:
         path = inject_strength_path(args, v["subject"], v["method"])
@@ -2950,7 +2961,7 @@ def run_inject_auto_strength(args, models: UCModels, entries: list, var_list: li
         hit = caches[path].get(inject_strength_key(args, v))
         (todo.append(v) if hit is None else found.append((v, hit)))
     print(f"inject auto-strength: {len(todo)} of {len(edits)} searches to run "
-          f"(target {args.inject_strength_target:g}, max {args.inject_strength_max:g})")
+          f"(target {args.inject_strength_target:g}, max {args.inject_strength_max:g}, CASL {args.casl_alpha_max:g})")
 
     if todo:
         ensure_base_activations(args, models, usable, block_list)
@@ -2997,9 +3008,20 @@ def run_inject_auto_strength(args, models: UCModels, entries: list, var_list: li
                 return probes[block]
 
             for v in vs:
-                # per block: what the hook adds at strength 1 (linear in strength)
+                # per block: what the hook adds at strength 1 (linear in strength) - a vector, or for CASL-Steer one
+                # per base image's masked patches (it scales each patch's own code)
                 unit = {}
-                for block, part in split_by_block(args, v, inject_values(args, v)).items():
+                if v["kind"] == "casl_steer":
+                    block = v["block"]
+                    if probe_at(block) is not None:
+                        sae = models.get_sae(block)
+                        cols = torch.from_numpy(load_casl_columns(args, casl_npz_path(args, concept, block),
+                                                                  list(v["latents"]))).float().to(models.device)
+                        unit[block] = [(sae.encode(torch.tensor(x[m], device=models.device))[..., list(v["latents"])]
+                                        .float() @ cols.T).cpu().numpy()
+                                       for e, x, m in base_block(block) if m.any() and not own_subject(e, concept)]
+                parts_ = {} if v["kind"] == "casl_steer" else split_by_block(args, v, inject_values(args, v))
+                for block, part in parts_.items():
                     if probe_at(block) is None:
                         continue
                     sae = models.get_sae(block)
@@ -3017,8 +3039,12 @@ def run_inject_auto_strength(args, models: UCModels, entries: list, var_list: li
                     pos = total = 0
                     for block, d in unit.items():
                         scaler, probe = probes[block]
-                        patches = [x[m] + strength * d for e, x, m in base_block(block)
-                                   if m.any() and not own_subject(e, concept)]
+                        if isinstance(d, list):  # CASL-Steer: per base image
+                            patches = [x[m] + strength * dd for (e, x, m), dd in
+                                       zip([b for b in base_block(block) if b[2].any() and not own_subject(b[0], concept)], d)]
+                        else:
+                            patches = [x[m] + strength * d for e, x, m in base_block(block)
+                                       if m.any() and not own_subject(e, concept)]
                         if not patches:  # no base subject covers a whole patch at this block's grid
                             continue
                         patches = np.concatenate(patches)
@@ -3036,7 +3062,7 @@ def run_inject_auto_strength(args, models: UCModels, entries: list, var_list: li
 
                 target = args.inject_strength_target
                 _, f0 = at(0.0)
-                smax, fmax = at(args.inject_strength_max)
+                smax, fmax = at(inject_strength_max(args, v))
                 if f0 >= target:
                     best, reached = 0.0, True  # already positive without any injection
                 elif fmax < target:
@@ -3081,7 +3107,8 @@ def casl_steer_inject_jobs(args, usable: list, v: dict) -> list:
     the paper's edit has none), alpha = minus the variant's removal gamma (the alpha setting, or the one --auto_gamma
     found: +, the map's own direction). strength = alpha.
     '''
-    alpha = -float(v["gamma"])
+    # --inject_auto_strength's copy: its own alpha; else minus the removal gamma
+    alpha = float(v["inject_strengths"][0]) if v.get("inject_strengths") else -float(v["gamma"])
     if alpha <= 0:
         return []  # --auto_gamma found 0: nothing to inject
     parts = {v["block"]: {"steer": casl_npz_path(args, v["subject"], v["block"]), "latents": list(v["latents"]),
@@ -3102,6 +3129,7 @@ def casl_steer_inject_jobs(args, usable: list, v: dict) -> list:
     return [{**{k: v[k] for k in ["subject", "concept_type", "method", "block", "kind", "feature_idx", "k_metric"]},
              "latents": list(v["latents"]), "values": None, "n_latents": len(v["latents"]), "parts": parts,
              "probe": v["probe"], "pos_mean": None, "strength": alpha, "base": e["name"],
+             "inject_strength_search": v.get("inject_strength_search"),
              "prompt": e["prompt"], "seed": e["seed"],
              "image": os.path.join(folder, f"{e['name']}.jpg")}
             for e in usable if not own_subject(e, v["subject"])]

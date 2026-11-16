@@ -29,6 +29,10 @@
 # --feature_rule auto_k: the same gamma grid / prompts / score for an auto-k method instead (ESSI = saeuron_masked, OSP,
 # adaptive thresholding: --auto_k_rule) - its auto-k set at each block (read from that run, --auto_k_dir) with its own
 # edit (no mask); evaluate_unlearncanvas.py --gamma_search_dir then removes with each object x block's best gamma.
+# --feature_rule casl_steer: CASL-Steer's top --casl_steer_k latents (the trained map of these --casl_* settings, from
+# --cache_dir) steered at every alpha of --sweep_casl_alphas (gamma = -alpha), the same prompts / score; images in
+# .../a{alpha}/, and {out_dir}/saeuron_search/{block}_casl_alpha.json = {object: best alpha} (ties: the weaker) for
+# evaluate_unlearncanvas.py --casl_alpha_file.
 # Run: scripts/uc_saeuron_search.sh
 import argparse
 import os
@@ -41,6 +45,7 @@ from evaluate_sae_features import load_block_codes, load_json, save_json, run_re
 from evaluate_unlearncanvas import (
     parser, CLASSES, THEMES, STYLES, UCModels, discover_entries, saeuron_scores, image_mean_codes,
     attach_latent_means, edit_scale, uc_score_id, load_uc, uc_kind, auto_key, features_path,
+    load_casl, casl_npz_path, run_steer_generate,
 )
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.init_helpers import repo_api_init
@@ -50,11 +55,15 @@ parser.add_argument("--sweep_gammas", nargs="*", type=float, default=[-1.0, -5.0
 parser.add_argument("--sweep_taus", nargs="*", type=int, default=[1, 2, 5, 10, 15, 20, 25, 30],
                     help="number of features tau: the top-tau latents by SAeUron score (the paper's Top-tau_c, Sec. 4 / "
                          "Alg. 1; grid of its App. Q, Fig. 31)")
-parser.add_argument("--feature_rule", type=str, default="top_tau", choices=["top_tau", "percentile", "auto_k"],
+parser.add_argument("--sweep_casl_alphas", nargs="*", type=float, default=[1.0, 32.0, 64.0, 96.0, 128.0],
+                    help="--feature_rule casl_steer: the alpha grid (the priority runs' CASL-Steer sweep)")
+parser.add_argument("--feature_rule", type=str, default="top_tau",
+                    choices=["top_tau", "percentile", "auto_k", "casl_steer"],
                     help="'top_tau': search --sweep_taus (the paper); 'percentile': their released code's "
                          "--sweep_percentiles thresholds (sweep_cls_distr.py) - top-1 only on our 5120-latent SAEs; "
                          "'auto_k': an auto-k run's set at each block (--auto_k_dir / --auto_k_rule), only gamma "
-                         "searched, with that run's edit (--remove_mode saeuron, no --saeuron_mask)")
+                         "searched, with that run's edit (--remove_mode saeuron, no --saeuron_mask); 'casl_steer': "
+                         "CASL-Steer's top --casl_steer_k latents, --sweep_casl_alphas searched")
 parser.add_argument("--auto_k_dir", type=str, default=None,
                     help="--feature_rule auto_k: the run's out_dir (--auto_k with this run's --auto_k_metric / _frac / "
                          "_max), whose features/ jsons hold the auto-k sets")
@@ -115,6 +124,8 @@ def auto_k_latents(args, concept: str, block: str) -> list:
 
 
 def search_block(args, models, entries, targets, block, prompts):
+    if args.feature_rule == "casl_steer":
+        return search_block_casl(args, models, targets, block, prompts)
     if args.feature_rule != "auto_k":
         idx_all, val_all, owner, _, n_dirs = load_block_codes(entries, block)
         means = image_mean_codes(idx_all, val_all, owner, len(entries), n_dirs)
@@ -189,11 +200,64 @@ def search_block(args, models, entries, targets, block, prompts):
     save_json(results_path(args, block), results)
 
 
+def search_block_casl(args, models, targets, block, prompts):
+    '''--feature_rule casl_steer: search_block for CASL-Steer - its alpha instead of gamma, the steer edit.'''
+    edits = []
+    for concept in targets:
+        ranking = load_casl(args, concept).get(block)
+        if not ranking or not ranking["order"]:
+            print(f"  ! {concept} @ {block}: no CASL ranking for these --casl_* settings in {args.cache_dir} - skipped")
+            continue
+        latents = [int(j) for j in ranking["order"][:args.casl_steer_k]]
+        for a in args.sweep_casl_alphas:
+            edits.append({"subject": concept, "latents": latents, "alpha": a,
+                          # paper direction: +alpha adds the concept, so removal steers with -alpha
+                          "steer": {"steer": casl_npz_path(args, concept, block), "latents": latents, "alpha": -a}})
+    jobs, paths = [], {}
+    for n, e in enumerate(edits):
+        folder = os.path.join(args.out_dir, "saeuron_search", safe(block), f"t{len(e['latents'])}_a{e['alpha']:g}",
+                              safe(e["subject"]))
+        paths[n] = []
+        for a in prompts:
+            image = os.path.join(folder, f"{a['object']}_{a['style']}.jpg")
+            paths[n].append(image)
+            jobs.append({"parts": {block: e["steer"]}, "prompt": a["prompt"], "seed": a["seed"], "image": image})
+    print(f"{block}: {len(edits)} settings x {len(prompts)} prompts = {len(jobs)} images")
+    run_steer_generate(args, models, jobs)
+    ensure_text_scores(models.get_uc, uc_kind(args), [(j["image"], "image") for j in jobs], args.score_batch_size,
+                       model=uc_score_id(args))
+
+    results = load_json(results_path(args, block), {})
+    picked = {}
+    for concept in targets:
+        rows = []
+        for n, e in enumerate(edits):
+            if e["subject"] != concept:
+                continue
+            ua, ira = ua_ira(paths[n], prompts, concept, args)
+            rows.append({"percentiles": [], "tau": len(e["latents"]), "latents": e["latents"], "alpha": e["alpha"],
+                         "gamma": -e["alpha"], "UA": ua, "IRA": ira, "score": None if ua is None else (ua + ira) / 2})
+        if not rows:
+            continue
+        results[concept] = rows
+        best = None
+        for r in sorted((r for r in rows if r["score"] is not None), key=lambda r: r["alpha"]):  # strict >: the weaker
+            if best is None or r["score"] > best["score"]:
+                best = r
+        if best:
+            picked[concept] = best["alpha"]
+            print(f"  {concept} @ {block}: best alpha {best['alpha']:g} - UA {best['UA']:.3f} IRA {best['IRA']:.3f} | "
+                  + " ".join(f"a{r['alpha']:g}:{r['score']:.3f}" for r in rows if r["score"] is not None))
+    os.makedirs(os.path.dirname(results_path(args, block)), exist_ok=True)
+    save_json(results_path(args, block), results)
+    save_json(os.path.join(args.out_dir, "saeuron_search", f"{safe(block)}_casl_alpha.json"), picked)
+
+
 def main(args):
     api, accelerator, device = repo_api_init(args)
     args.cache_dir = args.cache_dir or args.out_dir
     # SAeUron's edit (see the header); ESSI's has no mask (gamma x the mean activation on the concept, every patch)
-    args.remove_mode, args.saeuron_mask = "saeuron", args.feature_rule != "auto_k"
+    args.remove_mode, args.saeuron_mask = "saeuron", args.feature_rule not in ("auto_k", "casl_steer")
     assert args.feature_rule != "auto_k" or args.auto_k_dir, "--feature_rule auto_k needs --auto_k_dir"
     args.joint_offsets = None
     block_list = args.block_list or list(DEFAULT_BLOCK_LIST)
