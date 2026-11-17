@@ -23,6 +23,11 @@
 #            + probe predict
 #   masks    SAM3 on each discovery image of the concept (FlopCounterMode on one image), shared by the
 #            concept's blocks and split evenly over them
+#   auto-α   (--inject_auto_strength, insertion; its own column, not in the removal search total) the dense probe
+#            on all of the concept's discovery patches (re-fit here for n_iter_), and per strength tried (the curve
+#            cached in {out_dir}/inject_strength/) the injected masked base patches + scaler + probe predict; plus
+#            the base images' activations (one generation each, ensure_base_activations) split over the run's edits.
+#            Run with the run's insertion flags (--base_* files, --inject_strength_target, --inject_value)
 # Shared by both and left out: discovery images/activations, the unedited answer set, the final scoring.
 #
 # FlopCounterMode only counts matmul / conv / attention FLOPs, while the CPU side counts every multiply
@@ -67,7 +72,10 @@ from attribution import DEFAULT_BLOCK_LIST
 from evaluate_sae_features import (
     generate, make_zero_hook, load_block_codes, load_json, save_json, sam_mask, write_outputs_results,
 )
+from evaluate_sae_features import load_sam
+from generate_clean_inference import resize_mask_to_grid
 from evaluate_unlearncanvas import (
+    learned_edits, inject_strength_key, inject_strength_path, base_cache_dir, base_embedding_path, own_subject,
     parser, CLASSES, STYLES, UCModels, discover_entries, concept_entries, concept_methods,
     answer_entries, load_features, variants, auto_gamma_path, auto_gamma_key, auto_rules, auto_key, sparse_settings,
     saeuron_scores, masked_image_means, image_mean_codes, top_n, patch_labels, sam_query, load_attribution, load_casl, k_metric,
@@ -397,6 +405,64 @@ def auto_gamma_flops(args, entries, var_list, block_list) -> dict:
     return out
 
 
+def auto_alpha_flops(args, gpu, entries, var_list, block_list) -> dict:
+    '''{(concept, method, block): FLOPs of run_inject_auto_strength for that group's edits} (same probe and bases).'''
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+
+    base_entries = load_json(os.path.join(base_cache_dir(args), "base", "manifest.json"), [])
+    usable = [e for e in base_entries if e.get("mask_area", 0) > 0]
+    if not usable:
+        print(f"! no base images in {base_cache_dir(args)}/base/manifest.json - auto-alpha not counted")
+        return {}
+    edits = [v for v in learned_edits(args, var_list) if v["block"] in block_list]
+    out = {}
+    for block in block_list:
+        masked = []  # (base entry, masked patches at this block's grid)
+        for e in usable:
+            with np.load(base_embedding_path(args, e)) as d:
+                h, w = d[f"saved_output.{block}"].shape[-2:]
+            masked.append((e, int(resize_mask_to_grid(load_sam(e["image"], e["subject"])[0], h, w).sum())))
+        groups = {}
+        for v in edits:
+            if v["block"] == block:
+                groups.setdefault((v["concept_type"], v["subject"], v["method"]), []).append(v)
+        n_dirs = None
+        for (ctype, concept, method), vs in groups.items():
+            X, y = [], []
+            for n in concept_entries(args, entries, ctype, concept):
+                e = entries[n]
+                with np.load(e["embedding"]) as d:
+                    x = d[f"saved_output.{block}"][0]
+                    x = x - d[f"saved_input.{block}"][0] if args.mode == "diff" else x
+                if n_dirs is None:
+                    with np.load(e["sparse"]) as sp:
+                        n_dirs = int(sp[f"{block}__n_dirs"])
+                x = x.transpose(1, 2, 0).astype(np.float32)
+                X.append(x.reshape(-1, x.shape[-1]))
+                y.append(patch_labels(args, e, ctype, concept, method, x.shape[0], x.shape[1]).reshape(-1))
+            X, y = np.concatenate(X), np.concatenate(y).astype(bool)
+            if y.all() or not y.any():
+                continue
+            d = X.shape[1]
+            COUNTER.flops = 5 * X.size  # scaler fit + transform
+            with count_sklearn(args):
+                LogisticRegression(C=1.0, max_iter=2000).fit(StandardScaler().fit_transform(X), y)
+            flops = COUNTER.flops
+            n_b = sum(n for e, n in masked if not own_subject(e, concept))
+            cache = load_json(inject_strength_path(args, concept, method), {})
+            for v in vs:
+                hit = cache.get(inject_strength_key(args, v))
+                n_evals = len(hit["curve"]) if hit and "curve" in hit else 2 + args.inject_strength_steps
+                # the unit injection (one SAE decode), then per strength: add it, scaler + probe predict
+                flops += 2 * n_dirs * d + n_evals * 5 * n_b * d
+            out[(concept, method, block)] = flops
+        print(f"auto-alpha @ {block}: done")
+    # the base images' activations: one generation each for the whole run, split over its edits
+    share = len(base_entries) * np.mean(list(gpu["gen"].values())) / max(1, len(out))
+    return {k: f + share for k, f in out.items()}
+
+
 # ---------------------------------------------------------------- main
 
 def fmt(f: float) -> str:
@@ -439,6 +505,7 @@ def main(args):
     gpu = measure_gpu(args, device, entries, targets, block_list)
     ak = auto_k_flops(args, entries, targets, block_list) if auto else {}
     ag = auto_gamma_flops(args, entries, var_list, block_list) if auto else {}
+    aa = auto_alpha_flops(args, gpu, entries, var_list, block_list) if args.inject_auto_strength else {}
 
     features = args.sweep_taus if args.feature_rule == "top_tau" else args.sweep_percentiles
     grid = len(args.sweep_gammas) * len(features)
@@ -460,7 +527,7 @@ def main(args):
     part = lambda name: sum(cf[k][name] for k in cf)
     tot = {"saeuron_grid": sum(saeuron.values()), "auto_k": sum(ak.values()), "auto_gamma": sum(ag.values()),
            "sam_masks": sum(sam_per_key.values()), "casl_train": part("casl_train"), "casl_setup": part("casl_setup"),
-           "casl_alpha": part("casl_alpha"), "ours": sum(ours.values())}
+           "casl_alpha": part("casl_alpha"), "ours": sum(ours.values()), "auto_alpha": sum(aa.values())}
     n = len(keys)
 
     search = "auto-k + auto-γ" if auto else "CASL training + alpha sweep" if "casl_steer" in args.rules else \
@@ -487,6 +554,8 @@ def main(args):
     if "casl_steer" in args.rules:
         rows += [(f"this run: CASL-Steer alpha sweep ({len(args.casl_alpha)} alphas)", tot["casl_alpha"])]
     rows += [("this run: total", tot["ours"])]
+    if aa:
+        rows += [("this run: auto-α (insertion, not in the total)", tot["auto_alpha"])]
     print(f"\n{'':52s}{'per edit':>14s}{'run total':>14s}")
     for name, f in rows:
         print(f"{name:52s}{fmt(f / n):>14s}{fmt(f):>14s}")
@@ -498,7 +567,8 @@ def main(args):
     df = pd.DataFrame([{"subject": k[0], "method": k[1], "block": k[2], "kind": kind, "k_metric": km,
                         "feature_idx": np.nan, "auto": int(auto), "grid_size": grid, "n_answer": n_answer,
                         "saeuron_grid": saeuron[k], "auto_k": ak.get(k, 0.0), "auto_gamma": ag.get(k, 0.0),
-                        "sam_masks": sam_per_key.get(k, 0.0), **{c: cf.get(k, {}).get(c, 0.0) for c in
+                        "sam_masks": sam_per_key.get(k, 0.0), "auto_alpha": aa.get(k, np.nan),
+                        **{c: cf.get(k, {}).get(c, 0.0) for c in
                                                                  ["casl_train", "casl_setup", "casl_alpha"]},
                         "search": ours[k]} for k in keys])
     write_outputs_results(args, df, filename="uc_search_flops.csv",
