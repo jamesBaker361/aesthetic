@@ -2108,7 +2108,7 @@ def auto_gamma_key(args, v: dict) -> str:
     steer = [casl_key(args)] if v["kind"] == "casl_steer" else []
     return "|".join([v["block"], v["kind"], ",".join(str(i) for i in v["latents"]), v.get("remove_mode", args.remove_mode),
                      f"{args.auto_gamma_target:g}", f"{auto_gamma_min(args, v):g}", str(args.auto_gamma_steps),
-                     args.mode, str(args.seed)] + steer)
+                     args.mode, str(args.seed), "heldout:masked"] + steer)
 
 
 @torch.no_grad()
@@ -2117,7 +2117,8 @@ def run_auto_gamma(args, models: UCModels, entries: list, var_list: list, block_
     For every learned edit: at each block it touches, fit a dense probe
     (StandardScaler + L2 logistic regression) on the block's un-encoded
     activations (out - in with --mode diff) of ~80% of the concept's discovery
-    images, labels = its mask. On the held-out images, apply the edit offline
+    images, labels = its mask; the ~20% held out are drawn per block from the
+    images whose mask is non-empty there. On the held-out images, apply the edit offline
     exactly as make_zero_hook does (x - decoder(onehot of the chosen latents x
     (1 - scale)), each block with its own latents) and binary-search gamma in
     [--auto_gamma_min, 0] for the weakest one after which at most
@@ -2152,8 +2153,6 @@ def run_auto_gamma(args, models: UCModels, entries: list, var_list: list, block_
         groups.setdefault((v["concept_type"], v["subject"], v["method"]), []).append(v)
     for (ctype, concept, method), vs in groups.items():
         own = concept_entries(args, entries, ctype, concept)
-        rng = np.random.default_rng(args.seed)
-        test_ids = set(rng.choice(len(own), max(1, int(round(0.2 * len(own)))), replace=False).tolist())
         data = {}  # block -> probe + held-out activations / codes, built on first use
 
         def block_data(block):
@@ -2168,11 +2167,18 @@ def run_auto_gamma(args, models: UCModels, entries: list, var_list: list, block_
                 x = x.transpose(1, 2, 0).astype(np.float32)
                 labels = patch_labels(args, e, ctype, concept, method, x.shape[0], x.shape[1]).reshape(-1)
                 images.append((x, labels.astype(bool)))
+            # held out: ~20% of the images, drawn only from those with a non-empty mask at this block, so the search
+            # always has positives to measure (and the training split keeps at least one masked image). With every
+            # mask non-empty this is the same draw as one over all images.
+            masked = [i for i, (_, y) in enumerate(images) if y.any()]
+            n_test = min(max(1, int(round(0.2 * len(own)))), max(1, len(masked) - 1))
+            rng = np.random.default_rng(args.seed)
+            test_ids = {masked[i] for i in rng.choice(len(masked), n_test, replace=False)} if masked else set()
             train = [im for i, im in enumerate(images) if i not in test_ids] or images
             test = [im for i, im in enumerate(images) if i in test_ids]
             Xtr = np.concatenate([x.reshape(-1, x.shape[-1]) for x, _ in train])
             ytr = np.concatenate([y for _, y in train])
-            if ytr.all() or not ytr.any():
+            if ytr.all() or not ytr.any() or not test_ids:
                 data[block] = None
                 return None
             scaler = StandardScaler().fit(Xtr)
