@@ -2610,6 +2610,31 @@ def fid_feats(paths) -> np.ndarray:
     return np.stack([np.load(fid_cache_path(p)) for p in paths]) if paths else np.zeros((0, 2048))
 
 
+class FidDistances:
+    '''
+    The Frechet distances of a run, cached in {out_dir}/fid_distances.json: a 2048x2048 sqrtm per distance (minutes
+    each with these few, singular covariances), so a rerun only computes the edits whose images changed. Key = the
+    two image lists with their feature files' mtimes - a regenerated image gets new features, so a new key.
+    '''
+
+    def __init__(self, args):
+        self.path = os.path.join(args.out_dir, "fid_distances.json")
+        self.cache, self.new = load_json(self.path, {}), {}
+
+    def __call__(self, images, bases) -> float:
+        lists = [[p for p in ps if os.path.exists(fid_cache_path(p))] for ps in (images, bases)]
+        key = hashlib.sha1("\n--\n".join("\n".join(f"{p}|{os.stat(fid_cache_path(p)).st_mtime_ns}" for p in ps)
+                                         for ps in lists).encode()).hexdigest()
+        if key not in self.cache:
+            self.cache[key] = self.new[key] = frechet_distance(fid_feats(lists[0]), fid_feats(lists[1]))
+        return self.cache[key]
+
+    def save(self):
+        if self.new:  # merged into the file as it is now: another job of this out_dir may have added its own
+            save_json(self.path, {**load_json(self.path, {}), **self.new})
+            print(f"fid: {len(self.new)} distances computed, {len(self.cache) - len(self.new)} cached")
+
+
 def add_fid(args, df: pd.DataFrame, keys: list) -> pd.DataFrame:
     '''
     Per edit (one keys group): pytorch-fid FID of its images against the unedited images of the same
@@ -2620,11 +2645,12 @@ def add_fid(args, df: pd.DataFrame, keys: list) -> pd.DataFrame:
     df = df.copy()
     for col in ["fid", "fid_target", "fid_retain"]:
         df[col] = np.nan
+    distance = FidDistances(args)
     for _, g in df[df["kind"] != "base"].groupby(keys, dropna=False):
         for col, part in [("fid", g), ("fid_target", g[g["is_target"] == 1]), ("fid_retain", g[g["is_target"] == 0])]:
             if len(part) >= 2:
-                df.loc[part.index if col != "fid" else g.index, col] = frechet_distance(
-                    fid_feats(part["image"]), fid_feats(part["base_image"]))
+                df.loc[part.index if col != "fid" else g.index, col] = distance(part["image"], part["base_image"])
+    distance.save()
     return df
 
 
@@ -3356,9 +3382,11 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
         # per setting (one keys group): FID of its edits against their unedited base images, on every row of the
         # group as add_fid - one image per base, so a few dozen images: compare settings, not published values
         df["fid"] = np.nan
+        distance = FidDistances(args)
         for _, g in df.groupby(keys):
             if len(g) >= 2:
-                df.loc[g.index, "fid"] = frechet_distance(fid_feats(g["image"]), fid_feats(g["base_image"]))
+                df.loc[g.index, "fid"] = distance(g["image"], g["base_image"])
+        distance.save()
     # another --inject_root is another base set / protocol: its own per-run files
     root_tag = "" if args.inject_root == "inject" else f"_{args.inject_root}"
     df.to_csv(os.path.join(args.out_dir, f"inject_results_{run_tag(args)}{root_tag}.csv"), index=False)
