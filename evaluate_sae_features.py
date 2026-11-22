@@ -427,8 +427,10 @@ def load_text_score(image_path: str, kind: str, text: str):
 
 def base_manifest(args) -> list:
     '''
-    One entry per base prompt x base subject, reusing seeds/prompts already
-    recorded in manifest.json so a rerun never silently changes a base image.
+    One entry per base prompt x base subject (x --base_seeds copies, if the
+    parser has it), reusing seeds/prompts already recorded in manifest.json so
+    a rerun never silently changes a base image. Copy 0 is the original image
+    (same name and seed); copy j > 0 is "{name}_s{j}" at seed + 1000 j.
     '''
     base_dir = os.path.join(args.out_dir, "base")
     manifest_path = os.path.join(base_dir, "manifest.json")
@@ -438,15 +440,17 @@ def base_manifest(args) -> list:
     i = 0
     for p_i, template in enumerate(read_lines(args.base_prompt_file)):
         for subject in read_lines(args.base_subject_file):
-            name = f"{i:03d}_{safe(subject)}_p{p_i}"
-            entry = saved.get(name) or {
-                "name": name,
-                "prompt": fill_prompt(template, subject, args.placeholder),
-                "subject": subject,
-                "seed": args.seed + i,
-            }
-            entry["image"] = os.path.join(base_dir, "images", f"{name}.jpg")
-            entries.append(entry)
+            for rep in range(getattr(args, "base_seeds", 1)):
+                name = f"{i:03d}_{safe(subject)}_p{p_i}" + (f"_s{rep}" if rep else "")
+                entry = saved.get(name) or {
+                    "name": name,
+                    "prompt": fill_prompt(template, subject, args.placeholder),
+                    "subject": subject,
+                    "seed": args.seed + i + 1000 * rep,
+                }
+                entry["seed_rep"] = rep
+                entry["image"] = os.path.join(base_dir, "images", f"{name}.jpg")
+                entries.append(entry)
             i += 1
     return entries
 

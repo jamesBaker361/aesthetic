@@ -359,6 +359,9 @@ parser.add_argument("--eval_objects", nargs="*", default=None, help="answer-set 
 parser.add_argument("--eval_styles", nargs="*", default=None, help="answer-set styles (default: --style_list)")
 parser.add_argument("--eval_seeds", nargs="*", type=int, default=[188, 288, 588, 688, 888],
                     help="UnlearnCanvas's answer-set seeds")
+parser.add_argument("--per_seed", action="store_true",
+                    help="tables keyed by seed too: removal by answer-set seed (FID per seed), insertion by base copy "
+                         "(seed_rep, --base_seeds) - for the mean +- std over seeds")
 parser.add_argument("--eval_scope", type=str, default="target", choices=["target", "all"],
                     help="'target': test each concept's latents only on prompts containing it; "
                          "'all': on the whole answer set (adds IRA/CRA, |grid| images per latent)")
@@ -562,6 +565,9 @@ parser.add_argument("--fid_batch_size", type=int, default=64)
 
 parser.add_argument("--base_prompt_file", type=str, default="prompt_dir/base_prompts.txt")
 parser.add_argument("--base_subject_file", type=str, default="prompt_dir/base_subjects.txt")
+parser.add_argument("--base_seeds", type=int, default=1,
+                    help="copies of each base image at other seeds, for evaluation only: copy 0 is the original, "
+                         "copy j > 0 seed + 1000 j. --inject_auto_strength still searches on copy 0 alone")
 parser.add_argument("--base_cache_dir", type=str, default=None,
                     help="where the injection base images live ({base_cache_dir}/base: images, SAM masks, manifest, "
                          "activations; default --cache_dir) - another --base_*_file set needs its own, since the "
@@ -2719,13 +2725,12 @@ def build_results(args, answers: list, var_list: list):
         print("no scored rows yet")
         return df
     fid_keys = ["subject", "concept_type", "method", "block", "kind", "k_metric", "remove_mode", "remove_scale",
-                "auto_gamma_target"]
+                "auto_gamma_target"] + (["seed"] if args.per_seed else [])
     if not args.disable_fid:
         df = add_fid(args, df, fid_keys)
     df.to_csv(os.path.join(args.out_dir, f"uc_results_{run_tag(args)}.csv.gz"), index=False)
 
-    keys = ["subject", "concept_type", "method", "block", "kind", "k_metric", "remove_mode", "remove_scale",
-            "auto_gamma_target"]
+    keys = fid_keys
     metrics = ["UA", "IRA", "CRA", "CRA_target", "p_target", "style_acc", "object_acc", "sam_removed", "sam_score", "sam_area",
                "vqa", "clip", "psnr_target", "psnr_retain", "epr_target_change", "epr_nontarget_change",
                "probe_bce", "probe_loss_explained", "probe_f1",
@@ -2745,15 +2750,17 @@ def build_results(args, answers: list, var_list: list):
 
     # the unedited model's numbers next to every row of the same concept
     base_cols = [m for m in ["UA", "IRA", "CRA", "CRA_target", "p_target", "sam_removed", "vqa", "clip"] if m in summary]
-    base = summary[summary["kind"] == "base"].set_index("subject")[base_cols].add_suffix("_base")
-    summary = summary.join(base, on="subject")
+    on = ["subject", "seed"] if args.per_seed else ["subject"]
+    base = summary[summary["kind"] == "base"].set_index(on)[base_cols].add_suffix("_base")
+    summary = summary.join(base, on=on)
     summary.to_csv(os.path.join(args.out_dir, f"uc_summary_{run_tag(args)}.csv"), index=False)
 
     shown = [m for m in ["UA", "IRA", "CRA", "CRA_target", "sam_removed", "vqa", "psnr_target", "psnr_retain", "EPR"]
              if m in summary and summary[m].notna().any()]
     print(summary.groupby(["concept_type", "method", "kind"])[shown].mean().to_string())
 
-    write_outputs_results(args, df.drop(columns=["seed", "latents", "base_image"]), filename="uc_results.csv", keys=keys,
+    write_outputs_results(args, df.drop(columns=["latents", "base_image"] + ([] if args.per_seed else ["seed"])),
+                          filename="uc_results.csv", keys=keys,
                           replace_on=["subject", "method", "k_metric", "remove_mode", "remove_scale",
                                       "auto_gamma_target"],
                           defaults={"k_metric": "single", "remove_mode": "direct", "auto_gamma_target": 0.0,
@@ -2977,7 +2984,8 @@ def run_inject_auto_strength(args, models: UCModels, entries: list, var_list: li
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
 
-    usable = [e for e in base_entries if e.get("mask_area", 0) > 0]
+    # copy 0 only: the --base_seeds copies are for evaluation, the strength is searched once
+    usable = [e for e in base_entries if e.get("mask_area", 0) > 0 and e.get("seed_rep", 0) == 0]
     edits = learned_edits(args, var_list)
     if args.casl_direction == "paper":  # CASL-Steer: one copy per alpha in var_list, the strength doesn't depend on it
         edits += list({(v["subject"], v["block"], tuple(v["latents"])): v
@@ -3327,6 +3335,7 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
                                  "strength", "n_latents"]},
             "inject_value": args.inject_value,
             "base": base["name"], "base_subject": base["subject"], "base_prompt": base["prompt"],
+            **({"seed_rep": base.get("seed_rep", 0)} if args.per_seed else {}),
             "image": j["image"], "base_image": base["image"],
             "probe_bce": j["probe"].get("bce"), "probe_loss_explained": j["probe"].get("loss_explained"),
             "probe_f1": j["probe"].get("f1"),
@@ -3377,7 +3386,8 @@ def build_inject_results(args, jobs: list, base_by_name: dict):
     if df.empty:
         print("no injection rows yet")
         return df
-    keys = ["subject", "concept_type", "method", "block", "kind", "k_metric", "inject_value", "strength"]
+    keys = ["subject", "concept_type", "method", "block", "kind", "k_metric", "inject_value", "strength"] \
+        + (["seed_rep"] if args.per_seed else [])
     if not args.disable_fid:
         # per setting (one keys group): FID of its edits against their unedited base images, on every row of the
         # group as add_fid - one image per base, so a few dozen images: compare settings, not published values
@@ -3519,7 +3529,8 @@ def main(args):
         # run_base writes {out_dir}/base - point it at the shared cache
         cache_args = argparse.Namespace(**{**vars(args), "out_dir": base_cache_dir(args)})
         if args.disable_base:
-            base_entries = load_json(os.path.join(base_cache_dir(args), "base", "manifest.json"), [])
+            base_entries = [e for e in load_json(os.path.join(base_cache_dir(args), "base", "manifest.json"), [])
+                            if e.get("seed_rep", 0) < args.base_seeds]
         else:
             base_entries = run_base(cache_args, models, device)
         base_by_name = {e["name"]: e for e in base_entries}
