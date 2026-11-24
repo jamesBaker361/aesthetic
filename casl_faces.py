@@ -411,13 +411,18 @@ def main(args):
     clip, tokenizer = load_clip(device, args.clip_model, args.clip_pretrained)
     clip.requires_grad_(False)
     eclip, etokenizer = load_clip(device, args.eval_clip_model, args.eval_clip_pretrained)
+    eclip.requires_grad_(False)  # else every embedding below keeps its autograd graph (OOM after a few alphas)
     clf = AttrClassifier(args.classifier, device)
+
+    @torch.no_grad()
+    def eval_embed(imgs: torch.Tensor) -> torch.Tensor:
+        return torch.cat([clip_embed(eclip, imgs[n:n + 16].to(device)) for n in range(0, len(imgs), 16)])
 
     real = torch.stack([load_image(p, args.size) for p in test_rows["path"]])
     recon = torch.stack([load_image(cache_paths(args, i)[1], args.size) for i in test_rows["idx"]])
     x_start = torch.stack([load_traj(args, i)[0] for i in test_rows["idx"]])
     f_real, f_recon = clf(real), clf(recon)
-    e_recon = torch.cat([clip_embed(eclip, recon[n:n + 16].to(device)) for n in range(0, len(recon), 16)])
+    e_recon = eval_embed(recon)
 
     results_path = os.path.join(args.out_dir, "results.csv")
     rows = pd.read_csv(results_path).to_dict("records") if os.path.exists(results_path) else []
@@ -461,8 +466,7 @@ def main(args):
                     f_edit = clf(edited)
                     e, dt, dn = epr(f_edit, f_recon, ti)
                     e_real, _, _ = epr(f_edit, f_real, ti)
-                    e_edit = torch.cat([clip_embed(eclip, edited[n:n + 16].to(device))
-                                        for n in range(0, len(edited), 16)])
+                    e_edit = eval_embed(edited)
                     clip_edit = (e_edit @ e_text).mean().item()
                     add({"attribute": attr, "step": step, "k": k, "alpha": float(alpha),
                          "latents": " ".join(map(str, order[:k])), "EPR": e, "EPR_real": e_real, "d_target": dt,
